@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = [
+    "enki-rhi",
+    "enki-render",
+    "enki-app",
+    "enki-planet",
+    "enki-jobs",
+    "enki-nanite",
+]

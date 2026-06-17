@@ -1,0 +1,1405 @@
+// enki-app — winit 0.30 application shell with interactive navigation,
+// material/view hot-swap, egui panel, and HUD.
+//
+// # Render loop overview
+//   resumed()  → create window → Rhi::new → Scene::new [default]
+//             OR StressHarness::new [stress]
+//             → EguiState::new → Hud::new
+//
+//   RedrawRequested:
+//     Default: begin_frame() → begin_rendering() → Scene::record_frame() →
+//              EguiState::render() → end_frame()
+//     Stress:  begin_frame() → streaming_upload*() → begin_rendering() →
+//              StressHarness::record_frame() → EguiState::render() → end_frame()
+//
+// # Navigation mode cycle (Tab: Globe → Placement → FirstPerson → Globe)
+//   Globe       — orbit camera; LMB drag rotates, scroll zooms.
+//   Placement   — shows orbit view; click to ray-cast spawn point on planet.
+//   FirstPerson — WASD + mouse-look on the surface.
+//   Escape      — return from FirstPerson → Globe at any time.
+//
+// # View hot-swap keys (not consumed by egui)
+//   M    — cycle material_mode 0→1→2→3→0
+//   W    — toggle wireframe (Globe/Placement modes)
+//   Tab  — advance nav mode
+//   Esc  — exit first-person to Globe
+//
+// # Event routing
+//   WindowEvent → egui FIRST.  If egui consumed it (wants_pointer / wants_keyboard),
+//   do NOT route it to navigation.
+//
+// # Vulkan frame ordering
+//   vkCmdCopyBuffer is illegal inside a dynamic-rendering instance.
+//   Egui texture uploads (set_textures) perform a one-shot submit internally —
+//   they must happen in `build_frame`, outside begin_rendering/end_frame.
+//   Egui draw commands (`cmd_draw`) must be inside begin_rendering, before end_frame.
+
+mod controls;
+mod gui;
+mod hud;
+mod loading;
+mod planet_view;
+mod scene;
+mod stress;
+
+use std::time::Instant;
+
+use enki_planet::climate::ClimateParams;
+use enki_planet::lod::{LodCamera, LodConfig};
+use enki_render::{camera::Camera, frame::FrameUniforms, lights::Lights, projection::reversed_z_perspective};
+use enki_rhi::{Rhi, RhiConfig, RhiError};
+use glam::DVec3;
+use winit::{
+    application::ApplicationHandler,
+    dpi::LogicalSize,
+    event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::{KeyCode, PhysicalKey},
+    window::{CursorGrabMode, Window, WindowAttributes, WindowId},
+};
+
+use controls::{
+    first_person::{FirstPersonController, MoveInput},
+    globe::GlobeControls,
+    nav_mode::{NavMode, NavState},
+    surface_picker,
+    PLANET_RADIUS,
+};
+use gui::EguiState;
+use hud::Hud;
+use planet_view::{PlanetConfig, PlanetView, PlanetViewStats, RhiUploaderDummy, planet_view_from_hf};
+use scene::Scene;
+use stress::StressHarness;
+
+// ── Render mode ───────────────────────────────────────────────────────────────
+
+enum RenderMode {
+    /// Default: live LOD planet rendered via `PlanetView`.
+    Planet,
+    /// `--markers`: the old depth-proof marker scene (precision regression test).
+    Markers,
+    /// `--stress-streaming`: streaming budget stress test.
+    Stress,
+    /// `--soak-terrain` / `ENKI_SOAK_TERRAIN=1`: scripted fly-through that validates
+    /// dynamic LOD + streaming under real motion (split/merge churn, hide-while-pending,
+    /// streaming graveyard lifecycle).
+    SoakTerrain,
+}
+
+// ── App state ─────────────────────────────────────────────────────────────────
+
+struct App {
+    // Fields drop in declaration order.  Vulkan resources that hold device
+    // handles MUST drop before `rhi` (which owns the VkDevice).  Order:
+    //   egui  — holds pipeline/textures on the device; must free while device is alive.
+    //   planet_view / scene / stress — hold only opaque u64 BufferHandles freed by
+    //                    rhi's stores; their order relative to rhi is fine, but
+    //                    keeping them before rhi is clearest.
+    //   rhi   — LAST: wait_idle + destroys the VkDevice.
+    window:       Option<Window>,
+    egui:         Option<EguiState>,
+    planet_view:  Option<PlanetView<RhiUploaderDummy>>,
+    scene:        Option<Scene>,
+    stress:       Option<StressHarness>,
+    #[cfg(feature = "nanite")]
+    nanite:       Option<enki_nanite::render::NaniteRenderer>,
+    /// Stage-2 cluster streaming: the deep per-face DAGs (held in RAM) + the
+    /// residency selector that streams only the near-cut subset to the GPU pool.
+    #[cfg(feature = "nanite")]
+    nanite_assets: Vec<enki_nanite::cluster::ClusterAsset>,
+    #[cfg(feature = "nanite")]
+    nanite_streamer: Option<enki_nanite::residency::ClusterStreamer>,
+    /// Planet radius (for the streamer's altitude-relative reselection threshold).
+    #[cfg(feature = "nanite")]
+    nanite_radius: f64,
+    /// Frame index of the last streaming reselection (rate-limits the re-pack so
+    /// fast zoom can't trigger a full re-pack every frame → no sustained fps drop).
+    #[cfg(feature = "nanite")]
+    nanite_last_resel: u64,
+    /// In-progress async startup load (heightfield + Nanite bake); `None` once done.
+    loader:       Option<loading::Loader>,
+    /// Planet config held until the async load completes (then `PlanetView` is built).
+    pending_planet_cfg: Option<PlanetConfig>,
+    hud:          Hud,
+    mode:         RenderMode,
+    last_tick:    Instant,
+    minimized:    bool,
+    /// Monotonic frame counter for LOD age tracking.
+    frame_counter: u64,
+
+    // ── Navigation ────────────────────────────────────────────────────────
+    nav:          NavState,
+    globe:        GlobeControls,
+    first_person: Option<FirstPersonController>,
+    /// Last cursor NDC (x right, y up, -1..1) for Placement ray-cast.
+    cursor_ndc:   (f32, f32),
+
+    // ── View hot-swap ─────────────────────────────────────────────────────
+    material_mode: u32,
+    wireframe:     bool,
+    /// TAA toggle (off by default; the proven non-TAA path stays the default).
+    taa_enabled:   bool,
+    /// Sub-pixel jitter + view-proj history for the TAA resolve.
+    taa_jitter:    enki_render::taa::TaaJitter,
+    /// Nanite debug-view UI state.
+    nanite_enabled:    bool,
+    nanite_debug_mode: u32,
+    /// LOD pixel-error threshold (lower = finer/smoother, heavier).
+    nanite_tau:        f32,
+
+    // ── Raw input state ───────────────────────────────────────────────────
+    /// Accumulated mouse-motion delta between frames (pixels, CursorMoved).
+    mouse_delta:   (f32, f32),
+    /// Left mouse button currently held.
+    lmb_held:      bool,
+    /// Left-click fired this frame (rising edge, for Placement pick).
+    lmb_click:     bool,
+    /// True while the mouse button is held and the drag started on the 3D scene.
+    scene_drag_active: bool,
+    /// Previous cursor position in physical pixels; used to compute CursorMoved deltas.
+    cursor_pos_prev: Option<(f64, f64)>,
+    /// Scroll wheel delta accumulated this frame.
+    scroll:        f32,
+    /// WASD + Shift held state for FirstPerson movement.
+    move_keys:     MoveInput,
+
+    // ── Frame stats ───────────────────────────────────────────────────────
+    last_dt: f32,
+
+    // ── Soak-terrain state ────────────────────────────────────────────────
+    /// Monotonic elapsed time since the soak started (seconds).  Drives the
+    /// deterministic scripted camera path in `SoakTerrain` mode.
+    soak_elapsed: f64,
+    /// Wall-clock instant when the soak mode started, for fps measurement.
+    soak_start: Instant,
+    /// Rolling frame count used to compute average fps between log ticks.
+    soak_frames_since_log: u64,
+    /// Elapsed seconds at the last periodic log tick.
+    soak_last_log_elapsed: f64,
+
+    // rhi MUST be declared last: Rust drops fields in declaration order, and
+    // rhi owns the VkDevice.  egui (above) holds Vulkan pipelines/textures
+    // that must be freed before the device is destroyed.
+    rhi: Option<Rhi>,
+}
+
+impl App {
+    fn new(mode: RenderMode) -> Self {
+        Self {
+            window:        None,
+            egui:          None,
+            planet_view:   None,
+            scene:         None,
+            stress:        None,
+            #[cfg(feature = "nanite")]
+            nanite:        None,
+            #[cfg(feature = "nanite")]
+            nanite_assets: Vec::new(),
+            #[cfg(feature = "nanite")]
+            nanite_streamer: None,
+            #[cfg(feature = "nanite")]
+            nanite_radius: 0.0,
+            #[cfg(feature = "nanite")]
+            nanite_last_resel: 0,
+            loader:        None,
+            pending_planet_cfg: None,
+            hud:           Hud::new(),
+            mode,
+            last_tick:     Instant::now(),
+            minimized:     false,
+            frame_counter: 0,
+            nav:           NavState::new(),
+            globe:         GlobeControls::new(100_000.0),
+            first_person:  None,
+            cursor_ndc:    (0.0, 0.0),
+            material_mode: 0,
+            wireframe:     false,
+            taa_enabled:   false,
+            taa_jitter:    enki_render::taa::TaaJitter::new(),
+            nanite_enabled:    false,
+            nanite_debug_mode: 0,
+            nanite_tau:        1.0,
+            mouse_delta:   (0.0, 0.0),
+            lmb_held:      false,
+            lmb_click:     false,
+            scene_drag_active: false,
+            cursor_pos_prev:   None,
+            scroll:        0.0,
+            move_keys:     MoveInput::default(),
+            last_dt:       0.016,
+            soak_elapsed:           0.0,
+            soak_start:             Instant::now(),
+            soak_frames_since_log:  0,
+            soak_last_log_elapsed:  0.0,
+            rhi:           None,
+        }
+    }
+
+    // ── Camera and altitude helpers ───────────────────────────────────────
+
+    fn active_camera(&self) -> Camera {
+        match self.nav.mode() {
+            NavMode::Globe | NavMode::Placement => self.globe.camera(),
+            NavMode::FirstPerson => self
+                .first_person
+                .as_ref()
+                .map(|fp| fp.camera())
+                .unwrap_or_else(|| self.globe.camera()),
+        }
+    }
+
+    fn altitude_m(&self) -> f64 {
+        match self.nav.mode() {
+            NavMode::Globe | NavMode::Placement => self.globe.altitude(),
+            NavMode::FirstPerson => self
+                .first_person
+                .as_ref()
+                .map(|fp| fp.eye_position().length() - PLANET_RADIUS)
+                .unwrap_or_else(|| self.globe.altitude()),
+        }
+    }
+
+    // ── Navigation mode transitions ───────────────────────────────────────
+
+    /// Tab: Globe→Placement, Placement→Globe (cancel), FirstPerson→Globe.
+    fn cycle_nav_mode(&mut self) {
+        match self.nav.mode() {
+            NavMode::Globe => {
+                self.nav.begin_placement(&self.globe.camera());
+                log::info!("Nav: Globe → Placement (click to place first-person spawn)");
+            }
+            NavMode::Placement => {
+                // Cancel placement: reset state machine to Globe.
+                self.nav = NavState::new();
+                log::info!("Nav: Placement cancelled → Globe");
+            }
+            NavMode::FirstPerson => {
+                self.exit_first_person("Tab");
+            }
+        }
+    }
+
+    /// Grab and hide the cursor for first-person mouse-look.
+    ///
+    /// Tries `CursorGrabMode::Locked` first (preferred — pointer is confined and
+    /// reports raw deltas on Windows/Linux).  Falls back to `Confined` if the
+    /// platform does not support Locked (macOS).  Silently ignores errors if
+    /// neither mode is available.
+    fn grab_cursor(&self) {
+        if let Some(window) = &self.window {
+            let locked = window.set_cursor_grab(CursorGrabMode::Locked);
+            if locked.is_err() {
+                let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+            }
+            window.set_cursor_visible(false);
+        }
+    }
+
+    /// Release the cursor and make it visible again.
+    fn release_cursor(&self) {
+        if let Some(window) = &self.window {
+            let _ = window.set_cursor_grab(CursorGrabMode::None);
+            window.set_cursor_visible(true);
+        }
+    }
+
+    /// Common exit-first-person logic.
+    fn exit_first_person(&mut self, reason: &str) {
+        if let Some(restored) = self.nav.exit_first_person() {
+            let alt = (restored.position.length() - PLANET_RADIUS).max(0.0);
+            self.globe = GlobeControls::new(alt);
+        }
+        self.first_person = None;
+        self.release_cursor();
+        log::info!("Nav: FirstPerson → Globe ({})", reason);
+    }
+
+    /// Placement mode: ray-cast and spawn a first-person controller.
+    fn try_place_first_person(&mut self) {
+        // Compute aspect ratio from window size.
+        let aspect = self
+            .window
+            .as_ref()
+            .map(|w| {
+                let s = w.inner_size();
+                if s.height > 0 { s.width as f32 / s.height as f32 } else { 16.0 / 9.0 }
+            })
+            .unwrap_or(16.0 / 9.0);
+
+        let camera   = self.active_camera();
+        let (nx, ny) = self.cursor_ndc;
+        let (origin, dir) = surface_picker::camera_ray(&camera, nx, ny, aspect);
+
+        if let Some(hit) = surface_picker::pick(origin, dir, DVec3::ZERO, PLANET_RADIUS) {
+            log::info!(
+                "Nav: surface pick ({:.0}, {:.0}, {:.0}) — spawning first-person",
+                hit.point.x, hit.point.y, hit.point.z
+            );
+            let cam_fwd  = (camera.orientation * glam::Vec3::NEG_Z).as_dvec3();
+            let up       = hit.normal;
+            let projected = cam_fwd - up * cam_fwd.dot(up);
+            let heading  = if projected.length_squared() > 1e-10 {
+                projected.normalize().as_vec3()
+            } else {
+                glam::Vec3::Z
+            };
+
+            self.first_person = Some(FirstPersonController::new(
+                hit.point,
+                PLANET_RADIUS,
+                heading,
+            ));
+            self.nav.point_picked();
+            self.grab_cursor();
+            log::info!("Nav: Placement → FirstPerson");
+        } else {
+            log::info!("Nav: placement click missed the planet");
+        }
+    }
+
+    // ── Per-frame update ──────────────────────────────────────────────────
+
+    /// Compute the scripted soak-terrain camera for the current elapsed time.
+    ///
+    /// # Camera path
+    ///
+    /// The path loops with period `SOAK_PERIOD_S` and has three phases:
+    ///
+    ///   0 → DESCENT_END   — exponential descent from 100 km orbit to 500 m skim altitude.
+    ///   DESCENT_END → ASCENT_START — skim at low altitude with slow azimuth rotation.
+    ///   ASCENT_START → SOAK_PERIOD_S — ascent back to 100 km orbit.
+    ///
+    /// A slow continuous azimuth drift (one revolution per two full periods) ensures
+    /// the LOD tree sees genuinely different surface regions each loop.
+    ///
+    /// The polar angle is fixed at 45° from the north pole to keep camera-relative
+    /// rendering stable (avoids the pole singularity in look_at).
+    fn soak_camera(&self, elapsed: f64) -> Camera {
+        use controls::globe::spherical_to_cartesian;
+        use glam::{Quat, Vec3};
+
+        const PLANET_RADIUS_M: f64 = controls::PLANET_RADIUS;
+
+        // ── Altitude profile ─────────────────────────────────────────────
+        const HIGH_ALT: f64   = 100_000.0; // 100 km orbit
+        const LOW_ALT:  f64   =     500.0; // 500 m skim
+        const SOAK_PERIOD_S: f64  = 40.0;  // one full loop in seconds
+        const DESCENT_FRAC:  f64  = 0.35;  // fraction of period spent descending
+        const SKIM_FRAC:     f64  = 0.25;  // fraction skimming at low alt
+        // ascent occupies the remaining (1 - DESCENT_FRAC - SKIM_FRAC) of the period
+
+        let phase = (elapsed % SOAK_PERIOD_S) / SOAK_PERIOD_S; // 0..1 within the period
+
+        let altitude = if phase < DESCENT_FRAC {
+            // Descent: exponential ease-in so LOD splits happen gradually then rapidly.
+            let t = phase / DESCENT_FRAC; // 0..1
+            let log_high = HIGH_ALT.ln();
+            let log_low  = LOW_ALT.ln();
+            (log_high + (log_low - log_high) * t).exp()
+        } else if phase < DESCENT_FRAC + SKIM_FRAC {
+            // Skim: constant low altitude.
+            LOW_ALT
+        } else {
+            // Ascent: exponential ease-out back to orbit.
+            let t = (phase - DESCENT_FRAC - SKIM_FRAC) / (1.0 - DESCENT_FRAC - SKIM_FRAC);
+            let log_low  = LOW_ALT.ln();
+            let log_high = HIGH_ALT.ln();
+            (log_low + (log_high - log_low) * t).exp()
+        };
+
+        let radius = PLANET_RADIUS_M + altitude;
+
+        // ── Azimuth: one full revolution every two periods ───────────────
+        let theta = (elapsed / (SOAK_PERIOD_S * 2.0) * std::f64::consts::TAU) as f32;
+
+        // ── Fixed polar angle: 45° from north pole ───────────────────────
+        let phi = std::f32::consts::FRAC_PI_4;
+
+        let pos = spherical_to_cartesian(radius, theta, phi);
+
+        let forward = (-pos).normalize().as_vec3();
+        let world_up = Vec3::Y;
+        let right    = forward.cross(world_up).normalize();
+        let up       = right.cross(forward).normalize();
+        let orientation = Quat::from_mat3(&glam::Mat3::from_cols(right, up, -forward));
+
+        Camera {
+            position: pos,
+            orientation,
+            fov_y_radians: 60_f32.to_radians(),
+            near: 0.5,
+            far: 750_000.0,
+        }
+    }
+
+    fn update_nav(&mut self, dt: f32) {
+        let (dx, dy) = self.mouse_delta;
+        match self.nav.mode() {
+            NavMode::Globe | NavMode::Placement => {
+                // Globe drag sourced from CursorMoved deltas, gated by scene_drag_active.
+                if self.scene_drag_active && (dx != 0.0 || dy != 0.0) {
+                    self.globe.on_drag(dx, dy);
+                }
+                if self.scroll.abs() > 0.01 {
+                    self.globe.on_scroll(self.scroll);
+                }
+                self.globe.update(dt);
+
+                // Placement: left-click fires a ray-cast.
+                if self.nav.mode() == NavMode::Placement && self.lmb_click {
+                    self.try_place_first_person();
+                }
+            }
+            NavMode::FirstPerson => {
+                if let Some(fp) = self.first_person.as_mut() {
+                    // Mouse motion → mouse look (applied raw, not just on LMB).
+                    if dx.abs() > 0.01 || dy.abs() > 0.01 {
+                        fp.on_mouse_look(dx, dy);
+                    }
+                    fp.on_move(self.move_keys, dt);
+                }
+            }
+        }
+
+        // Clear per-frame accumulators.
+        self.mouse_delta = (0.0, 0.0);
+        self.lmb_click   = false;
+        self.scroll      = 0.0;
+    }
+}
+
+// ── ApplicationHandler ────────────────────────────────────────────────────────
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+
+        let title = match self.mode {
+            RenderMode::Planet      => "enki",
+            RenderMode::Markers     => "enki — markers",
+            RenderMode::Stress      => "enki — stress-streaming",
+            RenderMode::SoakTerrain => "enki — soak-terrain",
+        };
+
+        let attrs = WindowAttributes::default()
+            .with_title(title)
+            .with_inner_size(LogicalSize::new(1280u32, 720u32))
+            .with_resizable(true);
+
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => w,
+            Err(e) => {
+                log::error!("Failed to create window: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
+
+        log::info!("Window created (1280x720)");
+
+        let config = RhiConfig {
+            uniform_buffer_size: std::mem::size_of::<FrameUniforms>() as u64,
+            ..RhiConfig::default()
+        };
+
+        let mut rhi = match Rhi::new(&window, config) {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("Rhi::new failed: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
+
+        log::info!("RHI initialised");
+
+        let color_format = rhi.swapchain_format();
+        let samples      = rhi.msaa_samples();
+
+        match self.mode {
+            RenderMode::Planet | RenderMode::SoakTerrain => {
+                // Build the terrain pipelines for PlanetView.
+                use enki_render::{terrain_pass::TERRAIN_WGSL, material::ChunkPush};
+                use enki_rhi::{GraphicsPipelineDesc, ShaderModule};
+                let push_size = std::mem::size_of::<ChunkPush>() as u32;
+                let set0 = rhi.set0_layout();
+
+                let terrain_shader: ShaderModule = match rhi.create_shader_module(TERRAIN_WGSL) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::error!("Failed to compile terrain shader: {e}");
+                        event_loop.exit();
+                        return;
+                    }
+                };
+
+                let terrain_pipeline = match rhi.create_graphics_pipeline(&GraphicsPipelineDesc {
+                    shader: terrain_shader,
+                    vs_entry: "vs_main",
+                    fs_entry: "fs_main",
+                    push_constant_size: push_size,
+                    set0_layout: set0,
+                    color_format,
+                    depth_format: enki_rhi::vk::Format::D32_SFLOAT,
+                    samples,
+                    blend: false,
+                    fill: true,
+                }) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::error!("Failed to create terrain pipeline: {e}");
+                        event_loop.exit();
+                        return;
+                    }
+                };
+
+                let terrain_wireframe_pipeline = match rhi.create_graphics_pipeline(&GraphicsPipelineDesc {
+                    shader: terrain_shader,
+                    vs_entry: "vs_main",
+                    fs_entry: "fs_main",
+                    push_constant_size: push_size,
+                    set0_layout: set0,
+                    color_format,
+                    depth_format: enki_rhi::vk::Format::D32_SFLOAT,
+                    samples,
+                    blend: false,
+                    fill: false,
+                }) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::error!("Failed to create terrain wireframe pipeline: {e}");
+                        event_loop.exit();
+                        return;
+                    }
+                };
+
+                rhi.destroy_shader_module(terrain_shader);
+
+                let cfg = PlanetConfig {
+                    lod: LodConfig {
+                        radius:        50_000.0,
+                        height_scale:  1_200.0,
+                        resolution:    32,
+                        max_depth:     12,
+                        target_tri_px: 2.0,
+                        hysteresis:    0.15,
+                        lru_capacity:  1024,
+                    },
+                    seed:      42,
+                    n_workers: 4,
+                    terrain_pipeline,
+                    terrain_wireframe_pipeline,
+                    // Tectonic terrain — matches demiurge defaults.
+                    use_tectonics:     true,
+                    plate_count:       12,
+                    arc_density:       1.0,
+                    hotspot_count:     8,
+                    hotspot_intensity: 1.0,
+                };
+
+                // Climate params are baked into TectonicHeightField at startup
+                // and are not retained in PlanetView after construction.
+                let climate = ClimateParams {
+                    seed:           42,
+                    base_temp:      15.0,
+                    atmosphere:     0.6,
+                    band_count:     3,
+                    axial_tilt_rad: 23.0_f64.to_radians(),
+                    redistribution: None,
+                    greenhouse:     None,
+                    lapse_rate:     None,
+                };
+
+                // Kick off the async load (heightfield + 6 deep per-face Nanite
+                // DAGs) on a worker thread. The main loop renders a progress bar
+                // until it completes, then builds PlanetView + uploads the resident
+                // Nanite DAGs on the main thread. The heightfield is built ONCE.
+                let params = loading::LoadParams {
+                    seed: cfg.seed,
+                    use_tectonics: cfg.use_tectonics,
+                    plate_count: cfg.plate_count,
+                    arc_density: cfg.arc_density,
+                    hotspot_count: cfg.hotspot_count,
+                    hotspot_intensity: cfg.hotspot_intensity,
+                    climate,
+                    radius: cfg.lod.radius,
+                    height_scale: cfg.lod.height_scale,
+                    // Stage 2: bake DEEP (DAG exceeds the GPU pool); only the
+                    // near-cut subset is streamed resident per frame.
+                    nanite_resolution: 1024,
+                };
+                if matches!(self.mode, RenderMode::SoakTerrain) {
+                    self.soak_start = Instant::now();
+                }
+                self.loader = Some(loading::Loader::spawn(params));
+                self.pending_planet_cfg = Some(cfg);
+                log::info!("Async load started (heightfield + Nanite bake on a worker thread)");
+            }
+            RenderMode::Markers => {
+                match Scene::new(&mut rhi, color_format, samples) {
+                    Ok(s) => {
+                        log::info!("Scene built (markers mode)");
+                        self.scene = Some(s);
+                    }
+                    Err(e) => {
+                        log::error!("Scene::new failed: {e}");
+                        event_loop.exit();
+                        return;
+                    }
+                }
+            }
+            RenderMode::Stress => {
+                match StressHarness::new(&mut rhi, color_format, samples) {
+                    Ok(h) => {
+                        log::info!("Stress harness built");
+                        self.stress = Some(h);
+                    }
+                    Err(e) => {
+                        log::error!("StressHarness::new failed: {e}");
+                        event_loop.exit();
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Build egui state — needs the window for HasDisplayHandle (clipboard).
+        self.egui = Some(EguiState::new(&rhi, &window));
+        // egui draws at TYPE_1 in its own 1-sample pass on the resolved swapchain image.
+        log::info!("egui initialised (1-sample UI pass, swapchain format {:?})", rhi.swapchain_format());
+
+        // Initialise the TAA resolve resources (toggle starts OFF; the proven
+        // non-TAA path remains the default until the user enables it).
+        match rhi.create_shader_module(enki_render::taa::TAA_RESOLVE_WGSL) {
+            Ok(module) => {
+                let ubo_size = std::mem::size_of::<enki_render::taa::ResolveParams>() as u64;
+                if let Err(e) = rhi.init_taa(&module, "vs_fullscreen", "fs_resolve", ubo_size) {
+                    log::error!("TAA init failed: {e}");
+                }
+                rhi.destroy_shader_module(module);
+            }
+            Err(e) => log::error!("TAA resolve shader compile failed: {e}"),
+        }
+
+        self.last_tick = Instant::now();
+        self.window    = Some(window);
+        self.rhi       = Some(rhi);
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        // ── 1. Feed to egui FIRST ─────────────────────────────────────────────
+        // We need both window and egui; extract them carefully.
+        let egui_consumed = match (self.egui.as_mut(), self.window.as_ref()) {
+            (Some(eg), Some(w)) => eg.on_window_event(w, &event),
+            _ => false,
+        };
+
+        // ── 2. Non-render events (always handled, egui consumed irrelevant) ────
+        match &event {
+            WindowEvent::CloseRequested => {
+                log::info!("Close requested");
+                if let Some(rhi) = &self.rhi {
+                    if let Err(e) = rhi.wait_idle() {
+                        log::error!("wait_idle failed: {e}");
+                    }
+                }
+                event_loop.exit();
+                return;
+            }
+
+            WindowEvent::Resized(size) => {
+                self.minimized = size.width == 0 || size.height == 0;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+                return;
+            }
+
+            WindowEvent::RedrawRequested => {
+                // Handled below — fall through.
+            }
+
+            _ => {}
+        }
+
+        // ── 3. Nav input (only when egui did not capture) ─────────────────────
+        if !egui_consumed {
+            self.handle_nav_window_event(&event);
+        }
+
+        // ── 4. Render ─────────────────────────────────────────────────────────
+        if matches!(event, WindowEvent::RedrawRequested) {
+            self.render_frame();
+        }
+    }
+
+    /// Raw device events — mouse motion lives here in winit 0.30.
+    ///
+    /// Globe/Placement drag now sources from `WindowEvent::CursorMoved` (reliable
+    /// on WSLg/Xwayland).  This path is kept alive for `NavMode::FirstPerson`
+    /// mouse-look, which uses locked-cursor raw deltas that don't emit CursorMoved.
+    ///
+    /// NOTE: FirstPerson raw-input may have the same WSLg reliability issue —
+    /// tracked as a separate follow-up.
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id:  DeviceId,
+        event:       DeviceEvent,
+    ) {
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            if self.nav.mode() == NavMode::FirstPerson {
+                self.mouse_delta.0 += dx as f32;
+                self.mouse_delta.1 += dy as f32;
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+    }
+}
+
+// ── Navigation input (window events only — MouseMotion is in device_event) ───
+
+impl App {
+    fn handle_nav_window_event(&mut self, event: &WindowEvent) {
+        match event {
+            // Track cursor position as NDC for Placement ray-cast, and accumulate
+            // CursorMoved deltas for orbit drag while scene_drag_active.
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(w) = &self.window {
+                    let s = w.inner_size();
+                    if s.width > 0 && s.height > 0 {
+                        let nx =  (position.x as f32 / s.width  as f32) * 2.0 - 1.0;
+                        let ny = -((position.y as f32 / s.height as f32) * 2.0 - 1.0);
+                        self.cursor_ndc = (nx, ny);
+                    }
+                }
+                if self.scene_drag_active {
+                    if let Some((px, py)) = self.cursor_pos_prev {
+                        self.mouse_delta.0 += (position.x - px) as f32;
+                        self.mouse_delta.1 += (position.y - py) as f32;
+                    }
+                }
+                self.cursor_pos_prev = Some((position.x, position.y));
+            }
+
+            // LMB state (drag and placement click).
+            WindowEvent::MouseInput { button: MouseButton::Left, state, .. } => {
+                let pressed = *state == ElementState::Pressed;
+                if pressed && !self.lmb_held {
+                    self.lmb_click = true; // rising edge
+                    // Press landed on the 3D scene (egui consumed check is upstream).
+                    self.scene_drag_active = true;
+                    self.cursor_pos_prev = None; // fresh baseline; first CursorMoved sets it
+                }
+                if !pressed {
+                    self.scene_drag_active = false;
+                }
+                self.lmb_held = pressed;
+            }
+
+            // Scroll wheel → Globe zoom.
+            WindowEvent::MouseWheel { delta, .. } => {
+                self.scroll += match delta {
+                    MouseScrollDelta::LineDelta(_, y)   => *y,
+                    MouseScrollDelta::PixelDelta(p)     => p.y as f32 * 0.01,
+                };
+            }
+
+            // Keyboard input.
+            WindowEvent::KeyboardInput {
+                event: KeyEvent {
+                    physical_key: PhysicalKey::Code(code),
+                    state,
+                    repeat: false,
+                    ..
+                },
+                ..
+            } => {
+                let pressed = *state == ElementState::Pressed;
+                match code {
+                    // ── Nav mode cycle ────────────────────────────────────────
+                    KeyCode::Tab if pressed => {
+                        self.cycle_nav_mode();
+                    }
+
+                    // ── Exit first-person ─────────────────────────────────────
+                    KeyCode::Escape if pressed => {
+                        if self.nav.mode() == NavMode::FirstPerson {
+                            self.exit_first_person("Escape");
+                        }
+                    }
+
+                    // ── Material mode cycle ───────────────────────────────────
+                    KeyCode::KeyM if pressed => {
+                        self.material_mode = (self.material_mode + 1) % 4;
+                        log::info!("Material mode → {}", self.material_mode);
+                    }
+
+                    // ── Wireframe toggle ──────────────────────────────────────
+                    // Use W in Globe/Placement mode for wireframe; in FirstPerson
+                    // W is forward movement.
+                    KeyCode::KeyW if pressed && self.nav.mode() != NavMode::FirstPerson => {
+                        self.wireframe = !self.wireframe;
+                        log::info!("Wireframe → {}", self.wireframe);
+                    }
+
+                    // ── FirstPerson WASD ──────────────────────────────────────
+                    KeyCode::KeyW => { self.move_keys.forward  = pressed; }
+                    KeyCode::KeyA => { self.move_keys.left     = pressed; }
+                    KeyCode::KeyS => { self.move_keys.backward = pressed; }
+                    KeyCode::KeyD => { self.move_keys.right    = pressed; }
+                    KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                        self.move_keys.sprint = pressed;
+                    }
+
+                    _ => {}
+                }
+            }
+
+            _ => {}
+        }
+    }
+}
+
+// ── Render frame ──────────────────────────────────────────────────────────────
+
+impl App {
+    /// Render the loading screen: clear + a centered egui progress bar.
+    fn render_loading(&mut self, prog: &loading::LoadProgress) {
+        let rhi = match self.rhi.as_mut() {
+            Some(r) => r,
+            None => return,
+        };
+        let fi = match rhi.begin_frame() {
+            Ok(i) => i,
+            Err(e) => {
+                log::debug!("begin_frame (loading) skipped: {e}");
+                return;
+            }
+        };
+        if fi == u32::MAX {
+            let _ = rhi.end_frame(fi);
+            return;
+        }
+
+        if let (Some(egui), Some(window)) = (self.egui.as_mut(), self.window.as_ref()) {
+            egui.loading_frame(window, rhi, prog.fraction, &prog.message);
+        }
+
+        rhi.begin_rendering(fi);
+        rhi.set_viewport_scissor_full(fi);
+        rhi.begin_ui_pass(fi);
+        if let Some(egui) = self.egui.as_mut() {
+            egui.render(rhi, fi);
+        }
+        if let Err(e) = rhi.end_frame(fi) {
+            log::error!("end_frame (loading) error: {e}");
+        }
+    }
+
+    fn render_frame(&mut self) {
+        if self.minimized {
+            return;
+        }
+
+        // ── Delta time ────────────────────────────────────────────────────
+        let now = Instant::now();
+        let dt  = now.duration_since(self.last_tick).as_secs_f32().min(0.1);
+        self.last_tick = now;
+        self.last_dt   = dt;
+
+        // ── Async loading: show a progress bar until the worker finishes ──
+        if self.loader.is_some() {
+            match self.loader.as_ref().and_then(|l| l.poll()) {
+                Some(out) => {
+                    // Worker finished — assemble on the main thread (GPU uploads
+                    // need the RHI). Then fall through to normal rendering.
+                    if let Some(cfg) = self.pending_planet_cfg.take() {
+                        #[cfg(feature = "nanite")]
+                        {
+                            self.nanite_radius = cfg.lod.radius;
+                        }
+                        self.planet_view = Some(planet_view_from_hf(cfg, out.hf));
+                    }
+
+                    // Nanite (Stage 2): the deep per-face DAGs live in RAM; the GPU
+                    // pool starts empty and the streamer uploads only the near-cut
+                    // cluster subset each frame, so the DAG can exceed GPU memory.
+                    #[cfg(feature = "nanite")]
+                    if let Some(nodes) = out.nanite_asset {
+                        if let Some(rhi) = self.rhi.as_mut() {
+                            match enki_nanite::render::NaniteRenderer::new(rhi, &[]) {
+                                Ok(r) => {
+                                    let clusters: usize =
+                                        nodes.iter().map(|a| a.cluster_count()).sum();
+                                    log::info!(
+                                        "Nanite Stage-2 ready ({} faces, {} clusters in DAG; streaming near-cut subset)",
+                                        nodes.len(),
+                                        clusters,
+                                    );
+                                    self.nanite_streamer = Some(
+                                        enki_nanite::residency::ClusterStreamer::new(&nodes),
+                                    );
+                                    self.nanite_assets = nodes;
+                                    self.nanite = Some(r);
+                                }
+                                Err(e) => log::error!("Nanite renderer init failed: {e}"),
+                            }
+                        }
+                    }
+                    self.loader = None;
+                    log::info!("Async load complete.");
+                }
+                None => {
+                    let prog = self.loader.as_ref().unwrap().progress();
+                    self.render_loading(&prog);
+                    return;
+                }
+            }
+        }
+
+        // ── Navigation update (skipped in soak mode — camera is scripted) ──
+        if !matches!(self.mode, RenderMode::SoakTerrain) {
+            self.update_nav(dt);
+        } else {
+            self.soak_elapsed += dt as f64;
+            self.soak_frames_since_log += 1;
+        }
+
+        // ── Snapshot state for this frame ─────────────────────────────────
+        let (camera, altitude) = if matches!(self.mode, RenderMode::SoakTerrain) {
+            let cam = self.soak_camera(self.soak_elapsed);
+            let alt = (cam.position.length() - controls::PLANET_RADIUS).max(0.0);
+            (cam, alt)
+        } else {
+            (self.active_camera(), self.altitude_m())
+        };
+        let nav_mode      = self.nav.mode();
+        let material_mode = self.material_mode;
+        let wireframe     = self.wireframe;
+        let taa_on        = self.taa_enabled;
+        // This frame's sub-pixel jitter (for rasterization); advance() rolls it
+        // forward after the 3D draws so the resolve uses the matching history.
+        let jitter_px     = if taa_on { self.taa_jitter.jitter_px() } else { glam::Vec2::ZERO };
+
+        // ── Planet LOD stats (for HUD + egui) ────────────────────────────
+        let planet_stats: Option<PlanetViewStats> = self
+            .planet_view
+            .as_ref()
+            .map(|pv| pv.stats());
+
+        // ── Build egui frame (OUTSIDE rendering instance) ─────────────────
+        // Egui texture uploads happen here via one-shot submit.
+        // This must run before begin_frame → begin_rendering.
+        let ui_out = if self.egui.is_some() && self.window.is_some() && self.rhi.is_some() {
+            let nanite_enabled    = self.nanite_enabled;
+            let nanite_debug_mode = self.nanite_debug_mode;
+            let nanite_tau        = self.nanite_tau;
+            // egui, window, and rhi are independent fields — split-borrow.
+            let egui   = self.egui.as_mut().unwrap();
+            let window = self.window.as_ref().unwrap();
+            let rhi    = self.rhi.as_ref().unwrap();
+
+            Some(egui.build_frame(
+                window, rhi, nav_mode, altitude, dt, material_mode, wireframe, taa_on,
+                nanite_enabled, nanite_debug_mode, nanite_tau, cfg!(feature = "nanite"),
+                None, planet_stats.as_ref(),
+            ))
+        } else {
+            None
+        };
+
+        // Apply the debug panel's control changes back to app state.  The 3D view
+        // this frame still uses the pre-build snapshot (1-frame latency on toggles,
+        // imperceptible); nav actions take effect via the &mut self calls below.
+        if let Some(out) = ui_out {
+            self.material_mode     = out.material_mode;
+            self.wireframe         = out.wireframe;
+            self.taa_enabled       = out.taa;
+            self.nanite_enabled    = out.nanite_enabled;
+            self.nanite_debug_mode = out.nanite_debug_mode;
+            self.nanite_tau        = out.nanite_tau;
+            if out.cycle_nav {
+                self.cycle_nav_mode();
+            }
+            if out.exit_first_person && self.nav.mode() == NavMode::FirstPerson {
+                self.exit_first_person("UI button");
+            }
+        }
+
+        // ── HUD window-title update ───────────────────────────────────────
+        if let Some(window) = &self.window {
+            self.hud.update(window, dt, nav_mode, altitude, material_mode, wireframe,
+                planet_stats.as_ref());
+        }
+
+        // ── Acquire aspect + screen height from RHI ───────────────────────
+        let (aspect, screen_h_px) = self.rhi.as_ref().map(|r| {
+            let ext = r.extent();
+            let h = ext.height;
+            let a = if h > 0 { ext.width as f32 / h as f32 } else { 16.0 / 9.0 };
+            (a, h as f32)
+        }).unwrap_or((16.0 / 9.0, 720.0));
+
+        // ── Frame begin ───────────────────────────────────────────────────
+        let rhi = match self.rhi.as_mut() { Some(r) => r, None => return };
+
+        // Select the TAA path for this frame (must be set before begin_frame, which
+        // branches its image-layout barriers on it). No-op until init_taa ran.
+        rhi.set_taa_enabled(taa_on);
+
+        let fi = match rhi.begin_frame() {
+            Ok(idx) => idx,
+            Err(RhiError::Vulkan(vk_result)) => {
+                log::debug!("begin_frame swapchain event ({vk_result:?}) — skipping");
+                if let Some(w) = &self.window { w.request_redraw(); }
+                return;
+            }
+            Err(e) => {
+                log::error!("begin_frame error: {e}");
+                return;
+            }
+        };
+
+        if fi == u32::MAX {
+            if let Err(e) = rhi.end_frame(fi) {
+                log::error!("end_frame error: {e}");
+            }
+            return;
+        }
+
+        // ── 3D rendering ──────────────────────────────────────────────────
+        match self.mode {
+            RenderMode::Planet => {
+                // Build frame uniforms with rotation-only camera-relative view,
+                // as documented in FrameUniforms::new. With TAA on, jitter the
+                // projection sub-pixel (terrain + Nanite both read this view-proj).
+                let lights = Lights::demiurge_default();
+                let fu     = if taa_on {
+                    FrameUniforms::new_jittered(
+                        &camera, aspect, &lights, jitter_px, aspect * screen_h_px, screen_h_px,
+                    )
+                } else {
+                    FrameUniforms::new(&camera, aspect, &lights)
+                };
+
+                // Build the LOD camera with full world view-proj for frustum culling.
+                let proj = reversed_z_perspective(
+                    camera.fov_y_radians, aspect, camera.near, camera.far,
+                );
+                let view_world      = camera.view_matrix();
+                let view_proj_local = proj * view_world;
+
+                let lod_cam = LodCamera {
+                    local_pos:       camera.position,
+                    v_fov_rad:       camera.fov_y_radians,
+                    screen_h_px,
+                    view_proj_local,
+                };
+                let camera_world_pos = camera.position;
+
+                // Mutual exclusivity: Nanite is an LOD system that REPLACES the
+                // quadtree terrain. When it's active, the quadtree is not rendered.
+                #[cfg(feature = "nanite")]
+                let nanite_active = self.nanite_enabled && self.nanite.is_some();
+                #[cfg(not(feature = "nanite"))]
+                let nanite_active = false;
+
+                // PlanetView::update — streaming uploads (outside rendering instance).
+                if !nanite_active {
+                    if let Some(pv) = self.planet_view.as_mut() {
+                        pv.update(rhi, fi, self.frame_counter, &lod_cam, camera_world_pos);
+                    }
+                }
+
+                // Nanite (Stage 2): stream the near-cut cluster subset, then per-
+                // frame uniforms + cull dispatch (MUST be outside the rendering
+                // instance — compute dispatch is illegal inside it).
+                #[cfg(feature = "nanite")]
+                if nanite_active {
+                    // 1. Reselect the resident set (throttled), then INCREMENTALLY
+                    //    reconcile the GPU page pool: update_residency uploads only the
+                    //    newly-added clusters and frees the removed ones (stable slots,
+                    //    no whole-set re-pack) → no fast-zoom hitch.
+                    {
+                        let cot = 1.0 / (camera.fov_y_radians * 0.5).tan();
+                        let altitude =
+                            (camera_world_pos.length() - self.nanite_radius).max(1.0);
+                        // Wide margin keeps the resident set valid between reselections.
+                        let move_thresh = (altitude * 0.25).max(25.0);
+                        // Rate-limit how often we recompute the (whole-DAG) selection.
+                        const MIN_RESEL_FRAMES: u64 = 4;
+                        let eligible = self.frame_counter.wrapping_sub(self.nanite_last_resel)
+                            >= MIN_RESEL_FRAMES;
+                        let changed = if eligible {
+                            if let Some(s) = self.nanite_streamer.as_mut() {
+                                s.update(
+                                    camera_world_pos, self.nanite_tau, screen_h_px, cot, 2.5,
+                                    move_thresh,
+                                )
+                                .is_some()
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if changed {
+                            self.nanite_last_resel = self.frame_counter;
+                            let fif = rhi.frames_in_flight() as u64;
+                            let completed = self.frame_counter;
+                            let retire_at = self.frame_counter + fif;
+                            if let (Some(n), Some(s)) =
+                                (self.nanite.as_mut(), self.nanite_streamer.as_ref())
+                            {
+                                let _ = n.update_residency(
+                                    rhi, completed, retire_at, &self.nanite_assets,
+                                    s.entries(), s.selection(),
+                                );
+                            }
+                        }
+                    }
+                    // 2. Per-frame uniforms (incl. this frame's active-slot list) + cull.
+                    //    FrameUniforms gives the rotation-only camera-relative view-proj
+                    //    AND the terrain's lights.
+                    if let Some(n) = self.nanite.as_mut() {
+                        // Dithered LOD cross-fade is only useful with TAA on (it
+                        // resolves the per-frame stipple into a smooth blend).
+                        let _ = n.update(
+                            rhi, fi, camera_world_pos, &fu, screen_h_px,
+                            camera.fov_y_radians, self.nanite_tau, self.nanite_debug_mode,
+                            self.taa_enabled, self.frame_counter as u32,
+                        );
+                        let _ = n.record_cull(rhi, fi);
+                    }
+                }
+
+                // 3D opaque pass.
+                rhi.begin_rendering(fi);
+                rhi.set_viewport_scissor_full(fi);
+                if !nanite_active {
+                    if let Some(pv) = self.planet_view.as_mut() {
+                        if let Err(e) = pv.record(rhi, fi, &fu, camera_world_pos, material_mode, wireframe) {
+                            log::error!("PlanetView::record error: {e}");
+                        }
+                    }
+                }
+
+                // Nanite: indirect, vertex-pulling draw (inside the rendering instance).
+                #[cfg(feature = "nanite")]
+                if nanite_active {
+                    if let Some(n) = self.nanite.as_ref() {
+                        let _ = n.record_draw(rhi, fi);
+                    }
+                }
+            }
+            RenderMode::Markers => {
+                rhi.begin_rendering(fi);
+                if let Some(scene) = self.scene.as_mut() {
+                    let fu = FrameUniforms::new(&camera, aspect, &scene.lights);
+                    if let Err(e) = scene.record_frame(rhi, fi, &fu, &camera, material_mode, wireframe) {
+                        log::error!("record_frame error: {e}");
+                    }
+                }
+            }
+            RenderMode::Stress => {
+                let lights = Lights::demiurge_default();
+                let fu     = FrameUniforms::new(&camera, aspect, &lights);
+                if let Some(harness) = self.stress.as_mut() {
+                    if let Err(e) = harness.upload_phase(rhi, fi) {
+                        log::error!("stress upload_phase error: {e}");
+                    }
+                }
+                rhi.begin_rendering(fi);
+                if let Some(harness) = self.stress.as_mut() {
+                    if let Err(e) = harness.draw_phase(rhi, fi, &fu) {
+                        log::error!("stress draw_phase error: {e}");
+                    }
+                }
+            }
+            RenderMode::SoakTerrain => {
+                // Scripted fly-through: builds LodCamera + FrameUniforms exactly
+                // as Planet mode does, but with a deterministic soak camera position.
+                let lights = Lights::demiurge_default();
+                let fu     = FrameUniforms::new(&camera, aspect, &lights);
+
+                let proj = reversed_z_perspective(
+                    camera.fov_y_radians, aspect, camera.near, camera.far,
+                );
+                let view_world      = camera.view_matrix();
+                let view_proj_local = proj * view_world;
+
+                let lod_cam = LodCamera {
+                    local_pos:       camera.position,
+                    v_fov_rad:       camera.fov_y_radians,
+                    screen_h_px,
+                    view_proj_local,
+                };
+                let camera_world_pos = camera.position;
+
+                if let Some(pv) = self.planet_view.as_mut() {
+                    pv.update(rhi, fi, self.frame_counter, &lod_cam, camera_world_pos);
+                }
+
+                rhi.begin_rendering(fi);
+                rhi.set_viewport_scissor_full(fi);
+                if let Some(pv) = self.planet_view.as_mut() {
+                    if let Err(e) = pv.record(rhi, fi, &fu, camera_world_pos, material_mode, wireframe) {
+                        log::error!("PlanetView::record error (soak): {e}");
+                    }
+                }
+            }
+        }
+
+        self.frame_counter = self.frame_counter.wrapping_add(1);
+
+        // ── Periodic planet LOD stats log (every ~5 s) ───────────────────
+        // Logs resident chunk count and build queue to confirm the planet is
+        // initializing in headless test runs.
+        if matches!(self.mode, RenderMode::Planet) {
+            // ~300 frames at 60 fps ≈ 5 s; use wrapping so it fires even on slow hw.
+            if self.frame_counter % 300 == 1 {
+                if let Some(pv) = self.planet_view.as_ref() {
+                    let s = pv.stats();
+                    log::info!(
+                        "[planet] frame={} resident_chunks={} build_queue={} lod_levels={}-{}",
+                        self.frame_counter, s.resident_count, s.build_queue_depth,
+                        s.min_lod_level, s.max_lod_level,
+                    );
+                }
+                #[cfg(feature = "nanite")]
+                if self.nanite_enabled {
+                    if let Some(n) = self.nanite.as_ref() {
+                        log::info!(
+                            "[nanite] enabled — visible clusters (prev frame): {}",
+                            n.last_visible_clusters()
+                        );
+                    }
+                }
+            }
+        }
+
+        // ── Periodic soak stats log (every ~5 s, time-based) ─────────────
+        if matches!(self.mode, RenderMode::SoakTerrain) {
+            const SOAK_LOG_INTERVAL_S: f64 = 5.0;
+            if self.soak_elapsed - self.soak_last_log_elapsed >= SOAK_LOG_INTERVAL_S {
+                let wall_elapsed = self.soak_start.elapsed().as_secs_f64();
+                let dt_since_log = (self.soak_elapsed - self.soak_last_log_elapsed).max(1e-6);
+                let fps = self.soak_frames_since_log as f64 / dt_since_log;
+                let graveyard_size = rhi.streaming_graveyard_size();
+
+                if let Some(pv) = self.planet_view.as_ref() {
+                    let s = pv.stats();
+                    log::info!(
+                        "[soak] elapsed={:.1}s wall={:.1}s frame={} fps={:.1} \
+                         resident_chunks={} build_queue={} pending_upload={} \
+                         lod_levels={}-{} graveyard={}",
+                        self.soak_elapsed, wall_elapsed, self.frame_counter, fps,
+                        s.resident_count, s.build_queue_depth, s.pending_upload_count,
+                        s.min_lod_level, s.max_lod_level,
+                        graveyard_size,
+                    );
+                }
+
+                self.soak_last_log_elapsed = self.soak_elapsed;
+                self.soak_frames_since_log = 0;
+            }
+        }
+
+        // ── TAA resolve ──────────────────────────────────────────────────
+        // Must run AFTER all 3D draws and BEFORE begin_ui_pass. Rolls the view-
+        // proj/camera history forward, then reprojects + neighborhood-clamps +
+        // blends the current frame against history and blits to the swapchain.
+        // No-op when TAA is off (begin_rendering rendered straight to the swapchain).
+        if taa_on {
+            let proj = reversed_z_perspective(
+                camera.fov_y_radians, aspect, camera.near, camera.far,
+            );
+            let unjittered_vp = proj * camera.view_matrix_rotation_only();
+            self.taa_jitter.advance(unjittered_vp, camera.position);
+            let params = self.taa_jitter.resolve_params(
+                aspect * screen_h_px,
+                screen_h_px,
+                enki_render::taa::DEFAULT_HISTORY_BLEND,
+            );
+            if let Err(e) = rhi.taa_resolve(fi, params.as_bytes()) {
+                log::error!("taa_resolve error: {e}");
+            }
+        }
+
+        // ── Transition to 1-sample UI pass ───────────────────────────────
+        // begin_ui_pass closes the MSAA 3D instance (non-TAA path), inserts a
+        // resolve→load barrier on the swapchain image, and opens a 1-sample
+        // rendering instance (loadOp=LOAD, no depth attachment). egui-ash-renderer
+        // 0.11 hardcodes TYPE_1 samples, so it MUST draw in this separate pass.
+        // (On the TAA path the 3D instance + swapchain were already handled by
+        // taa_resolve; begin_ui_pass just opens the UI instance.)
+        //
+        // This call is always made (all render modes) so that end_frame always
+        // closes a UI instance — maintaining the begin/end bracket invariant.
+        rhi.begin_ui_pass(fi);
+
+        // ── egui render (inside 1-sample UI pass) ─────────────────────────
+        if let Some(egui) = self.egui.as_mut() {
+            egui.render(rhi, fi);
+        }
+
+        // ── End frame ─────────────────────────────────────────────────────
+        // end_frame closes the UI rendering instance opened by begin_ui_pass,
+        // then submits and presents.
+        if let Err(e) = rhi.end_frame(fi) {
+            log::error!("end_frame error: {e}");
+        }
+    }
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    log::info!("enki starting");
+
+    let args: Vec<String> = std::env::args().collect();
+    let stress_flag  = args.iter().any(|a| a == "--stress-streaming")
+        || std::env::var("ENKI_STRESS_STREAMING").ok().as_deref() == Some("1");
+    let markers_flag = args.iter().any(|a| a == "--markers");
+    let soak_flag    = args.iter().any(|a| a == "--soak-terrain")
+        || std::env::var("ENKI_SOAK_TERRAIN").ok().as_deref() == Some("1");
+
+    let mode = if soak_flag {
+        log::info!("Mode: soak-terrain (scripted fly-through, deterministic camera)");
+        RenderMode::SoakTerrain
+    } else if stress_flag {
+        log::info!("Mode: stress-streaming");
+        RenderMode::Stress
+    } else if markers_flag {
+        log::info!("Mode: markers (depth-proof scene)");
+        RenderMode::Markers
+    } else {
+        log::info!("Mode: planet (default)");
+        RenderMode::Planet
+    };
+
+    let event_loop = EventLoop::new().expect("failed to create event loop");
+    event_loop.set_control_flow(ControlFlow::Poll);
+
+    let mut app = App::new(mode);
+    if let Err(e) = event_loop.run_app(&mut app) {
+        log::error!("Event loop exited with error: {e}");
+        std::process::exit(1);
+    }
+
+    log::info!("enki shut down");
+}

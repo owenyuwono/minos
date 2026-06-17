@@ -1,0 +1,27 @@
+[package]
+name = "enki-app"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["nanite"]
+# Plug-and-play Nanite virtualized terrain. Off (`--no-default-features`) builds
+# the classic engine with zero references to enki-nanite.
+nanite = ["dep:enki-nanite"]
+
+[dependencies]
+enki-nanite = { version = "0.1.0", path = "../enki-nanite", optional = true }
+bytemuck = { version = "1.25.0", features = ["derive"] }
+egui = { version = "0.33", default-features = false, features = ["default_fonts"] }
+egui-winit = { version = "0.33", default-features = false }
+egui-ash-renderer = { version = "0.11.0", default-features = false, features = ["dynamic-rendering"] }
+enki-jobs = { version = "0.1.0", path = "../enki-jobs" }
+enki-planet = { version = "0.1.0", path = "../enki-planet" }
+enki-render = { version = "0.1.0", path = "../enki-render" }
+enki-rhi = { version = "0.1.0", path = "../enki-rhi" }
+env_logger = "0.11.10"
+glam = "0.33.1"
+log = "0.4.32"
+lru = "0.12"
+raw-window-handle = "0.6"
+winit = "0.30"

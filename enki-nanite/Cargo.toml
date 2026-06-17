@@ -1,0 +1,18 @@
+[package]
+name = "enki-nanite"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+glam = "0.33.1"
+enki-planet = { path = "../enki-planet" }
+enki-render = { path = "../enki-render" }
+enki-rhi = { path = "../enki-rhi" }
+meshopt = "0.6.2"
+metis = "0.2"
+bytemuck = { version = "1.25.0", features = ["derive"] }
+crossbeam-channel = "0.5"
+log = "0.4.32"
+
+[dev-dependencies]
+naga = { version = "29.0.3", features = ["wgsl-in"] }

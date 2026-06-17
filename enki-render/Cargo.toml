@@ -1,0 +1,12 @@
+[package]
+name = "enki-render"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytemuck = { version = "1.25.0", features = ["derive"] }
+enki-rhi = { version = "0.1.0", path = "../enki-rhi" }
+glam = "0.33.1"
+log = "0.4.32"
+naga = { version = "29.0.3", features = ["wgsl-in", "spv-out"] }
+thiserror = "2.0.18"
