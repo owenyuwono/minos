@@ -50,123 +50,6 @@ pub struct GpuClusterMeta {
     pub range: [u32; 4],
 }
 
-/// Flattened, GPU-ready geometry for one or more resident node cluster-DAGs.
-pub struct FlatGeometry {
-    /// 9 floats per vertex: position.xyz, normal.xyz, color.rgb (node-origin-relative).
-    pub verts: Vec<f32>,
-    /// 3 u32 per triangle: global vertex indices into `verts`.
-    pub tris: Vec<u32>,
-    /// One entry per cluster (`range[2]` = node index).
-    pub meta: Vec<GpuClusterMeta>,
-    /// Per-node planet-space origin (f64); each node's cluster positions are
-    /// relative to its own origin, so f32 stays precise at planet scale.
-    pub node_origins: Vec<DVec3>,
-    pub cluster_count: u32,
-    /// Upper bound on draw vertex count: `cluster_count * MAX_CLUSTER_TRIS * 3`.
-    pub max_draw_verts: u32,
-}
-
-/// Flatten one or more baked node assets into shared flat storage buffers.
-///
-/// Each cluster is tagged with its node index (`meta.range[2]`), and the per-node
-/// origins are returned so the renderer applies per-node camera-relative
-/// translation. One asset (whole planet) or many (streamed nodes) both work.
-pub fn flatten<'a, I>(assets: I) -> FlatGeometry
-where
-    I: IntoIterator<Item = &'a ClusterAsset>,
-{
-    flatten_capped(assets, &Caps::UNBOUNDED).0
-}
-
-/// Capacity limits for [`flatten_capped`].
-struct Caps {
-    clusters: usize,
-    floats: usize,
-    indices: usize,
-    nodes: usize,
-}
-
-impl Caps {
-    const UNBOUNDED: Caps = Caps {
-        clusters: usize::MAX,
-        floats: usize::MAX,
-        indices: usize::MAX,
-        nodes: usize::MAX,
-    };
-}
-
-/// Like [`flatten`], but stops adding nodes once any capacity limit would be
-/// exceeded. Returns the geometry plus the number of nodes dropped. Callers pass
-/// assets ordered by priority (nearest-first) so only far nodes are dropped.
-fn flatten_capped<'a, I>(assets: I, caps: &Caps) -> (FlatGeometry, usize)
-where
-    I: IntoIterator<Item = &'a ClusterAsset>,
-{
-    let mut verts: Vec<f32> = Vec::new();
-    let mut tris: Vec<u32> = Vec::new();
-    let mut meta: Vec<GpuClusterMeta> = Vec::new();
-    let mut node_origins: Vec<DVec3> = Vec::new();
-    let mut dropped = 0usize;
-
-    for asset in assets.into_iter() {
-        // Size this node before committing it (clusters are tightly packed).
-        let n_clusters = asset.clusters.len();
-        let n_floats: usize = asset.clusters.iter().map(|c| c.vertices.len() * 9).sum();
-        let n_indices: usize = asset.clusters.iter().map(|c| c.triangles.len() * 3).sum();
-        if meta.len() + n_clusters > caps.clusters
-            || verts.len() + n_floats > caps.floats
-            || tris.len() + n_indices > caps.indices
-            || node_origins.len() + 1 > caps.nodes
-        {
-            dropped += 1;
-            continue;
-        }
-
-        let node_idx = node_origins.len();
-        node_origins.push(asset.patch_origin);
-        for (cidx, c) in asset.clusters.iter().enumerate() {
-            let vert_base = (verts.len() / 9) as u32;
-            for v in &c.vertices {
-                verts.extend_from_slice(&v.position);
-                verts.extend_from_slice(&v.normal);
-                verts.extend_from_slice(&v.color);
-            }
-            let tri_offset = (tris.len() / 3) as u32;
-            for t in &c.triangles {
-                tris.push(vert_base + t[0] as u32);
-                tris.push(vert_base + t[1] as u32);
-                tris.push(vert_base + t[2] as u32);
-            }
-            meta.push(GpuClusterMeta {
-                bounds: [c.bounds.center.x, c.bounds.center.y, c.bounds.center.z, c.bounds.radius],
-                parent_bounds: [
-                    c.parent_bounds.center.x,
-                    c.parent_bounds.center.y,
-                    c.parent_bounds.center.z,
-                    c.parent_bounds.radius,
-                ],
-                err: [c.self_error, c.parent_error, c.lod as f32, 0.0],
-                // range[3] = STABLE cluster id (node<<20 | cluster) for debug color,
-                // so it doesn't flicker when the resident set is re-packed.
-                range: [tri_offset, c.triangles.len() as u32, node_idx as u32, stable_id(node_idx as u32, cidx as u32)],
-            });
-        }
-    }
-
-    let cluster_count = meta.len() as u32;
-    (
-        FlatGeometry {
-            verts,
-            tris,
-            meta,
-            node_origins,
-            cluster_count,
-            max_draw_verts: cluster_count * MAX_CLUSTER_TRIS as u32 * 3,
-        },
-        dropped,
-    )
-}
-
 /// Stable per-cluster id for the debug view (face/node in the high bits, cluster
 /// index in the low bits). Independent of the cluster's transient GPU buffer slot,
 /// so debug colors stay put when the streaming set is re-packed.
@@ -696,34 +579,6 @@ mod tests {
     }
 
     #[test]
-    fn flatten_shapes_and_indices_valid() {
-        let a = asset();
-        let f = flatten(std::slice::from_ref(&a));
-
-        let total_verts: usize = a.clusters.iter().map(|c| c.vertices.len()).sum();
-        let total_tris: usize = a.clusters.iter().map(|c| c.triangles.len()).sum();
-
-        assert_eq!(f.verts.len(), total_verts * 9, "9 floats per vertex");
-        assert_eq!(f.tris.len(), total_tris * 3, "3 indices per triangle");
-        assert_eq!(f.meta.len() as usize, a.clusters.len());
-        assert_eq!(f.cluster_count as usize, a.clusters.len());
-
-        // Every triangle index must reference a real vertex.
-        let nverts = (f.verts.len() / 9) as u32;
-        for &i in &f.tris {
-            assert!(i < nverts, "tri index {i} out of range (nverts={nverts})");
-        }
-
-        // meta tri ranges must be consistent and within the tris buffer.
-        let ntris = (f.tris.len() / 3) as u32;
-        for m in &f.meta {
-            let (off, cnt) = (m.range[0], m.range[1]);
-            assert!(off + cnt <= ntris, "meta tri range out of bounds");
-            assert!(cnt as usize <= MAX_CLUSTER_TRIS, "cluster exceeds tri cap");
-        }
-    }
-
-    #[test]
     fn residency_evictions_picks_undesired_keys() {
         let mut resident: HashMap<u32, u32> = HashMap::new();
         resident.insert(10, 0); // key 10 -> slot 0
@@ -774,16 +629,14 @@ mod tests {
     }
 
     #[test]
-    fn flatten_meta_is_monotonic_and_finite_bounds() {
+    fn cluster_meta_is_monotonic_and_finite_bounds() {
         let a = asset();
-        let f = flatten(std::slice::from_ref(&a));
-        for m in &f.meta {
-            let (self_err, parent_err) = (m.err[0], m.err[1]);
-            assert!(parent_err >= self_err, "non-monotonic error in flattened meta");
-            assert!(m.bounds[3] > 0.0, "degenerate bounds radius");
+        for c in &a.clusters {
+            assert!(c.parent_error >= c.self_error, "non-monotonic error");
+            assert!(c.bounds.radius > 0.0, "degenerate bounds radius");
             // Sphere centers must be finite (parent_error may be +inf for roots).
-            assert!(m.bounds[..3].iter().all(|x| x.is_finite()));
-            assert!(m.parent_bounds.iter().all(|x| x.is_finite()));
+            assert!(c.bounds.center.is_finite());
+            assert!(c.parent_bounds.center.is_finite());
         }
     }
 }

@@ -46,13 +46,9 @@ use lru::LruCache;
 
 use enki_jobs::job::{ChunkBuildTemplate, MeshRequest};
 use enki_jobs::pool::WorkerPool;
-use enki_planet::climate::ClimateParams;
 use enki_planet::height::HeightField;
 use enki_planet::lod::{LodCamera, LodConfig, LodTree};
-use enki_planet::noise::Noise3D;
 use enki_planet::quadtree::ChunkKey;
-use enki_planet::sampler::{TectonicHeightField, TectonicHeightFieldParams};
-use enki_planet::simple_height::SimpleHeightField;
 use enki_render::frame::FrameUniforms;
 use enki_render::material::ChunkPush;
 use enki_rhi::{Rhi, RhiError, StreamedMesh};
@@ -394,10 +390,6 @@ impl<U: ChunkUploader> PlanetView<U> {
 
 // ── Production constructor (requires Rhi) ─────────────────────────────────────
 
-/// `PlanetView` specialised for the real GPU path.
-#[allow(dead_code)]
-pub type PlanetViewGpu = PlanetView<RhiUploaderDummy>;
-
 /// Dummy type used only to name the GPU variant of `PlanetView`.
 /// The real uploader is provided each frame via `update(&mut RhiUploader<'_>, ...)`.
 pub enum RhiUploaderDummy {}
@@ -412,44 +404,6 @@ impl ChunkUploader for RhiUploaderDummy {
     fn retire(&mut self, _handle: StreamedMesh) {
         unreachable!()
     }
-}
-
-/// Build a `PlanetView` for the real GPU path.
-///
-/// The returned view uses a `RhiUploaderDummy` type parameter only to fix the
-/// associated `Handle = StreamedMesh`.  The actual uploader is always a
-/// `RhiUploader<'_>` passed to `update` each frame.
-///
-/// `climate` is consumed at construction time (baked into `TectonicHeightField`)
-/// and is not retained in `PlanetView`.  Pass `ClimateParams::default()` or any
-/// value when `cfg.use_tectonics == false`.
-///
-/// In practice callers just let the type infer from first `update` call.
-#[allow(dead_code)] // superseded by the async loader's planet_view_from_hf; kept for the synchronous path.
-pub fn planet_view_new(
-    _rhi: &mut Rhi,
-    cfg: PlanetConfig,
-    climate: ClimateParams,
-) -> PlanetView<RhiUploaderDummy> {
-    build_planet_view(cfg, climate)
-}
-
-/// Internal constructor shared between production and test paths.
-#[allow(dead_code)] // only reachable via the (now unused) synchronous planet_view_new.
-fn build_planet_view<U: ChunkUploader>(cfg: PlanetConfig, climate: ClimateParams) -> PlanetView<U> {
-    let hf: Arc<dyn HeightField> = if cfg.use_tectonics {
-        Arc::new(TectonicHeightField::new(TectonicHeightFieldParams {
-            seed:              cfg.seed,
-            plate_count:       cfg.plate_count,
-            arc_density:       cfg.arc_density,
-            hotspot_count:     cfg.hotspot_count,
-            hotspot_intensity: cfg.hotspot_intensity,
-            climate,
-        }))
-    } else {
-        Arc::new(SimpleHeightField { noise: Noise3D::new(cfg.seed) })
-    };
-    build_planet_view_from_hf(cfg, hf)
 }
 
 /// Build the GPU-path `PlanetView` from a PRE-BUILT height field.

@@ -11,7 +11,6 @@ enki-rhi = { path = "../enki-rhi" }
 meshopt = "0.6.2"
 metis = "0.2"
 bytemuck = { version = "1.25.0", features = ["derive"] }
-crossbeam-channel = "0.5"
 log = "0.4.32"
 
 [dev-dependencies]

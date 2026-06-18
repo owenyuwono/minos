@@ -21,4 +21,3 @@ pub mod debug;
 pub mod render;
 pub mod residency;
 pub mod stream;
-pub mod streamer;

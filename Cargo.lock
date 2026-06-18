@@ -549,7 +549,6 @@ name = "enki-nanite"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "crossbeam-channel",
  "enki-planet",
  "enki-render",
  "enki-rhi",
