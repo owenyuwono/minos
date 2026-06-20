@@ -43,6 +43,38 @@ fn eval_vertex(
     (dir, world, h)
 }
 
+/// Surface normal at sphere direction `dir`, from a **face-independent** tangent
+/// basis built from `dir` alone — so adjacent cube faces compute the *identical*
+/// normal at a shared edge (cross-face shading seam → 0).
+///
+// ponytail: reuse the Nanite dir-based normal so quadtree edges match. The old
+// per-vertex face-local central difference used ghost vertices extrapolated in
+// face-parameter space (`gi = -1` lands off the cube face), so each face invented
+// a different edge normal (~3.3° cross-face step). This is a pure function of the
+// world direction, hence continuous across every face boundary (matches
+// enki-nanite tessellate::surface_normal).
+fn surface_normal(dir: DVec3, p: &ChunkBuildParams, hf: &dyn HeightField) -> DVec3 {
+    let up_ref = if dir.y.abs() < 0.99 { DVec3::Y } else { DVec3::X };
+    let t1 = dir.cross(up_ref).normalize();
+    let t2 = dir.cross(t1).normalize();
+    // One grid step in angle, so the normal captures detail at the mesh scale.
+    let scale = 1.0 / (1u64 << p.level) as f64;
+    let eps = std::f64::consts::FRAC_PI_2 * scale / p.resolution as f64;
+    let disp = |d: DVec3| -> DVec3 {
+        let dn = d.normalize();
+        dn * (p.radius + hf.height(dn, p.level) * p.height_scale)
+    };
+    let pr = disp(dir + t1 * eps);
+    let pl = disp(dir - t1 * eps);
+    let pu = disp(dir + t2 * eps);
+    let pd = disp(dir - t2 * eps);
+    let mut n = (pr - pl).cross(pu - pd).normalize();
+    if n.dot(dir) < 0.0 {
+        n = -n;
+    }
+    n
+}
+
 /// Tessellate one quadtree patch into vertex/index data.
 pub fn build_chunk(p: &ChunkBuildParams, hf: &dyn HeightField) -> ChunkMeshArrays {
     let res = p.resolution;
@@ -59,6 +91,8 @@ pub fn build_chunk(p: &ChunkBuildParams, hf: &dyn HeightField) -> ChunkMeshArray
     let mut positions = vec![[0.0f32; 3]; total_verts];
     let mut normals = vec![[0.0f32; 3]; total_verts];
     let mut colors = vec![[0.0f32; 3]; total_verts];
+    // Per-vertex tectonic plate tint for the "Plate" debug view (parallel to colors).
+    let mut plate = vec![[0.0f32; 3]; total_verts];
     let mut indices = vec![0u32; total_indices];
 
     // -- Origin: chunk center in world f64 -----------------------------------------
@@ -82,10 +116,8 @@ pub fn build_chunk(p: &ChunkBuildParams, hf: &dyn HeightField) -> ChunkMeshArray
     let origin: DVec3 = center_dir * (p.radius + h_center * p.height_scale);
 
     // -- Pass 1: positions + caches -------------------------------------------
-    // world_cache stores f64 absolute world positions for neighbour lookups in
-    // Pass 2 (normal computation). dir_cache stores unit sphere directions for
-    // the outward-normal check and coloring slope computation.
-    let mut world_cache = vec![DVec3::ZERO; grid_verts];
+    // dir_cache stores unit sphere directions for the dir-based normal,
+    // outward-normal check, and coloring slope computation; h_cache the heights.
     let mut dir_cache = vec![DVec3::ZERO; grid_verts];
     let mut h_cache = vec![0.0f64; grid_verts];
     let mut min_h = f64::INFINITY;
@@ -100,7 +132,6 @@ pub fn build_chunk(p: &ChunkBuildParams, hf: &dyn HeightField) -> ChunkMeshArray
             // Magnitude is O(node_size) — small enough for f32 precision.
             let rel = world - origin;
             positions[vi] = [rel.x as f32, rel.y as f32, rel.z as f32];
-            world_cache[vi] = world;
             dir_cache[vi] = dir;
             h_cache[vi] = h;
 
@@ -115,63 +146,24 @@ pub fn build_chunk(p: &ChunkBuildParams, hf: &dyn HeightField) -> ChunkMeshArray
     let relief_world = (max_h - min_h) * p.height_scale;
     let skirt_depth = (1.5 * relief_world + 2.0).clamp(2.0, p.height_scale);
 
-    // -- Ghost position helper ------------------------------------------------
-    // Returns the absolute world position for an out-of-bounds grid index
-    // (gi or gj outside [0, res]). Uses the same continuous heightfield so
-    // the value matches exactly what the adjacent tile stores at its real
-    // border vertex — eliminating same-level seams.
-    let ghost_world = |gi: i64, gj: i64| -> DVec3 {
-        let (_, world, _) = eval_vertex(p, gi, gj, hf);
-        world
-    };
-
     // -- Pass 2: normals + colors ---------------------------------------------
+    // ponytail: dir-based analytic normal (see `surface_normal`) instead of
+    // face-local central differences. The normal is a pure function of `dir`, so
+    // adjacent cube faces produce the IDENTICAL normal at a shared edge — no
+    // cross-face shading crease — and no ghost-vertex heightfield evals on borders.
     for gj in 0..grid_size {
         for gi in 0..grid_size {
             let vi = gj * grid_size + gi;
             let dir = dir_cache[vi];
             let h = h_cache[vi];
 
-            // Fetch neighbour world positions (absolute f64).
-            // In-bounds: read from world_cache (0 extra heightfield evals).
-            // Out-of-bounds: ghost vertex via one extra heightfield eval.
-            let world_l = if gi > 0 {
-                world_cache[gj * grid_size + gi - 1]
-            } else {
-                ghost_world(gi as i64 - 1, gj as i64)
-            };
-            let world_r = if gi < grid_size - 1 {
-                world_cache[gj * grid_size + gi + 1]
-            } else {
-                ghost_world(gi as i64 + 1, gj as i64)
-            };
-            let world_d = if gj > 0 {
-                world_cache[(gj - 1) * grid_size + gi]
-            } else {
-                ghost_world(gi as i64, gj as i64 - 1)
-            };
-            let world_u = if gj < grid_size - 1 {
-                world_cache[(gj + 1) * grid_size + gi]
-            } else {
-                ghost_world(gi as i64, gj as i64 + 1)
-            };
-
-            // Central-difference normal: cross(∂pos/∂gi, ∂pos/∂gj).
-            // Origin offsets cancel in the subtraction so absolute world
-            // positions work identically to origin-relative ones here.
-            let tan_u = world_r - world_l;
-            let tan_v = world_u - world_d;
-
-            let mut normal = tan_u.cross(tan_v).normalize();
-            if normal.dot(dir) < 0.0 {
-                normal = -normal;
-            }
-
+            let normal = surface_normal(dir, p, hf);
             normals[vi] = [normal.x as f32, normal.y as f32, normal.z as f32];
 
             let slope = (1.0 - normal.dot(dir)) as f32;
             let (temp, moisture) = hf.climate(dir, h);
             colors[vi] = crate::coloring::biome_color(temp, moisture, h as f32, slope);
+            plate[vi] = hf.plate_color(dir);
         }
     }
 
@@ -214,7 +206,8 @@ pub fn build_chunk(p: &ChunkBuildParams, hf: &dyn HeightField) -> ChunkMeshArray
                                 border_vi: usize,
                                 positions: &mut Vec<[f32; 3]>,
                                 normals: &mut Vec<[f32; 3]>,
-                                colors: &mut Vec<[f32; 3]>| {
+                                colors: &mut Vec<[f32; 3]>,
+                                plate: &mut Vec<[f32; 3]>| {
         // positions[border_vi] is origin-relative; reconstruct world f64 to compute skirt pull.
         let bx = positions[border_vi][0] as f64 + origin.x;
         let by = positions[border_vi][1] as f64 + origin.y;
@@ -230,6 +223,7 @@ pub fn build_chunk(p: &ChunkBuildParams, hf: &dyn HeightField) -> ChunkMeshArray
         ];
         normals[*sv] = normals[border_vi];
         colors[*sv] = colors[border_vi];
+        plate[*sv] = plate[border_vi];
         *sv += 1;
     };
 
@@ -253,7 +247,7 @@ pub fn build_chunk(p: &ChunkBuildParams, hf: &dyn HeightField) -> ChunkMeshArray
     let e0_start = skirt_base as u32;
     for gi in 0..=res as usize {
         let border_vi = gi; // gj=0
-        emit_skirt_vert(&mut sv, border_vi, &mut positions, &mut normals, &mut colors);
+        emit_skirt_vert(&mut sv, border_vi, &mut positions, &mut normals, &mut colors, &mut plate);
     }
     for qi in 0..res as usize {
         let border0 = qi as u32;
@@ -267,7 +261,7 @@ pub fn build_chunk(p: &ChunkBuildParams, hf: &dyn HeightField) -> ChunkMeshArray
     let e1_start = e0_start + (res + 1);
     for gj in 0..=res as usize {
         let border_vi = gj * grid_size + res as usize;
-        emit_skirt_vert(&mut sv, border_vi, &mut positions, &mut normals, &mut colors);
+        emit_skirt_vert(&mut sv, border_vi, &mut positions, &mut normals, &mut colors, &mut plate);
     }
     for qi in 0..res as usize {
         let border0 = (qi * grid_size + res as usize) as u32;
@@ -281,7 +275,7 @@ pub fn build_chunk(p: &ChunkBuildParams, hf: &dyn HeightField) -> ChunkMeshArray
     let e2_start = e1_start + (res + 1);
     for gi in (0..=res as usize).rev() {
         let border_vi = res as usize * grid_size + gi;
-        emit_skirt_vert(&mut sv, border_vi, &mut positions, &mut normals, &mut colors);
+        emit_skirt_vert(&mut sv, border_vi, &mut positions, &mut normals, &mut colors, &mut plate);
     }
     for qi in 0..res as usize {
         let gi0 = res as usize - qi;
@@ -297,7 +291,7 @@ pub fn build_chunk(p: &ChunkBuildParams, hf: &dyn HeightField) -> ChunkMeshArray
     let e3_start = e2_start + (res + 1);
     for gj in (0..=res as usize).rev() {
         let border_vi = gj * grid_size; // gi=0
-        emit_skirt_vert(&mut sv, border_vi, &mut positions, &mut normals, &mut colors);
+        emit_skirt_vert(&mut sv, border_vi, &mut positions, &mut normals, &mut colors, &mut plate);
     }
     for qi in 0..res as usize {
         let gj0 = res as usize - qi;
@@ -316,7 +310,7 @@ pub fn build_chunk(p: &ChunkBuildParams, hf: &dyn HeightField) -> ChunkMeshArray
         positions,
         normals,
         colors,
-        plate_colors: None,
+        plate_colors: Some(plate),
         indices,
         origin,
     }
@@ -331,6 +325,17 @@ mod tests {
     impl HeightField for SineHf {
         fn height(&self, dir: DVec3, _level: u8) -> f64 {
             0.01 * (dir.x * 7.0 + dir.y * 5.0 + dir.z * 3.0).sin()
+        }
+    }
+
+    /// Steeper, higher-frequency height (still a pure function of `dir`, so it is
+    /// continuous across cube edges). The face-local estimator's seam grows with
+    /// local relief steepness, so this gives the cross-face-normal regression a
+    /// clear margin over the f32 normal-storage floor.
+    struct SteepHf;
+    impl HeightField for SteepHf {
+        fn height(&self, dir: DVec3, _level: u8) -> f64 {
+            0.05 * (dir.x * 23.0).sin() * (dir.y * 19.0).cos() + 0.03 * (dir.z * 31.0).sin()
         }
     }
 
@@ -489,5 +494,108 @@ mod tests {
                 "border mismatch at gj={gj}: dist={dist:.6} (tol={tol:.6}) wa={wa:?} wb={wb:?}"
             );
         }
+    }
+
+    /// Cross-face SHADING (normal) continuity along a shared cube edge.
+    ///
+    /// Regression guard for the quadtree mesher's cube-seam crease: before the
+    /// dir-based-normal fix, each face estimated the border normal from
+    /// face-local ghost vertices (`gi=-1` lands off the cube face), so the SAME
+    /// physical edge vertex was shaded two different ways depending on which face
+    /// owned it — a measured cross-face normal step up to ~3.33° (mean ~0.23°).
+    /// The dir-based `surface_normal` is a pure function of the world direction,
+    /// so both faces compute the IDENTICAL normal at a shared edge.
+    ///
+    /// We build two whole-face chunks (face 0 = +X, face 4 = +Z), which meet at
+    /// the cube edge x=z (|x|=|z| largest). For each face-0 border vertex we find
+    /// the coincident face-4 border vertex (vertex coincidence is exact — 0 m),
+    /// then assert the angle between their stored normals is well under the
+    /// pre-fix value. `SteepHf` is a pure function of `dir`, hence continuous
+    /// across the edge, so any residual angle is purely the estimator seam.
+    #[test]
+    fn cross_face_normals_continuous_at_cube_edge() {
+        let res = 64u32;
+        let radius = 50_000.0_f64;
+        let height_scale = 1200.0_f64;
+        let mk = |face: u8| ChunkBuildParams {
+            face,
+            level: 0,
+            ix: 0,
+            iy: 0,
+            resolution: res,
+            radius,
+            height_scale,
+        };
+        let ma = build_chunk(&mk(0), &SteepHf); // +X
+        let mb = build_chunk(&mk(4), &SteepHf); // +Z
+        let grid = (res + 1) as usize;
+        let grid_verts = grid * grid;
+
+        // Reconstruct absolute world position of grid vertex `vi` in mesh `m`.
+        let world = |m: &enki_render::geometry::ChunkMeshArrays, vi: usize| -> DVec3 {
+            DVec3::new(
+                m.positions[vi][0] as f64 + m.origin.x,
+                m.positions[vi][1] as f64 + m.origin.y,
+                m.positions[vi][2] as f64 + m.origin.z,
+            )
+        };
+        let normal = |m: &enki_render::geometry::ChunkMeshArrays, vi: usize| -> DVec3 {
+            DVec3::new(
+                m.normals[vi][0] as f64,
+                m.normals[vi][1] as f64,
+                m.normals[vi][2] as f64,
+            )
+        };
+
+        // Collect face-0 perimeter vertices, then match each to the nearest
+        // face-4 perimeter vertex. Pairs that actually coincide (≈0 m) are the
+        // shared cube-edge vertices; we assert normal continuity on those.
+        let is_border = |vi: usize| {
+            let gi = vi % grid;
+            let gj = vi / grid;
+            gi == 0 || gi == grid - 1 || gj == 0 || gj == grid - 1
+        };
+        let b_border: Vec<usize> = (0..grid_verts).filter(|&vi| is_border(vi)).collect();
+
+        let mut matched = 0usize;
+        let mut max_deg = 0.0_f64;
+        let mut sum_deg = 0.0_f64;
+        for vi_a in (0..grid_verts).filter(|&vi| is_border(vi)) {
+            let wa = world(&ma, vi_a);
+            // nearest face-4 border vertex
+            let mut best = f64::INFINITY;
+            let mut best_vi = b_border[0];
+            for &vi_b in &b_border {
+                let d = (world(&mb, vi_b) - wa).length();
+                if d < best {
+                    best = d;
+                    best_vi = vi_b;
+                }
+            }
+            // Only treat as a shared edge vertex if it truly coincides.
+            if best > radius * 1e-6 {
+                continue;
+            }
+            matched += 1;
+            let na = normal(&ma, vi_a);
+            let nb = normal(&mb, best_vi);
+            let ang = na.dot(nb).clamp(-1.0, 1.0).acos().to_degrees();
+            max_deg = max_deg.max(ang);
+            sum_deg += ang;
+        }
+
+        assert!(matched >= res as usize, "too few shared-edge vertices matched: {matched}");
+        let mean_deg = sum_deg / matched as f64;
+        // Measured on this exact SteepHf/res=64 case: the OLD face-local estimator
+        // seams at max ~0.097° (mean ~0.060°); the NEW dir-based normal computes
+        // the IDENTICAL f64 normal on both faces, so the only residual is the f32
+        // normal-storage floor (max ~0.020°, mean ~0.005° — two coincident unit
+        // vectors rounded to f32 independently). (On steep tectonic relief at
+        // res=1024 the pre-fix seam reached ~3.33°.) 0.05° sits cleanly above the
+        // f32 floor and below the pre-fix seam — real teeth, not brittle.
+        assert!(
+            max_deg < 0.05,
+            "cross-face normal seam: max={max_deg:.4}° mean={mean_deg:.4}° over {matched} edge verts (expected at f32 floor ~0.02°)"
+        );
     }
 }

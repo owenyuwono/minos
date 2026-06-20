@@ -131,14 +131,15 @@ impl PipelineStore {
         // ── Pipeline layout ─────────────────────────────────────────────────
         let set_layouts = [desc.set0_layout];
 
+        // A zero-size push-constant range is invalid; only declare one when used.
         let push_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
             .size(desc.push_constant_size);
-
-        let layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&set_layouts)
-            .push_constant_ranges(std::slice::from_ref(&push_range));
+        let mut layout_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
+        if desc.push_constant_size > 0 {
+            layout_info = layout_info.push_constant_ranges(std::slice::from_ref(&push_range));
+        }
 
         let layout = unsafe { self.device.create_pipeline_layout(&layout_info, None) }
             .map_err(RhiError::Vulkan)?;

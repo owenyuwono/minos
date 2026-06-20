@@ -106,8 +106,10 @@ fn extract_planes(vp: Mat4) -> [[f32; 4]; 6] {
 /// Resident-cluster pool capacity (number of GPU cluster slots). The DAG may be
 /// far larger; only the near-cut working set is resident at any time.
 const POOL_MAX_CLUSTERS: usize = 49_152;
-/// Floats per cluster slot (fixed stride): `MAX_CLUSTER_VERTS` verts × 9 floats.
-const SLOT_FLOATS: usize = MAX_CLUSTER_VERTS * 9;
+/// Floats per cluster slot (fixed stride): `MAX_CLUSTER_VERTS` verts × 16 floats
+/// (pos3 + normal3 + color3 + material1 + wetness1 + volcanism1 + elevation1 + plate3).
+/// MUST match the per-vertex stride in nanite_draw.wgsl::vs_pull.
+const SLOT_FLOATS: usize = MAX_CLUSTER_VERTS * 16;
 /// Indices per cluster slot (fixed stride): `MAX_CLUSTER_TRIS` tris × 3.
 const SLOT_INDICES: usize = MAX_CLUSTER_TRIS * 3;
 const POOL_MAX_FLOATS: usize = POOL_MAX_CLUSTERS * SLOT_FLOATS;
@@ -180,7 +182,26 @@ impl NaniteRenderer {
     /// Build the cull + draw pipelines and the shared cluster page pool, then seed
     /// `initial` as permanently-resident clusters (usually empty — the streamer
     /// fills the pool via [`Self::update_residency`]).
+    ///
+    /// The draw pipeline targets the swapchain color format (the planet path draws
+    /// straight to the swapchain MSAA instance).
     pub fn new(rhi: &mut Rhi, initial: &[ClusterAsset]) -> Result<Self, RhiError> {
+        let fmt = rhi.swapchain_format();
+        Self::new_with_color_format(rhi, initial, fmt)
+    }
+
+    /// Like [`Self::new`], but builds the draw pipeline against an explicit color
+    /// `color_format` instead of the swapchain format. Used when the Nanite draw is
+    /// recorded INTO a caller-owned offscreen color attachment (e.g. the flora
+    /// viewer's RGBA16F HDR scene pass) rather than the swapchain — the dynamic-
+    /// rendering color attachment format MUST match the pipeline's. Depth
+    /// (`D32_SFLOAT`) and MSAA (`rhi.msaa_samples()`) are unchanged, so the caller's
+    /// attachment must be D32 + the same sample count (the flora scene pass is).
+    pub fn new_with_color_format(
+        rhi: &mut Rhi,
+        initial: &[ClusterAsset],
+        color_format: vk::Format,
+    ) -> Result<Self, RhiError> {
         // One descriptor set layout (8 storage bindings) for both pipelines.
         // 0..2 = shared geometry (verts/tris/meta); 3..7 = per-frame working set.
         // FRAGMENT is required because the lit draw mode reads `frame` (binding 5).
@@ -214,7 +235,7 @@ impl NaniteRenderer {
             fs_entry: "fs_color",
             push_constant_size: 4, // u32 debug mode
             set0_layout: set_layout,
-            color_format: rhi.swapchain_format(),
+            color_format,
             depth_format: vk::Format::D32_SFLOAT,
             samples: rhi.msaa_samples(),
             blend: false,
@@ -323,11 +344,13 @@ impl NaniteRenderer {
     ) -> Result<(), RhiError> {
         let c = &asset.clusters[cluster_idx];
 
-        let mut vbuf: Vec<f32> = Vec::with_capacity(c.vertices.len() * 9);
+        let mut vbuf: Vec<f32> = Vec::with_capacity(c.vertices.len() * 16);
         for v in &c.vertices {
             vbuf.extend_from_slice(&v.position);
             vbuf.extend_from_slice(&v.normal);
             vbuf.extend_from_slice(&v.color);
+            vbuf.extend_from_slice(&[v.material, v.wetness, v.volcanism, v.elevation]);
+            vbuf.extend_from_slice(&v.plate);
         }
         let verts_off = slot as u64 * SLOT_FLOATS as u64 * 4;
         rhi.write_storage_bytes_at(self.verts_buf, verts_off, bytemuck::cast_slice(&vbuf))?;

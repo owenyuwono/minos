@@ -90,6 +90,57 @@ impl Lights {
             },
         }
     }
+
+    /// dryad's EXACT viewer lighting (flora viewer / "a better No Man's Sky"
+    /// reference). Mirrors dryad/src/viewer.js: a single key `DirectionalLight`
+    /// `#fff4e0 × 3.0` along the sun direction, a `HemisphereLight`
+    /// `sky #88aacc / ground #443322 × 0.3`, NO second directional, and NO
+    /// isotropic white ambient (dryad's ambient is the HemisphereLight + IBL).
+    ///
+    /// | Term        | Value                                       |
+    /// |-------------|---------------------------------------------|
+    /// | Ambient     | 0.0 (dryad has no white ambient term)       |
+    /// | Hemi sky    | `#88aacc` × 0.3                             |
+    /// | Hemi ground | `#443322` × 0.3                             |
+    /// | Sun dir     | `(1, 0.8, 0.6)` normalised, `#fff4e0` × 3.0 |
+    /// | Fill dir    | none (color_intensity = 0)                  |
+    ///
+    /// `environmentIntensity 0.6` and `toneMappingExposure 1.0` are NOT applied
+    /// here — they are already baked into the IBL SH/spec and the ACES call.
+    /// Additive sibling of [`Self::demiurge_default`]; the shared planet/terrain
+    /// path keeps using `demiurge_default`.
+    pub fn dryad_default() -> Self {
+        // sun key #fff4e0 = sRGB(255, 244, 224), premultiplied by intensity 3.0.
+        let sun_srgb = glam::Vec3::new(255.0 / 255.0, 244.0 / 255.0, 224.0 / 255.0);
+        let sun_lin = srgb_to_linear(sun_srgb) * 3.0;
+
+        // hemi sky #88aacc / ground #443322, premultiplied by intensity 0.3.
+        let sky_lin =
+            srgb_to_linear(glam::Vec3::new(136.0 / 255.0, 170.0 / 255.0, 204.0 / 255.0)) * 0.3;
+        let ground_lin =
+            srgb_to_linear(glam::Vec3::new(68.0 / 255.0, 51.0 / 255.0, 34.0 / 255.0)) * 0.3;
+
+        // dryad sunPosition = normalized lightDir (flora's existing sun dir).
+        let sun_dir = glam::Vec3::new(1.0, 0.8, 0.6).normalize();
+
+        Self {
+            ambient: 0.0,
+            hemisphere: HemisphereLight {
+                sky: sky_lin,
+                ground: ground_lin,
+            },
+            directional_0: DirectionalLight {
+                direction: sun_dir,
+                color_intensity: sun_lin,
+            },
+            // No second directional in dryad: zero color → contributes nothing
+            // (direction irrelevant). Keep a unit dir to avoid NaNs downstream.
+            directional_1: DirectionalLight {
+                direction: glam::Vec3::Y,
+                color_intensity: glam::Vec3::ZERO,
+            },
+        }
+    }
 }
 
 /// Approximate gamma-expand from sRGB to linear (component-wise).

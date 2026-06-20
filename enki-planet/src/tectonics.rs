@@ -23,11 +23,16 @@ use glam::DVec3;
 // Cube-map constants
 // ---------------------------------------------------------------------------
 
-const RES: usize = 256;
+// RES=512 to match ki (tectonics.ts:128) EXACTLY. The crack/arc band constants are
+// absolute radians (STEP, SIN_HALF, ARC_CRUST_WIDTH=0.090, …), so the crack-walker →
+// flood-fill → sliver-merge pipeline only rasterizes to ki's continents per-seed when
+// RES equals ki's. RES=256 was an angularly-similar down-scale but produced a
+// *different* set of continents. (Coupled: conv/shear blur is 12 passes at this RES.)
+const RES: usize = 512;
 const TOTAL_TEXELS: usize = 6 * RES * RES;
-// Pre-computed texel angular size: texAng(256) = (π/2)/256 ≈ 0.006136 rad
+// Pre-computed texel angular size: texAng(512) = (π/2)/512 ≈ 0.003068 rad
 // Matches demiurge cubemap.ts: texAng(res) = (Math.PI * 0.5) / res
-const TEX_ANG: f64 = std::f64::consts::FRAC_PI_2 / 256.0;
+const TEX_ANG: f64 = std::f64::consts::FRAC_PI_2 / 512.0;
 
 // ---------------------------------------------------------------------------
 // PRNG helpers — same mixer as noise.rs (splitmix32)
@@ -127,12 +132,17 @@ pub struct TectonicQuery {
     pub convergence: f64,
     /// Tangential (along-boundary) relative velocity component ≈ [-1, 1].
     pub shear: f64,
+    /// Smoothed per-plate base elevation (no Voronoi step) — C1-sampled blurred field.
+    pub base_elevation: f64,
     /// Signed distance: +inside crust, -outside crust (radians). // PHASE 2
     pub crust_dist: f64,
     /// Distance to nearest paleo/fossil crack boundary (radians). // PHASE 2
     pub paleo_dist: f64,
     /// crustDist mirrored to neighbour side (coarse, no fine warp). // PHASE 2
     pub other_crust_dist: f64,
+    /// Substrate rock hardness [0,1]: 1=hard fresh igneous/volcanic, 0=soft sediment.
+    /// C1-sampled from the baked rock_hardness field. Consumed in Phase-3 erosion + Phase-4 sampler.
+    pub rock_hardness: f64,
 }
 
 /// Serialisable / Arc-shareable snapshot of a fully-baked Tectonics.
@@ -146,6 +156,7 @@ pub struct TectonicsBaked {
     pub arc_density: f64,
     pub hotspot_count: u32,
     pub hotspot_intensity: f64,
+    pub composition: f64,
     pub plates: Vec<PlateWire>,
     /// Per-texel plate id (0-based). Length = TOTAL_TEXELS.
     pub comp_id: Vec<u16>,
@@ -161,6 +172,12 @@ pub struct TectonicsBaked {
     pub conv_field: Vec<f32>,
     /// Per-texel baked shear (blurred). Length = TOTAL_TEXELS.
     pub shear_field: Vec<f32>,
+    /// Per-texel blurred plate base elevation. Length = TOTAL_TEXELS.
+    pub base_elev_field: Vec<f32>,
+    /// Per-texel wide-smoothed uplift field. Length = TOTAL_TEXELS.
+    pub uplift_field: Vec<f32>,
+    /// Per-texel substrate rock hardness [0,1] (composition-scaled contrast). Length = TOTAL_TEXELS.
+    pub rock_hardness: Vec<f32>,
     // Volcano arrays — all empty in Phase 1/2; populated in Phase 3. // PHASE 2
     pub vol_pos: Vec<f32>,
     pub vol_base_radius: Vec<f32>,
@@ -351,6 +368,9 @@ fn neighbor_texel(face: usize, x: usize, y: usize, dx: i32, dy: i32) -> Texel {
 ///   - Interior fast path: all 4 texels in-bounds → direct fetch.
 ///   - Edge path: anchor = clamped in-bounds corner; each cell corner is reached
 ///     via neighborTexel(face, axx, ayy, ox, oy) where ox,oy ∈ {-1,0,1}.
+// ponytail: kept for reference / potential C0-field reuse; all tectonics field
+// sampling now goes through `sample_c1`. Allow dead_code rather than delete.
+#[allow(dead_code)]
 fn sample_smooth(field: &[f32], dir: DVec3) -> f64 {
     let ax = dir.x.abs();
     let ay = dir.y.abs();
@@ -406,6 +426,79 @@ fn sample_smooth(field: &[f32], dir: DVec3) -> f64 {
         let ox1 = x1i - axx as i32;  // ∈ {0, 1}
         let oy0 = y0i - ayy as i32;  // ∈ {-1, 0}
         let oy1 = y1i - ayy as i32;  // ∈ {0, 1}
+        v00 = fetch(axx, ayy, ox0, oy0);
+        v10 = fetch(axx, ayy, ox1, oy0);
+        v01 = fetch(axx, ayy, ox0, oy1);
+        v11 = fetch(axx, ayy, ox1, oy1);
+    }
+
+    let top = v00 + (v10 - v00) * fu;
+    let bot = v01 + (v11 - v01) * fu;
+    top + (bot - top) * fv
+}
+
+/// C1 smoothstep bilinear sample of a Float32 cubemap field at a unit direction.
+/// Identical to `sample_smooth` except smoothstep is applied to the fractional
+/// texel coords before the bilinear lerp (`fu = fu*fu*(3-2*fu)`, same for `fv`),
+/// giving zero slope at cell edges — no C0 kinks / boundary staircasing.
+/// Mirrors `_sampleC1` in tectonics.ts (lines ~3118-3186).
+/// NOT safe for sentinel-valued fields (comp_id / neighbor_id — use direct lookup).
+fn sample_c1(field: &[f32], dir: DVec3) -> f64 {
+    let ax = dir.x.abs();
+    let ay = dir.y.abs();
+    let az = dir.z.abs();
+
+    let (face, sc, tc, mc) = if ax >= ay && ax >= az {
+        if dir.x > 0.0 { (0usize, dir.z,  dir.y,  ax) }
+        else            { (1,     -dir.z,  dir.y,  ax) }
+    } else if ay >= ax && ay >= az {
+        if dir.y > 0.0 { (2,  dir.x,  dir.z,  ay) }
+        else            { (3,  dir.x, -dir.z,  ay) }
+    } else if dir.z > 0.0 {
+        (4, -dir.x,  dir.y,  az)
+    } else {
+        (5,  dir.x,  dir.y,  az)
+    };
+
+    let hres = (RES as f64) * 0.5;
+    let fx_cont = (sc / mc + 1.0) * hres - 0.5;
+    let fy_cont = (tc / mc + 1.0) * hres - 0.5;
+
+    let x0i = fx_cont.floor() as i32;
+    let y0i = fy_cont.floor() as i32;
+    let mut fu = fx_cont - fx_cont.floor();
+    let mut fv = fy_cont - fy_cont.floor();
+    // smoothstep for C1 continuity — zero slope at cell edges, no kinks
+    fu = fu * fu * (3.0 - 2.0 * fu);
+    fv = fv * fv * (3.0 - 2.0 * fv);
+    let x1i = x0i + 1;
+    let y1i = y0i + 1;
+
+    let fetch = |xc: usize, yc: usize, dx: i32, dy: i32| -> f64 {
+        let t = neighbor_texel(face, xc, yc, dx, dy);
+        field[texel_index(t.face, t.x, t.y)] as f64
+    };
+
+    let v00: f64;
+    let v10: f64;
+    let v01: f64;
+    let v11: f64;
+
+    if x0i >= 0 && y0i >= 0 && x1i < RES as i32 && y1i < RES as i32 {
+        let base = face * RES * RES;
+        let x0 = x0i as usize; let y0 = y0i as usize;
+        let x1 = x1i as usize; let y1 = y1i as usize;
+        v00 = field[base + y0 * RES + x0] as f64;
+        v10 = field[base + y0 * RES + x1] as f64;
+        v01 = field[base + y1 * RES + x0] as f64;
+        v11 = field[base + y1 * RES + x1] as f64;
+    } else {
+        let axx = x0i.clamp(0, (RES as i32) - 1) as usize;
+        let ayy = y0i.clamp(0, (RES as i32) - 1) as usize;
+        let ox0 = x0i - axx as i32;
+        let ox1 = x1i - axx as i32;
+        let oy0 = y0i - ayy as i32;
+        let oy1 = y1i - ayy as i32;
         v00 = fetch(axx, ayy, ox0, oy0);
         v10 = fetch(axx, ayy, ox1, oy0);
         v01 = fetch(axx, ayy, ox0, oy1);
@@ -1292,6 +1385,138 @@ fn build_crust_sdf(crust_mask: &[u8]) -> Vec<f32> {
 }
 
 // ---------------------------------------------------------------------------
+// bake_hardness — substrate rock-hardness cubemap field.
+// Verbatim port of `_bakeHardness` in tectonics.ts (lines ~2401-2542).
+//
+// crust_age [0,1]: 0 = fresh/divergent/volcanic crust, 1 = old stable craton.
+// rock_hardness [0,1]: 1 = hard fresh igneous, 0 = soft sediment/basin.
+// Reads conv_field, dist_field (boundary distance), crust_dist (signed crust SDF).
+// Pure baked-grid output — main-thread & worker identical (no live noise post-bake).
+// ---------------------------------------------------------------------------
+
+fn bake_hardness(
+    conv_field: &[f32],
+    dist_field: &[f32],
+    crust_dist: &[f32],
+    hardness_noise: &Noise3D,
+    composition: f64,
+) -> Vec<f32> {
+    // --- Constants (50 km reference scale; angular constants are scale-invariant) ---
+    const DIV_THRESH: f64   = -0.05; // conv_field below this → divergent
+    const DIV_DIST: f64     = 0.08;  // radians — must be near a plate boundary
+    const AGE_SCALE: f64    = 0.40;  // radians — half-sphere worth of "age"
+    const VOLC_THRESH: f64  = 0.15;  // conv_field above this → arc/volcanic zone
+    const HARD_FBM_AMP: f64  = 0.12; // ±0.12 hardness noise amplitude
+    const HARD_FBM_FREQ: f64 = 2.8;  // spatial frequency on unit sphere
+
+    // ---- Step 1: Multi-source Dijkstra from divergent-boundary texels → divergent_dist ----
+    let inf = 1.0e30f64;
+    let mut divergent_dist = vec![inf as f32; TOTAL_TEXELS];
+    let mut settled        = vec![false; TOTAL_TEXELS];
+    let mut heap           = BinaryHeap::new(TOTAL_TEXELS * 2);
+
+    let diag_cost = TEX_ANG * std::f64::consts::SQRT_2;
+    let orth_cost = TEX_ANG;
+    const DX8: [i32; 8] = [1, -1,  0,  0,  1, -1,  1, -1];
+    const DY8: [i32; 8] = [0,  0,  1, -1,  1,  1, -1, -1];
+
+    // Seed: texels near divergent boundaries (spreading ridges).
+    for idx in 0..TOTAL_TEXELS {
+        let conv = conv_field[idx] as f64;
+        let dist = dist_field[idx] as f64;
+        if conv < DIV_THRESH && dist < DIV_DIST {
+            divergent_dist[idx] = 0.0;
+            heap.push(0.0, idx);
+        }
+    }
+
+    // If no divergent texels (non-tectonic case), leave divergent_dist at INF → crust_age = 1.
+    while !heap.is_empty() {
+        let (dist, idx) = heap.pop_min();
+        if settled[idx] { continue; }
+        settled[idx] = true;
+        let face = idx / (RES * RES);
+        let rem  = idx - face * RES * RES;
+        let cy   = rem / RES;
+        let cx   = rem % RES;
+        for d in 0..8 {
+            let nb = neighbor_texel(face, cx, cy, DX8[d], DY8[d]);
+            let ni = texel_index(nb.face, nb.x, nb.y);
+            if settled[ni] { continue; }
+            let cost = if DX8[d] != 0 && DY8[d] != 0 { diag_cost } else { orth_cost };
+            let nd = dist + cost;
+            if nd < divergent_dist[ni] as f64 {
+                divergent_dist[ni] = nd as f32;
+                heap.push(nd, ni);
+            }
+        }
+    }
+
+    // ---- Step 2: Build crust_age field (0 = freshest divergent, 1 = oldest craton) ----
+    let mut crust_age = vec![0.0f32; TOTAL_TEXELS];
+    for i in 0..TOTAL_TEXELS {
+        let dv = divergent_dist[i] as f64;
+        crust_age[i] = if dv >= inf * 0.5 { 1.0 } else { (dv / AGE_SCALE).min(1.0) as f32 };
+    }
+    // Light blur for C1-friendliness.
+    let crust_age = blur_field_n(crust_age, 2);
+
+    // ---- Step 3: Build rock_hardness (4-term blend) ----
+    let mut hardness_raw = vec![0.0f32; TOTAL_TEXELS];
+    for i in 0..TOTAL_TEXELS {
+        let face = i / (RES * RES);
+        let rem  = i - face * RES * RES;
+        let ty   = rem / RES;
+        let tx   = rem % RES;
+        let dir  = texel_to_dir(face, tx, ty);
+
+        // (a) Age term.
+        let age = crust_age[i] as f64;
+        let hard_age = if age < 0.5 {
+            0.55 + (0.85 - 0.55) * (1.0 - age * 2.0)
+        } else {
+            0.55 - (0.55 - 0.35) * ((age - 0.5) * 2.0)
+        };
+
+        // (b) Volcanic-arc proximity (conv_field proxy).
+        let conv = conv_field[i] as f64;
+        let volc_frac = ((conv - VOLC_THRESH) / (1.0 - VOLC_THRESH)).clamp(0.0, 1.0);
+        let hard_volc = 0.90;
+        let hard_b = hard_age + volc_frac * (hard_volc - hard_age);
+
+        // (c) Crust-type offset: oceanic basalt harder than continental sediment cover.
+        let cd = crust_dist[i] as f64;
+        let crust_offset = if cd < 0.0 { 0.08 } else if cd > 0.05 { -0.08 } else { 0.0 };
+        let hard_c = hard_b + crust_offset;
+
+        // (d) FBM break-up (stream 19; freq folded into coords, octaves 4).
+        let fbm_val = fbm(
+            hardness_noise,
+            dir.x * HARD_FBM_FREQ,
+            dir.y * HARD_FBM_FREQ,
+            dir.z * HARD_FBM_FREQ,
+            4, 1.0, 2.0, 0.5,
+        );
+        let hard_d = hard_c + HARD_FBM_AMP * fbm_val;
+
+        hardness_raw[i] = hard_d.clamp(0.0, 1.0) as f32;
+    }
+
+    // ---- Step 4: Box blur for C1-friendliness (3 passes) ----
+    let hardness_blurred = blur_field_n(hardness_raw, 3);
+
+    // ---- Step 5: Scale contrast by composition ----
+    let contrast_scale = 0.25 + 0.75 * composition;
+    const HARD_MEAN: f64 = 0.5;
+    let mut rock_hardness = vec![0.0f32; TOTAL_TEXELS];
+    for i in 0..TOTAL_TEXELS {
+        let h = HARD_MEAN + (hardness_blurred[i] as f64 - HARD_MEAN) * contrast_scale;
+        rock_hardness[i] = h.clamp(0.0, 1.0) as f32;
+    }
+    rock_hardness
+}
+
+// ---------------------------------------------------------------------------
 // Paleo-orogen Dijkstra — multi-source SDF from all dilated paleo crack texels.
 // Mirrors Step 6c paleo-dist block in tectonics.ts constructor.
 // Returns distance field; INF replaced with PI (finite cap for consumers).
@@ -1420,14 +1645,18 @@ fn bake_conv_shear(
         let b = t_hat.cross(c_dir);
         let b_len = b.length();
         if b_len > 1.0e-7 {
-            let raw_shear = diff.dot(b / b_len) / 2.0;
+            // Match ki's exact float order (tectonics.ts:1368): (diff·b)/bLen computed
+            // as Σ(diffᵢ·bᵢ/bLen), multiply-then-divide per term — not diff·(b/bLen).
+            let raw_shear = (diff.x * b.x / b_len + diff.y * b.y / b_len + diff.z * b.z / b_len) / 2.0;
             shear_field[idx] = raw_shear.clamp(-1.0, 1.0) as f32;
         }
     }
 
-    // 3 blur passes
-    let conv_blurred  = blur_field_n(conv_field,  3);
-    let shear_blurred = blur_field_n(shear_field, 3);
+    // 12 blur passes (ki tectonics.ts:1378-1379). Blur radius ∝ √passes·cellSize, so
+    // at RES=512 the angular σ needs 12 passes (was 3 at RES=256) to preserve ki's
+    // smoothing; eliminates gradient sign-flip artefacts at saddle points.
+    let conv_blurred  = blur_field_n(conv_field,  12);
+    let shear_blurred = blur_field_n(shear_field, 12);
     (conv_blurred, shear_blurred)
 }
 
@@ -1473,6 +1702,9 @@ pub struct Tectonics {
     arc_density: f64,
     hotspot_count: u32,
     hotspot_intensity: f64,
+    /// Crust composition [0,1]: 0 = icy/sediment (soft), 1 = rocky/basaltic (hard).
+    /// Feeds Phase-1 substrate-hardness contrast; stored here for round-trip.
+    composition: f64,
 
     // Cube-map tables (read-only after construction).
     comp_id:    Vec<u16>,   // per-texel plate id (0-based)
@@ -1480,6 +1712,13 @@ pub struct Tectonics {
     neighbor_id: Vec<u16>,  // per-texel neighbour plate id
     conv_field:  Vec<f32>,  // per-texel baked convergence (blurred)
     shear_field: Vec<f32>,  // per-texel baked shear (blurred)
+    /// Per-texel blurred plate base elevation (eliminates the Voronoi base-elev cliff).
+    base_elev_field: Vec<f32>,
+    /// Wide-smoothed uplift field = blur_field_n(conv_field, 3). Consumed in Phase 4
+    /// broad-deform; currently only exposed via `uplift_at`.
+    uplift_field: Vec<f32>,
+    /// Per-texel substrate rock hardness [0,1]. Consumed in Phase-3 erosion + Phase-4 sampler.
+    rock_hardness: Vec<f32>,
 
     // PHASE 2 fields (zeroed in Phase 1).
     crust_dist: Vec<f32>,   // per-texel signed crust SDF
@@ -1490,6 +1729,10 @@ pub struct Tectonics {
     fine_warp_noise: Noise3D,
     // Volcano roughening noise (stream 18).
     vol_noise:       Noise3D,
+    // Substrate-hardness break-up noise (stream 19). Only read during bake_hardness,
+    // kept for parity with the constructor's stream set.
+    #[allow(dead_code)]
+    hardness_noise:  Noise3D,
 
     // Volcano flat arrays (populated by bake_volcanoes in Phase 2).
     vol_pos:         Vec<f32>,  // 3*nVol xyz interleaved
@@ -1558,10 +1801,13 @@ impl Tectonics {
         arc_density_raw: f64,
         hotspot_count_raw: u32,
         hotspot_intensity_raw: f64,
+        composition_raw: f64,
     ) -> Self {
         let arc_density       = arc_density_raw.clamp(0.2, 3.0);
         let hotspot_count     = hotspot_count_raw.min(20);
         let hotspot_intensity = hotspot_intensity_raw.clamp(0.0, 3.0);
+        // composition: 0 = icy/sediment (soft, low contrast), 1 = rocky/basaltic (hard).
+        let composition       = composition_raw.clamp(0.0, 1.0);
         let plate_count_clamped = plate_count.min(48);
         let target = plate_count_clamped;
 
@@ -1569,12 +1815,13 @@ impl Tectonics {
         let warp_noise      = Noise3D::new(derive_seed(seed, 5));
         let fine_warp_noise = Noise3D::new(derive_seed(seed, 13));
         let vol_noise       = Noise3D::new(derive_seed(seed, 18));
+        let hardness_noise  = Noise3D::new(derive_seed(seed, 19));
 
         // Non-tectonic branch: plateCount <= 1 → single plate, no boundaries.
         if plate_count_clamped <= 1 {
             return Self::compute_non_tectonic(
-                seed, arc_density, hotspot_count, hotspot_intensity,
-                warp_noise, fine_warp_noise, vol_noise,
+                seed, arc_density, hotspot_count, hotspot_intensity, composition,
+                warp_noise, fine_warp_noise, vol_noise, hardness_noise,
             );
         }
 
@@ -1785,22 +2032,43 @@ impl Tectonics {
             &conv_field, &shear_field, &plates, &warp_noise, &fine_warp_noise,
         );
 
+        // Smooth base-elevation field: nearest-neighbour reads of
+        // plates[comp_id[i]].base_elevation produce a hard cliff at Voronoi plate
+        // boundaries; blurring 6× converts it to a ~1 km gradient (tectonics.ts:2154-2160).
+        let base_elev_field = {
+            let mut raw = vec![0.0f32; TOTAL_TEXELS];
+            for (i, slot) in raw.iter_mut().enumerate() {
+                *slot = plates[comp_id[i] as usize].base_elevation as f32;
+            }
+            blur_field_n(raw, 6)
+        };
+        // Wide-smoothed uplift field for broad-belt deformation (bakeUpliftField: tectonics.ts:1255-1260).
+        let uplift_field = blur_field_n(conv_field.clone(), 3);
+
+        // Substrate rock-hardness field (_bakeHardness): reads conv/dist/crust_dist + stream-19 FBM.
+        let rock_hardness = bake_hardness(&conv_field, &dist_field, &crust_dist, &hardness_noise, composition);
+
         Tectonics {
             plates,
             seed,
             arc_density,
             hotspot_count,
             hotspot_intensity,
+            composition,
             comp_id,
             dist_field,
             neighbor_id,
             conv_field,
             shear_field,
+            base_elev_field,
+            uplift_field,
+            rock_hardness,
             crust_dist,
             paleo_dist,
             warp_noise,
             fine_warp_noise,
             vol_noise,
+            hardness_noise,
             vol_pos:         vol_baked.vol_pos,
             vol_base_radius: vol_baked.vol_base_radius,
             vol_height:      vol_baked.vol_height,
@@ -1823,9 +2091,11 @@ impl Tectonics {
         arc_density: f64,
         hotspot_count: u32,
         hotspot_intensity: f64,
+        composition: f64,
         warp_noise: Noise3D,
         fine_warp_noise: Noise3D,
         vol_noise: Noise3D,
+        hardness_noise: Noise3D,
     ) -> Self {
         // Single plate covers the whole sphere.
         let plates = vec![Plate {
@@ -1871,22 +2141,41 @@ impl Tectonics {
             &conv_field, &shear_field, &plates, &warp_noise, &fine_warp_noise,
         );
 
+        // Base-elev field: single plate (base_elevation 0.0) → uniform; blur is a no-op.
+        let base_elev_field = {
+            let mut raw = vec![0.0f32; TOTAL_TEXELS];
+            for (i, slot) in raw.iter_mut().enumerate() {
+                *slot = plates[comp_id[i] as usize].base_elevation as f32;
+            }
+            blur_field_n(raw, 6)
+        };
+        // Uplift field: conv_field is all-zero in the stagnant-lid branch → stays zero.
+        let uplift_field = blur_field_n(conv_field.clone(), 3);
+
+        // Substrate rock-hardness: no divergent texels (conv all-zero) → crust_age = 1 everywhere.
+        let rock_hardness = bake_hardness(&conv_field, &dist_field, &crust_dist, &hardness_noise, composition);
+
         Tectonics {
             plates,
             seed,
             arc_density,
             hotspot_count,
             hotspot_intensity,
+            composition,
             comp_id,
             dist_field,
             neighbor_id,
             conv_field,
             shear_field,
+            base_elev_field,
+            uplift_field,
+            rock_hardness,
             crust_dist,
             paleo_dist,
             warp_noise,
             fine_warp_noise,
             vol_noise,
+            hardness_noise,
             vol_pos:         vol_baked.vol_pos,
             vol_base_radius: vol_baked.vol_base_radius,
             vol_height:      vol_baked.vol_height,
@@ -2063,7 +2352,7 @@ impl Tectonics {
             // Mirrors JS: `bd = this._distField[t]` — uses the BLURRED dist field,
             // not the raw one. JS stores the blurred dist as `this._distField`.
             if crust_mask[t] == 0 {
-                let conv_arc = sample_smooth(conv_field, d);
+                let conv_arc = sample_c1(conv_field, d);
                 if conv_arc > arc_conv_thresh_eff {
                     let bd = dist_field_blurred[t] as f64;
                     if (ARC_OFFSET - ARC_CRUST_WIDTH..=ARC_OFFSET + ARC_CRUST_WIDTH).contains(&bd) {
@@ -2126,11 +2415,24 @@ impl Tectonics {
         };
 
         // Helper: fine-warp a direction (mirrors crustDist fine-warp in query())
-        let fine_warp = |w: DVec3| -> DVec3 {
-            let fw0 = fbm(fine_warp_noise, w.x + 5.1,  w.y + 5.1,  w.z + 5.1,  3, 9.0, 2.0, 0.5);
-            let fw1 = fbm(fine_warp_noise, w.x + 7.3,  w.y + 7.3,  w.z + 7.3,  3, 9.0, 2.0, 0.5);
-            let fw2 = fbm(fine_warp_noise, w.x + 11.7, w.y + 11.7, w.z + 11.7, 3, 9.0, 2.0, 0.5);
+        // Fine warp for crustDist sampling. Mirrors query() EXACTLY: the fbm is sampled
+        // at the UNWARPED `dir` (offsets 5.1/7.3/11.7) and added to the warped `w`. The
+        // old closure sampled the fbm at `w` (warp doubly-applied) — a bake-vs-query
+        // mismatch that shifted arc-cone OC/OO crust-dist classification.
+        let fine_warp = |dir: DVec3, w: DVec3| -> DVec3 {
+            let fw0 = fbm(fine_warp_noise, dir.x + 5.1,  dir.y + 5.1,  dir.z + 5.1,  3, 9.0, 2.0, 0.5);
+            let fw1 = fbm(fine_warp_noise, dir.x + 7.3,  dir.y + 7.3,  dir.z + 7.3,  3, 9.0, 2.0, 0.5);
+            let fw2 = fbm(fine_warp_noise, dir.x + 11.7, dir.y + 11.7, dir.z + 11.7, 3, 9.0, 2.0, 0.5);
             DVec3::new(w.x + 0.025 * fw0, w.y + 0.025 * fw1, w.z + 0.025 * fw2).normalize()
+        };
+        // Fine-dist-warp for boundary_dist sampling (mirrors query(): amp 0.006, offsets
+        // 3.7/8.2/12.9, fbm at the UNWARPED dir, added to warped w). ARC_BAND half-width
+        // is 0.006 — exactly this amplitude — so the front-band gate lands on ki's texels.
+        let fine_dist_warp = |dir: DVec3, w: DVec3| -> DVec3 {
+            let f0 = fbm(fine_warp_noise, dir.x + 3.7,  dir.y + 3.7,  dir.z + 3.7,  3, 9.0, 2.0, 0.5);
+            let f1 = fbm(fine_warp_noise, dir.x + 8.2,  dir.y + 8.2,  dir.z + 8.2,  3, 9.0, 2.0, 0.5);
+            let f2 = fbm(fine_warp_noise, dir.x + 12.9, dir.y + 12.9, dir.z + 12.9, 3, 9.0, 2.0, 0.5);
+            DVec3::new(w.x + 0.006 * f0, w.y + 0.006 * f1, w.z + 0.006 * f2).normalize()
         };
 
         // Full query at a direction (mirrors the essential parts of query())
@@ -2142,12 +2444,12 @@ impl Tectonics {
             let pid = comp_id[idx] as usize;
             let nid = (neighbor_id[idx] as usize).min(plates.len().saturating_sub(1));
 
-            let boundary_dist = sample_smooth(dist_field, w);
-            let convergence   = sample_smooth(conv_field, w);
+            let boundary_dist = sample_c1(dist_field, fine_dist_warp(dir, w));
+            let convergence   = sample_c1(conv_field, w);
 
             // crustDist with fine warp
-            let fw = fine_warp(w);
-            let crust_dist_v = sample_smooth(crust_dist, fw);
+            let fw = fine_warp(dir, w);
+            let crust_dist_v = sample_c1(crust_dist, fw);
 
             // otherCrustDist: mirror through boundary
             // Compute gradient for tHat
@@ -2194,7 +2496,7 @@ impl Tectonics {
                     let mz = vz * cos_t + cz * sin_t + kz * kdotv * (1.0 - cos_t);
                     let mlen = (mx * mx + my * my + mz * mz).sqrt().max(1.0e-9);
                     let mirror = DVec3::new(mx / mlen, my / mlen, mz / mlen);
-                    let mirrored = sample_smooth(crust_dist, mirror);
+                    let mirrored = sample_c1(crust_dist, mirror);
                     let g2 = g_len * g_len;
                     let grad_strength = ss(1.0e-6, 5.0e-6, g2);
                     other_crust_dist = crust_dist_v + grad_strength * (mirrored - crust_dist_v);
@@ -2202,7 +2504,6 @@ impl Tectonics {
             }
             (boundary_dist, convergence, crust_dist_v, other_crust_dist, pid as f64 + nid as f64 * 1_000_000.0)
         };
-        let _ = full_query; // used below
 
         // ---- a. FRONT CANDIDATES ----
         #[allow(dead_code)]
@@ -2220,20 +2521,24 @@ impl Tectonics {
                     let dir = texel_to_dir(face, tx, ty);
                     let w = warp_dir(dir);
                     // Cheap pre-reject
-                    let conv_pre = sample_smooth(conv_field, w);
+                    let conv_pre = sample_c1(conv_field, w);
                     if conv_pre < arc_conv_thresh_eff * 0.5 { continue; }
 
+                    // pid/nid at the WARPED texel (ki tectonics.ts:3254-3259). `tidx`
+                    // (unwarped) is kept only for the candidate hash below (ki 2623-2624).
                     let tidx = texel_index(face, tx, ty);
-                    let pid = comp_id[tidx] as usize;
-                    let nid = (neighbor_id[tidx] as usize).min(plates.len().saturating_sub(1));
+                    let wt = dir_to_texel(w);
+                    let tidx_w = texel_index(wt.face, wt.x, wt.y);
+                    let pid = comp_id[tidx_w] as usize;
+                    let nid = (neighbor_id[tidx_w] as usize).min(plates.len().saturating_sub(1));
 
-                    let boundary_dist = sample_smooth(dist_field, w);
-                    let convergence   = sample_smooth(conv_field, w);
+                    let boundary_dist = sample_c1(dist_field, fine_dist_warp(dir, w));
+                    let convergence   = sample_c1(conv_field, w);
                     if convergence <= arc_conv_thresh_eff { continue; }
                     if !(ARC_OFFSET - ARC_BAND..=ARC_OFFSET + ARC_BAND).contains(&boundary_dist) { continue; }
 
-                    let fw = fine_warp(w);
-                    let crust_dist_v = sample_smooth(crust_dist, fw);
+                    let fw = fine_warp(dir, w);
+                    let crust_dist_v = sample_c1(crust_dist, fw);
 
                     // otherCrustDist via mirror (simplified — just use crust_dist for now)
                     let dt = dir_to_texel(dir);
@@ -2277,7 +2582,7 @@ impl Tectonics {
                             let mz = vz * cos_t + cz2 * sin_t + kz * kdotv * (1.0 - cos_t);
                             let mlen = (mx * mx + my * my + mz * mz).sqrt().max(1.0e-9);
                             let mirror_dir = DVec3::new(mx / mlen, my / mlen, mz / mlen);
-                            let mirrored = sample_smooth(crust_dist, mirror_dir);
+                            let mirrored = sample_c1(crust_dist, mirror_dir);
                             let g2 = g_len * g_len;
                             let gs = ss(1.0e-6, 5.0e-6, g2);
                             other_crust_dist = crust_dist_v + gs * (mirrored - crust_dist_v);
@@ -2417,19 +2722,18 @@ impl Tectonics {
                 let my_cell = texel_index_occ(occ_face, occ_x, occ_y);
                 if occupied[my_cell] != 0 { continue; }
 
-                // Re-validate at final position
+                // Re-validate at the final position via full_query — which now reproduces
+                // query()'s warp handling EXACTLY (boundary_dist fine-dist-warped, crustDist
+                // fine-warped at the unwarped dir, mirrored otherCrustDist). ki's bake calls
+                // this.query() here (tectonics.ts:2733-2744); full_query is our mid-bake
+                // equivalent (query() reads not-yet-stored self.* fields).
                 let w2 = warp_dir(pos_dir);
                 let tidx2 = texel_index(dir_to_texel(w2).face, dir_to_texel(w2).x, dir_to_texel(w2).y);
                 let pid2 = comp_id[tidx2] as usize;
                 let nid2 = (neighbor_id[tidx2] as usize).min(plates.len().saturating_sub(1));
-                let fbd  = sample_smooth(dist_field, w2);
-                let fconv = sample_smooth(conv_field, w2);
+                let (fbd, fconv, f_crust_dist, f_other_crust, _) = full_query(pos_dir);
                 if fconv <= arc_conv_thresh_eff { continue; }
                 if !(ARC_OFFSET - ARC_BAND..=ARC_OFFSET + ARC_BAND).contains(&fbd) { continue; }
-                let fw2 = fine_warp(w2);
-                let f_crust_dist = sample_smooth(crust_dist, fw2);
-                // simplified otherCrustDist for validation
-                let f_other_crust = f_crust_dist; // conservative: just self-side
                 let fw_mine  = ss(-0.10, 0.10, f_crust_dist);
                 let fw_other = ss(-0.10, 0.10, f_other_crust);
                 let side_ok = (fw_mine > 0.5 && fw_other < 0.5)
@@ -2698,15 +3002,33 @@ impl Tectonics {
         let neighbor_id = (self.neighbor_id[idx] as usize)
             .min(self.plates.len().saturating_sub(1));
 
-        // Smooth boundary distance
-        let boundary_dist = sample_smooth(&self.dist_field, w);
+        // Smooth boundary distance.
+        // Fine warp for dist_field (tectonics.ts:3265-3271): breaks the 177 m staircase
+        // isoline without large profile drift. Amp 0.006 ≈ 3 cells; freq 9 ≈ 2° wavelength;
+        // offsets 3.7/8.2/12.9 differ from the crust_dist warp (5.1/7.3/11.7) so the two
+        // warps are uncorrelated. Same fine_warp_noise basis as the crust_dist warp below.
+        let fdw0 = fbm(&self.fine_warp_noise, dir.x + 3.7,  dir.y + 3.7,  dir.z + 3.7,  3, 9.0, 2.0, 0.5);
+        let fdw1 = fbm(&self.fine_warp_noise, dir.x + 8.2,  dir.y + 8.2,  dir.z + 8.2,  3, 9.0, 2.0, 0.5);
+        let fdw2 = fbm(&self.fine_warp_noise, dir.x + 12.9, dir.y + 12.9, dir.z + 12.9, 3, 9.0, 2.0, 0.5);
+        let fd_dir = DVec3::new(
+            w.x + 0.006 * fdw0,
+            w.y + 0.006 * fdw1,
+            w.z + 0.006 * fdw2,
+        ).normalize();
+        let boundary_dist = sample_c1(&self.dist_field, fd_dir);
 
         // Convergence and shear from pre-baked blurred fields
-        let convergence = sample_smooth(&self.conv_field,  w);
-        let shear       = sample_smooth(&self.shear_field, w);
+        let convergence = sample_c1(&self.conv_field,  w);
+        let shear       = sample_c1(&self.shear_field, w);
 
         // paleoDist: sample using the standard warped direction w
-        let paleo_dist = sample_smooth(&self.paleo_dist, w);
+        let paleo_dist = sample_c1(&self.paleo_dist, w);
+
+        // baseElevation: blurred per-plate base elevation, C1-sampled (no Voronoi step)
+        let base_elevation = sample_c1(&self.base_elev_field, w);
+
+        // rockHardness: C1 sample from baked grid using the same domain-warped dir w.
+        let rock_hardness = sample_c1(&self.rock_hardness, w);
 
         // Fine warp for coastline complexity — applied ONLY to crustDist sampling
         let fw0 = fbm(&self.fine_warp_noise, dir.x + 5.1,  dir.y + 5.1,  dir.z + 5.1,  3, 9.0, 2.0, 0.5);
@@ -2717,7 +3039,7 @@ impl Tectonics {
             w.y + 0.025 * fw1,
             w.z + 0.025 * fw2,
         ).normalize();
-        let crust_dist = sample_smooth(&self.crust_dist, fw_dir);
+        let crust_dist = sample_c1(&self.crust_dist, fw_dir);
 
         // otherCrustDist: mirror through boundary to the neighbor side via Rodrigues rotation.
         // Mirrors the `otherCrustDist` block in tectonics.ts query().
@@ -2766,7 +3088,7 @@ impl Tectonics {
                 let mz = vz * cos_t + cz * sin_t + kz * kdotv * (1.0 - cos_t);
                 let mlen = (mx * mx + my * my + mz * mz).sqrt().max(1.0e-9);
                 let mirror_dir = DVec3::new(mx / mlen, my / mlen, mz / mlen);
-                let mirrored = sample_smooth(&self.crust_dist, mirror_dir);
+                let mirrored = sample_c1(&self.crust_dist, mirror_dir);
                 let g2 = g_len * g_len;
                 let grad_strength = ss(1.0e-6, 5.0e-6, g2);
                 crust_dist + grad_strength * (mirrored - crust_dist)
@@ -2783,9 +3105,11 @@ impl Tectonics {
             boundary_dist,
             convergence,
             shear,
+            base_elevation,
             crust_dist,
             paleo_dist,
             other_crust_dist,
+            rock_hardness,
         }
     }
 
@@ -2821,6 +3145,7 @@ impl Tectonics {
             arc_density:      self.arc_density,
             hotspot_count:    self.hotspot_count,
             hotspot_intensity: self.hotspot_intensity,
+            composition:      self.composition,
             plates:           plates_wire,
             comp_id:          self.comp_id.clone(),
             dist_field:       self.dist_field.clone(),
@@ -2829,6 +3154,9 @@ impl Tectonics {
             paleo_dist:       self.paleo_dist.clone(),
             conv_field:       self.conv_field.clone(),
             shear_field:      self.shear_field.clone(),
+            base_elev_field:  self.base_elev_field.clone(),
+            uplift_field:     self.uplift_field.clone(),
+            rock_hardness:    self.rock_hardness.clone(),
             vol_pos:          self.vol_pos.clone(),
             vol_base_radius:  self.vol_base_radius.clone(),
             vol_height:       self.vol_height.clone(),
@@ -2864,6 +3192,9 @@ impl Tectonics {
         let warp_noise      = Noise3D::new(derive_seed(b.seed, 5));
         let fine_warp_noise = Noise3D::new(derive_seed(b.seed, 13));
         let vol_noise       = Noise3D::new(derive_seed(b.seed, 18));
+        // Stream 19 is only consumed during bake_hardness (already baked into rock_hardness),
+        // but reconstructed for parity with the constructor's stream set.
+        let hardness_noise  = Noise3D::new(derive_seed(b.seed, 19));
 
         Tectonics {
             plates,
@@ -2871,16 +3202,21 @@ impl Tectonics {
             arc_density:      b.arc_density,
             hotspot_count:    b.hotspot_count,
             hotspot_intensity: b.hotspot_intensity,
+            composition:      b.composition,
             comp_id:          b.comp_id.clone(),
             dist_field:       b.dist_field.clone(),
             neighbor_id:      b.neighbor_id.clone(),
             conv_field:       b.conv_field.clone(),
             shear_field:      b.shear_field.clone(),
+            base_elev_field:  b.base_elev_field.clone(),
+            uplift_field:     b.uplift_field.clone(),
+            rock_hardness:    b.rock_hardness.clone(),
             crust_dist:       b.crust_dist.clone(),
             paleo_dist:       b.paleo_dist.clone(),
             warp_noise,
             fine_warp_noise,
             vol_noise,
+            hardness_noise,
             vol_pos:          b.vol_pos.clone(),
             vol_base_radius:  b.vol_base_radius.clone(),
             vol_height:       b.vol_height.clone(),
@@ -2894,6 +3230,46 @@ impl Tectonics {
             hotspot_intensity_arr: b.hotspot_intensity_arr.clone(),
             hotspot_is_chain:      b.hotspot_is_chain.clone(),
         }
+    }
+
+    /// Wide-smoothed uplift field value at `dir` (C1). Positive = broad orogen,
+    /// negative = broad basin. Uses the same domain-warp as `query`.
+    /// Mirrors `upliftAt` in tectonics.ts (lines ~3193-3210). Consumed by Phase-4
+    /// broad-deform; currently otherwise unused.
+    #[allow(dead_code)]
+    pub fn uplift_at(&self, dir: DVec3) -> f64 {
+        let dx = fbm(&self.warp_noise, dir.x + 13.7, dir.y,         dir.z,
+                     WARP_OCTAVES, WARP_FREQ, 2.0, 0.5);
+        let dy = fbm(&self.warp_noise, dir.x,         dir.y + 13.7, dir.z,
+                     WARP_OCTAVES, WARP_FREQ, 2.0, 0.5);
+        let dz = fbm(&self.warp_noise, dir.x,         dir.y,         dir.z + 13.7,
+                     WARP_OCTAVES, WARP_FREQ, 2.0, 0.5);
+        let w = DVec3::new(
+            dir.x + WARP_AMP * dx,
+            dir.y + WARP_AMP * dy,
+            dir.z + WARP_AMP * dz,
+        ).normalize();
+        sample_c1(&self.uplift_field, w)
+    }
+
+    /// Substrate rock hardness at `dir` (C1). Returns [0,1]: 1 = hard fresh igneous/volcanic,
+    /// 0 = soft sediment/basin. Pure baked-grid lookup (identical main-thread/worker); uses
+    /// the same domain-warp as `query`. Mirrors `hardnessAt` in tectonics.ts (lines ~3402-3419).
+    /// Consumed by Phase-3 erosion + Phase-4 sampler; otherwise unused for now.
+    #[allow(dead_code)]
+    pub fn hardness_at(&self, dir: DVec3) -> f64 {
+        let dx = fbm(&self.warp_noise, dir.x + 13.7, dir.y,         dir.z,
+                     WARP_OCTAVES, WARP_FREQ, 2.0, 0.5);
+        let dy = fbm(&self.warp_noise, dir.x,         dir.y + 13.7, dir.z,
+                     WARP_OCTAVES, WARP_FREQ, 2.0, 0.5);
+        let dz = fbm(&self.warp_noise, dir.x,         dir.y,         dir.z + 13.7,
+                     WARP_OCTAVES, WARP_FREQ, 2.0, 0.5);
+        let w = DVec3::new(
+            dir.x + WARP_AMP * dx,
+            dir.y + WARP_AMP * dy,
+            dir.z + WARP_AMP * dz,
+        ).normalize();
+        sample_c1(&self.rock_hardness, w)
     }
 
     /// Tangent surface velocity of the owning plate at `dir`: ω × dir.
@@ -3062,6 +3438,7 @@ pub fn boundary_relief(
     plates: &[Plate],
     dir: DVec3,
     ridged_at: &dyn Fn(DVec3, f64, u32) -> f64,
+    base: f64,
 ) -> f64 {
     let d         = q.boundary_dist;
     let side_ramp = ss(0.002, 0.015, d);
@@ -3111,9 +3488,18 @@ pub fn boundary_relief(
         // OO: Japan arc
         let oo_subduct = 0.5 + (if own.id < other.id { 1.0 } else { 0.0 } - 0.5) * side_ramp;
         let arc_ridged = (ridged_at(dir, 9.0, 4) - BR_ARC_RIDGE_THRESH).max(0.0) * BR_ARC_RIDGE_SCALE;
+        // Sea-level emergence clamp (mirrors ki): cone tip can only just breach where
+        // the underlying base is near/below sea level. Keeps island arcs submarine
+        // except for the strongest cones.
+        // ponytail: the `arcClusterGate` along-strike envelope from ki is a separate
+        // drift not flagged for this phase; left out to keep this diff scoped.
+        const SEA_MARGIN: f64 = 0.02;
+        const SEA_ISLAND_HEADROOM: f64 = 0.05;
+        let arc_relief = (BR_ARC_HEIGHT * cp2r * gauss(d, BR_ARC_POS, BR_ARC_WIDTH) * arc_ridged)
+            .min((-base - SEA_MARGIN).max(0.0) + SEA_ISLAND_HEADROOM);
         relief += w_oo * (
               oo_subduct      * (-BR_OO_TRENCH_DEPTH * cp2r * gauss(d, 0.0, BR_OO_TRENCH_WIDTH))
-            + (1.0 - oo_subduct) * (BR_ARC_HEIGHT * cp2r * gauss(d, BR_ARC_POS, BR_ARC_WIDTH) * arc_ridged)
+            + (1.0 - oo_subduct) * arc_relief
         );
 
         // CC: Himalaya / Alps collision belt
@@ -3128,11 +3514,13 @@ pub fn boundary_relief(
     }
 
     if dpr > 0.0 {
-        // Mid-ocean ridge
-        relief += (1.0 - w_mine) * (BR_RIDGE_HEIGHT * dpr * gauss(d, 0.0, BR_RIDGE_WIDTH)
+        // Mid-ocean ridge — ridgeCap suppresses emergence so it stays submarine.
+        let ridge_cap = 1.0 - ss(-0.10, -0.02, base);
+        relief += (1.0 - w_mine) * ridge_cap * (BR_RIDGE_HEIGHT * dpr * gauss(d, 0.0, BR_RIDGE_WIDTH)
                                    - BR_NOTCH_DEPTH  * dpr * gauss(d, 0.0, BR_NOTCH_WIDTH));
-        // East African Rift
-        relief += w_mine * (BR_RIFT_SHOULDER * dpr * gauss(d, BR_RIFT_SHOULDER_POS, BR_RIFT_SHOULDER_WIDTH)
+        // East African Rift — shoulderSuppress damps the rift shoulder on high base.
+        let shoulder_suppress = 1.0 - ss(0.05, 0.25, base);
+        relief += w_mine * (BR_RIFT_SHOULDER * shoulder_suppress * dpr * gauss(d, BR_RIFT_SHOULDER_POS, BR_RIFT_SHOULDER_WIDTH)
                           - BR_GRABEN_DEPTH  * dpr * gauss(d, 0.0, BR_GRABEN_WIDTH));
     }
 
@@ -3156,8 +3544,8 @@ mod tests {
     /// Same seed must produce identical plate count, plate ids, and query results.
     #[test]
     fn tectonics_deterministic() {
-        let t1 = Tectonics::new(0xDEAD_BEEF, 8, 1.0, 4, 1.0);
-        let t2 = Tectonics::new(0xDEAD_BEEF, 8, 1.0, 4, 1.0);
+        let t1 = Tectonics::new(0xDEAD_BEEF, 8, 1.0, 4, 1.0, 0.5);
+        let t2 = Tectonics::new(0xDEAD_BEEF, 8, 1.0, 4, 1.0, 0.5);
 
         assert_eq!(t1.plate_count(), t2.plate_count(),
             "plate count differs between identical seeds");
@@ -3188,8 +3576,8 @@ mod tests {
     /// Different seeds must produce at least one differing plate id somewhere.
     #[test]
     fn different_seeds_diverge() {
-        let t1 = Tectonics::new(1, 8, 1.0, 4, 1.0);
-        let t2 = Tectonics::new(2, 8, 1.0, 4, 1.0);
+        let t1 = Tectonics::new(1, 8, 1.0, 4, 1.0, 0.5);
+        let t2 = Tectonics::new(2, 8, 1.0, 4, 1.0, 0.5);
         // Check a grid of 20 directions
         let mut any_diff = false;
         for i in 0..20 {
@@ -3206,7 +3594,7 @@ mod tests {
     /// Every direction on the sphere must map to a valid plate id.
     #[test]
     fn every_direction_gets_valid_plate_id() {
-        let t = Tectonics::new(42, 12, 1.0, 4, 1.0);
+        let t = Tectonics::new(42, 12, 1.0, 4, 1.0, 0.5);
         let n = t.plate_count();
         assert!(n > 0, "no plates generated");
 
@@ -3226,7 +3614,7 @@ mod tests {
     /// boundary_dist must be >= 0 for every queried point.
     #[test]
     fn boundary_dist_non_negative() {
-        let t = Tectonics::new(7, 10, 1.0, 4, 1.0);
+        let t = Tectonics::new(7, 10, 1.0, 4, 1.0, 0.5);
         for i in 0..50usize {
             let theta = std::f64::consts::PI * (i as f64 + 0.5) / 50.0;
             let phi   = 2.0 * std::f64::consts::PI * (i as f64 * 0.381_966_011_25) % (2.0 * std::f64::consts::PI);
@@ -3240,7 +3628,7 @@ mod tests {
     /// Non-tectonic path (plate_count=0) must compile and return plate_id=0.
     #[test]
     fn non_tectonic_path_compiles() {
-        let t = Tectonics::new(99, 0, 1.0, 0, 1.0);
+        let t = Tectonics::new(99, 0, 1.0, 0, 1.0, 0.5);
         assert_eq!(t.plate_count(), 1, "non-tectonic path should produce exactly 1 plate");
         let q = t.query(DVec3::new(1.0, 0.0, 0.0));
         assert_eq!(q.plate_id, 0);
@@ -3256,8 +3644,8 @@ mod tests {
     /// crust_dist and paleo_dist are now real data — same seed → identical values.
     #[test]
     fn phase2_crust_paleo_deterministic() {
-        let t1 = Tectonics::new(0xCAFE_BABE, 8, 1.0, 4, 1.0);
-        let t2 = Tectonics::new(0xCAFE_BABE, 8, 1.0, 4, 1.0);
+        let t1 = Tectonics::new(0xCAFE_BABE, 8, 1.0, 4, 1.0, 0.5);
+        let t2 = Tectonics::new(0xCAFE_BABE, 8, 1.0, 4, 1.0, 0.5);
 
         let dirs = [
             DVec3::new(1.0, 0.0, 0.0),
@@ -3280,7 +3668,7 @@ mod tests {
     /// crust_dist and paleo_dist must be finite everywhere.
     #[test]
     fn phase2_fields_finite() {
-        let t = Tectonics::new(0xF00D, 8, 1.0, 4, 1.0);
+        let t = Tectonics::new(0xF00D, 8, 1.0, 4, 1.0, 0.5);
         for i in 0..50usize {
             let theta = std::f64::consts::PI * (i as f64 + 0.5) / 50.0;
             let phi   = 2.0 * std::f64::consts::PI * (i as f64 * 0.618_033_988_75) % (2.0 * std::f64::consts::PI);
@@ -3297,7 +3685,7 @@ mod tests {
     #[test]
     fn boundary_relief_finite_and_bounded() {
         use crate::noise::ridged;
-        let t = Tectonics::new(0xABCD_1234, 8, 1.0, 4, 1.0);
+        let t = Tectonics::new(0xABCD_1234, 8, 1.0, 4, 1.0, 0.5);
         let ridged_noise = crate::noise::Noise3D::new(42);
 
         for i in 0..50usize {
@@ -3307,7 +3695,7 @@ mod tests {
             let q = t.query(dir);
             let r = boundary_relief(&q, &t.plates, dir, &|d, freq, oct| {
                 ridged(&ridged_noise, d.x, d.y, d.z, oct, freq, 2.0, 0.5)
-            });
+            }, 0.0);
             assert!(r.is_finite(), "boundary_relief not finite at i={}", i);
             assert!(r > -3.0 && r < 3.0, "boundary_relief {} out of plausible range at i={}", r, i);
         }
@@ -3317,8 +3705,8 @@ mod tests {
     #[test]
     fn boundary_relief_deterministic() {
         use crate::noise::ridged;
-        let t1 = Tectonics::new(0xBEEF, 8, 1.0, 4, 1.0);
-        let t2 = Tectonics::new(0xBEEF, 8, 1.0, 4, 1.0);
+        let t1 = Tectonics::new(0xBEEF, 8, 1.0, 4, 1.0, 0.5);
+        let t2 = Tectonics::new(0xBEEF, 8, 1.0, 4, 1.0, 0.5);
         let ridged_noise = crate::noise::Noise3D::new(77);
 
         let dirs = [
@@ -3331,10 +3719,10 @@ mod tests {
             let q2 = t2.query(dir.normalize());
             let r1 = boundary_relief(&q1, &t1.plates, dir, &|d, freq, oct| {
                 ridged(&ridged_noise, d.x, d.y, d.z, oct, freq, 2.0, 0.5)
-            });
+            }, 0.0);
             let r2 = boundary_relief(&q2, &t2.plates, dir, &|d, freq, oct| {
                 ridged(&ridged_noise, d.x, d.y, d.z, oct, freq, 2.0, 0.5)
-            });
+            }, 0.0);
             assert_eq!(r1.to_bits(), r2.to_bits(),
                 "boundary_relief differs between identical seeds at {:?}", dir);
         }
@@ -3351,7 +3739,7 @@ mod tests {
     fn round_trip_baked_bit_identical() {
         use crate::noise::ridged;
 
-        let original = Tectonics::new(0x9E37_79B9, 10, 1.0, 5, 1.0);
+        let original = Tectonics::new(0x9E37_79B9, 10, 1.0, 5, 1.0, 0.5);
         let baked    = original.to_baked();
         let restored = Tectonics::from_baked(&baked);
 
@@ -3397,8 +3785,8 @@ mod tests {
             let ridged_fn = |d: DVec3, freq: f64, oct: u32| {
                 ridged(&ridged_noise, d.x, d.y, d.z, oct, freq, 2.0, 0.5)
             };
-            let br_orig = boundary_relief(&q_orig, &original.plates, dir, &ridged_fn);
-            let br_rest = boundary_relief(&q_rest, &restored.plates, dir, &ridged_fn);
+            let br_orig = boundary_relief(&q_orig, &original.plates, dir, &ridged_fn, 0.0);
+            let br_rest = boundary_relief(&q_rest, &restored.plates, dir, &ridged_fn, 0.0);
             assert_eq!(br_orig.to_bits(), br_rest.to_bits(),
                 "boundary_relief differs after round-trip at i={}", i);
 
@@ -3414,7 +3802,7 @@ mod tests {
     /// Simply calling all public methods constitutes the check.
     #[test]
     fn public_surface_complete() {
-        let t = Tectonics::new(0x1111, 6, 1.2, 3, 0.8);
+        let t = Tectonics::new(0x1111, 6, 1.2, 3, 0.8, 0.5);
         let dir = DVec3::new(1.0, 0.0, 0.0);
 
         // new + query + velocity_at + volcano_elevation
@@ -3427,7 +3815,7 @@ mod tests {
         let rn = crate::noise::Noise3D::new(99);
         let _ = boundary_relief(&q, &t.plates, dir, &|d, freq, oct| {
             ridged(&rn, d.x, d.y, d.z, oct, freq, 2.0, 0.5)
-        });
+        }, 0.0);
 
         // to_baked + from_baked
         let baked = t.to_baked();
@@ -3438,8 +3826,8 @@ mod tests {
     /// volcano_elevation must be deterministic and finite.
     #[test]
     fn volcano_elevation_deterministic() {
-        let t1 = Tectonics::new(0x1234, 8, 1.0, 4, 1.0);
-        let t2 = Tectonics::new(0x1234, 8, 1.0, 4, 1.0);
+        let t1 = Tectonics::new(0x1234, 8, 1.0, 4, 1.0, 0.5);
+        let t2 = Tectonics::new(0x1234, 8, 1.0, 4, 1.0, 0.5);
 
         let dirs = [
             DVec3::new(1.0, 0.0, 0.0),

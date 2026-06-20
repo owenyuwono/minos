@@ -48,6 +48,11 @@ pub fn build_base_clusters(mesh: &PatchMesh) -> Vec<Cluster> {
                     position: mesh.positions[gv],
                     normal: mesh.normals[gv],
                     color: mesh.colors[gv],
+                    material: mesh.material[gv],
+                    wetness: mesh.wetness[gv],
+                    volcanism: mesh.volcanism[gv],
+                    elevation: mesh.elevation[gv],
+                    plate: mesh.plate[gv],
                 }
             })
             .collect();

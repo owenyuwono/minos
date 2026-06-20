@@ -10,7 +10,7 @@ pub mod dag;
 pub mod tessellate;
 
 pub use cluster_build::build_base_clusters;
-pub use dag::{bake_patch, bake_planet, build_dag};
+pub use dag::{bake_patch, bake_patch_timed, bake_planet, build_dag, BakeTimings};
 pub use tessellate::{tessellate_patch, PatchMesh, PatchParams};
 
 #[cfg(test)]

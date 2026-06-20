@@ -73,6 +73,11 @@ struct MergedMesh {
     positions: Vec<[f32; 3]>,
     normals: Vec<[f32; 3]>,
     colors: Vec<[f32; 3]>,
+    material: Vec<f32>,
+    wetness: Vec<f32>,
+    volcanism: Vec<f32>,
+    elevation: Vec<f32>,
+    plate: Vec<[f32; 3]>,
     indices: Vec<u32>,
     lock: Vec<bool>,
 }
@@ -84,6 +89,11 @@ fn merge_group(clusters: &[Cluster], group: &[usize]) -> MergedMesh {
     let mut positions = Vec::new();
     let mut normals = Vec::new();
     let mut colors = Vec::new();
+    let mut material = Vec::new();
+    let mut wetness = Vec::new();
+    let mut volcanism = Vec::new();
+    let mut elevation = Vec::new();
+    let mut plate = Vec::new();
     let mut indices = Vec::new();
 
     for &ci in group {
@@ -95,6 +105,11 @@ fn merge_group(clusters: &[Cluster], group: &[usize]) -> MergedMesh {
                 positions.push(v.position);
                 normals.push(v.normal);
                 colors.push(v.color);
+                material.push(v.material);
+                wetness.push(v.wetness);
+                volcanism.push(v.volcanism);
+                elevation.push(v.elevation);
+                plate.push(v.plate);
                 id
             });
             local.push(id);
@@ -122,7 +137,7 @@ fn merge_group(clusters: &[Cluster], group: &[usize]) -> MergedMesh {
         }
     }
 
-    MergedMesh { positions, normals, colors, indices, lock }
+    MergedMesh { positions, normals, colors, material, wetness, volcanism, elevation, plate, indices, lock }
 }
 
 // ── METIS grouping ───────────────────────────────────────────────────────────
@@ -291,6 +306,11 @@ pub fn build_dag(base: Vec<Cluster>) -> Vec<Cluster> {
                                 position: merged.positions[gv],
                                 normal: merged.normals[gv],
                                 color: merged.colors[gv],
+                                material: merged.material[gv],
+                                wetness: merged.wetness[gv],
+                                volcanism: merged.volcanism[gv],
+                                elevation: merged.elevation[gv],
+                                plate: merged.plate[gv],
                             }
                         })
                         .collect();
@@ -342,19 +362,54 @@ pub fn build_dag(base: Vec<Cluster>) -> Vec<Cluster> {
     all
 }
 
+/// Per-stage bake timings, milliseconds. For the planet bake the 6 faces run in
+/// parallel, so each stage is the **slowest face** — the three sum to ≈ the bake
+/// wall-clock, which is what the load-stats popup attributes time against.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BakeTimings {
+    pub tessellate_ms: f64,
+    pub clusters_ms: f64,
+    pub dag_ms: f64,
+}
+
 /// Full bake: tessellate the patch, build base clusters, build the DAG.
 pub fn bake_patch(params: &PatchParams, hf: &dyn HeightField) -> ClusterAsset {
+    bake_patch_timed(params, hf).0
+}
+
+/// Like [`bake_patch`] but also returns the per-stage timings.
+pub fn bake_patch_timed(params: &PatchParams, hf: &dyn HeightField) -> (ClusterAsset, BakeTimings) {
+    let t0 = std::time::Instant::now();
     let mesh = tessellate_patch(params, hf);
+    let t_tess = t0.elapsed();
     let origin = mesh.origin;
-    let clusters = build_dag(build_base_clusters(&mesh));
-    ClusterAsset {
+    let base = build_base_clusters(&mesh);
+    let t_clus = t0.elapsed() - t_tess;
+    let clusters = build_dag(base);
+    let t_dag = t0.elapsed() - t_tess - t_clus;
+    let timings = BakeTimings {
+        tessellate_ms: t_tess.as_secs_f64() * 1e3,
+        clusters_ms: t_clus.as_secs_f64() * 1e3,
+        dag_ms: t_dag.as_secs_f64() * 1e3,
+    };
+    log::info!(
+        "bake face {} res {}: tessellate {:.0}ms, clusters {:.0}ms, dag {:.0}ms ({} clusters)",
+        params.face,
+        params.resolution,
+        timings.tessellate_ms,
+        timings.clusters_ms,
+        timings.dag_ms,
+        clusters.len(),
+    );
+    let asset = ClusterAsset {
         clusters,
         patch_origin: origin,
         face: params.face,
         level: params.level,
         ix: params.ix,
         iy: params.iy,
-    }
+    };
+    (asset, timings)
 }
 
 /// Bake the **whole planet** — all 6 cube faces at level 0 — into ONE resident
@@ -372,7 +427,7 @@ pub fn bake_planet(
     radius: f64,
     height_scale: f64,
     resolution: u32,
-) -> Vec<ClusterAsset> {
+) -> (Vec<ClusterAsset>, BakeTimings) {
     // Bake the 6 faces in parallel. Each face is a node with its OWN origin — no
     // re-basing to the planet centre. The renderer applies a per-node camera-
     // relative translation (computed in f64), so f32 stays precise at any scale.
@@ -380,7 +435,7 @@ pub fn bake_planet(
         let handles: Vec<_> = (0..6u8)
             .map(|face| {
                 s.spawn(move || {
-                    bake_patch(
+                    bake_patch_timed(
                         &PatchParams {
                             face,
                             level: 0,
@@ -395,7 +450,18 @@ pub fn bake_planet(
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().expect("face bake panicked")).collect()
+        // Aggregate per stage by the slowest face (the critical path); those three
+        // ≈ the bake wall-clock since faces run concurrently.
+        let mut assets = Vec::with_capacity(6);
+        let mut agg = BakeTimings::default();
+        for h in handles {
+            let (asset, t) = h.join().expect("face bake panicked");
+            agg.tessellate_ms = agg.tessellate_ms.max(t.tessellate_ms);
+            agg.clusters_ms = agg.clusters_ms.max(t.clusters_ms);
+            agg.dag_ms = agg.dag_ms.max(t.dag_ms);
+            assets.push(asset);
+        }
+        (assets, agg)
     })
 }
 
@@ -527,7 +593,7 @@ mod tests {
     #[test]
     fn bake_planet_covers_six_faces() {
         let hf = SimpleHeightField { noise: Noise3D::new(5) };
-        let assets = bake_planet(&hf, 50_000.0, 1_200.0, 24);
+        let (assets, _) = bake_planet(&hf, 50_000.0, 1_200.0, 24);
         assert_eq!(assets.len(), 6, "one node per cube face");
         for a in &assets {
             assert!(a.cluster_count() > 0, "each face has clusters");

@@ -19,7 +19,7 @@
 //   Escape      — return from FirstPerson → Globe at any time.
 //
 // # View hot-swap keys (not consumed by egui)
-//   M    — cycle material_mode 0→1→2→3→0
+//   M    — cycle view_mode (0–10; skips Nanite-only 3–5 on the classic path)
 //   W    — toggle wireframe (Globe/Placement modes)
 //   Tab  — advance nav mode
 //   Esc  — exit first-person to Globe
@@ -38,13 +38,16 @@ mod controls;
 mod gui;
 mod hud;
 mod loading;
+mod ocean;
 mod planet_view;
 mod scene;
 mod stress;
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use enki_planet::climate::ClimateParams;
+use enki_planet::height::HeightField;
 use enki_planet::lod::{LodCamera, LodConfig};
 use enki_render::{camera::Camera, frame::FrameUniforms, lights::Lights, projection::reversed_z_perspective};
 use enki_rhi::{Rhi, RhiConfig, RhiError};
@@ -67,6 +70,7 @@ use controls::{
 };
 use gui::EguiState;
 use hud::Hud;
+use ocean::{Ocean, WaveSurface};
 use planet_view::{PlanetConfig, PlanetView, PlanetViewStats, RhiUploaderDummy, planet_view_from_hf};
 use scene::Scene;
 use stress::StressHarness;
@@ -99,10 +103,18 @@ struct App {
     window:       Option<Window>,
     egui:         Option<EguiState>,
     planet_view:  Option<PlanetView<RhiUploaderDummy>>,
+    /// Translucent sea-level shell for the live Planet path (built once at startup).
+    ocean:        Option<Ocean>,
+    /// FFT spectral wave surface (camera-anchored), drawn near the surface.
+    wave:         Option<WaveSurface>,
     scene:        Option<Scene>,
     stress:       Option<StressHarness>,
     #[cfg(feature = "nanite")]
     nanite:       Option<enki_nanite::render::NaniteRenderer>,
+    // Flora lives only in the dedicated `flora_viewer` bin (the showcase + 1:1
+    // dryad-render target). The in-planet draw was a single invisible debug tree
+    // at orbit scale; real on-surface flora (scatter/LOD/placement) is its own
+    // future slice, not this leftover. Removed so `--features flora` stays clean.
     /// Stage-2 cluster streaming: the deep per-face DAGs (held in RAM) + the
     /// residency selector that streams only the near-cut subset to the GPU pool.
     #[cfg(feature = "nanite")]
@@ -120,6 +132,10 @@ struct App {
     loader:       Option<loading::Loader>,
     /// Planet config held until the async load completes (then `PlanetView` is built).
     pending_planet_cfg: Option<PlanetConfig>,
+    /// Per-stage load timing, captured when the loader finishes (for the popup).
+    load_timings: Option<loading::LoadTimings>,
+    /// Show the one-time load-stats popup until the user dismisses it.
+    show_load_stats: bool,
     hud:          Hud,
     mode:         RenderMode,
     last_tick:    Instant,
@@ -133,19 +149,37 @@ struct App {
     first_person: Option<FirstPersonController>,
     /// Last cursor NDC (x right, y up, -1..1) for Placement ray-cast.
     cursor_ndc:   (f32, f32),
+    /// Shared terrain height source (clone of the loader's) so the FPS controller
+    /// can stand/walk on the surface. `None` until the async load completes.
+    height_field: Option<Arc<dyn HeightField>>,
+    /// Elevation scale (m) the renderer baked with — pairs with `height_field`.
+    terrain_height_scale: f64,
 
     // ── View hot-swap ─────────────────────────────────────────────────────
-    material_mode: u32,
+    /// Unified view mode 0–10 (View: 0 Lit,1 Unlit,2 Normal,3 Triangle,4 Cluster,
+    /// 5 LOD; Planet: 6 Plate,7 Height,8 Material,9 Wetness,10 Volcano).
+    view_mode:     u32,
     wireframe:     bool,
     /// TAA toggle (off by default; the proven non-TAA path stays the default).
     taa_enabled:   bool,
     /// Sub-pixel jitter + view-proj history for the TAA resolve.
     taa_jitter:    enki_render::taa::TaaJitter,
-    /// Nanite debug-view UI state.
+    /// Nanite UI state.
     nanite_enabled:    bool,
-    nanite_debug_mode: u32,
     /// LOD pixel-error threshold (lower = finer/smoother, heavier).
     nanite_tau:        f32,
+    /// Draw the translucent ocean shell over the planet.
+    ocean_enabled:     bool,
+    /// Draw the FFT spectral wave surface (camera-anchored detail).
+    wave_enabled:      bool,
+    /// Wave choppiness (horizontal displacement gain) — GUI-tunable.
+    wave_choppiness:   f32,
+    /// Foam threshold (Jacobian below which whitecaps form) — GUI-tunable.
+    wave_foam:         f32,
+    /// Sea level as a metre offset from the terrain's `e = 0` datum (= PLANET_RADIUS).
+    sea_level_m:       f64,
+    /// Elapsed seconds driving the ocean wave animation.
+    ocean_time:        f32,
 
     // ── Raw input state ───────────────────────────────────────────────────
     /// Accumulated mouse-motion delta between frames (pixels, CursorMoved).
@@ -189,6 +223,8 @@ impl App {
             window:        None,
             egui:          None,
             planet_view:   None,
+            ocean:         None,
+            wave:          None,
             scene:         None,
             stress:        None,
             #[cfg(feature = "nanite")]
@@ -203,6 +239,8 @@ impl App {
             nanite_last_resel: 0,
             loader:        None,
             pending_planet_cfg: None,
+            load_timings:  None,
+            show_load_stats: false,
             hud:           Hud::new(),
             mode,
             last_tick:     Instant::now(),
@@ -212,13 +250,20 @@ impl App {
             globe:         GlobeControls::new(100_000.0),
             first_person:  None,
             cursor_ndc:    (0.0, 0.0),
-            material_mode: 0,
+            height_field:  None,
+            terrain_height_scale: 0.0,
+            view_mode:     0,
             wireframe:     false,
-            taa_enabled:   false,
+            taa_enabled:   true,
             taa_jitter:    enki_render::taa::TaaJitter::new(),
-            nanite_enabled:    false,
-            nanite_debug_mode: 0,
+            nanite_enabled:    true,
             nanite_tau:        1.0,
+            ocean_enabled:     true,
+            wave_enabled:      true,
+            wave_choppiness:   1.3,
+            wave_foam:         0.4,
+            sea_level_m:       0.0,
+            ocean_time:        0.0,
             mouse_delta:   (0.0, 0.0),
             lmb_held:      false,
             lmb_click:     false,
@@ -344,9 +389,15 @@ impl App {
                 glam::Vec3::Z
             };
 
+            let Some(hf) = self.height_field.clone() else {
+                log::warn!("Nav: terrain not loaded yet — cannot place first-person");
+                return;
+            };
             self.first_person = Some(FirstPersonController::new(
                 hit.point,
+                hf,
                 PLANET_RADIUS,
+                self.terrain_height_scale,
                 heading,
             ));
             self.nav.point_picked();
@@ -577,6 +628,17 @@ impl ApplicationHandler for App {
 
                 rhi.destroy_shader_module(terrain_shader);
 
+                // Ocean shell at the terrain's sea-level datum (e = 0 = PLANET_RADIUS).
+                match Ocean::new(&mut rhi, color_format, samples, PLANET_RADIUS) {
+                    Ok(o)  => self.ocean = Some(o),
+                    Err(e) => log::error!("Ocean::new failed: {e}"),
+                }
+                // FFT spectral wave surface (camera-anchored detail patch).
+                match WaveSurface::new(&mut rhi, color_format, samples, PLANET_RADIUS) {
+                    Ok(w)  => self.wave = Some(w),
+                    Err(e) => log::error!("WaveSurface::new failed: {e}"),
+                }
+
                 let cfg = PlanetConfig {
                     lod: LodConfig {
                         radius:        50_000.0,
@@ -610,6 +672,14 @@ impl ApplicationHandler for App {
                     redistribution: None,
                     greenhouse:     None,
                     lapse_rate:     None,
+                    swirl_strength: None,
+                    n_high:         None,
+                    n_low:          None,
+                    cross_isobar_max: None,
+                    sigma_base:     None,
+                    lat_spread:     None,
+                    retrograde:     None,
+                    equator_taper_width: None,
                 };
 
                 // Kick off the async load (heightfield + 6 deep per-face Nanite
@@ -841,10 +911,20 @@ impl App {
                         }
                     }
 
-                    // ── Material mode cycle ───────────────────────────────────
+                    // ── View mode cycle ───────────────────────────────────────
                     KeyCode::KeyM if pressed => {
-                        self.material_mode = (self.material_mode + 1) % 4;
-                        log::info!("Material mode → {}", self.material_mode);
+                        #[cfg(feature = "nanite")]
+                        let nanite_on = self.nanite_enabled && self.nanite.is_some();
+                        #[cfg(not(feature = "nanite"))]
+                        let nanite_on = false;
+                        loop {
+                            self.view_mode = (self.view_mode + 1) % 11;
+                            // Skip the Nanite-only geometry views (3–5) on the classic path.
+                            if nanite_on || !(3..=5).contains(&self.view_mode) {
+                                break;
+                            }
+                        }
+                        log::info!("View mode → {}", self.view_mode);
                     }
 
                     // ── Wireframe toggle ──────────────────────────────────────
@@ -919,6 +999,7 @@ impl App {
         let dt  = now.duration_since(self.last_tick).as_secs_f32().min(0.1);
         self.last_tick = now;
         self.last_dt   = dt;
+        self.ocean_time += dt.min(0.1); // clamp hitches so waves don't jump
 
         // ── Async loading: show a progress bar until the worker finishes ──
         if self.loader.is_some() {
@@ -926,13 +1007,19 @@ impl App {
                 Some(out) => {
                     // Worker finished — assemble on the main thread (GPU uploads
                     // need the RHI). Then fall through to normal rendering.
+                    self.load_timings = Some(out.timings);
+                    self.show_load_stats = true;
                     if let Some(cfg) = self.pending_planet_cfg.take() {
                         #[cfg(feature = "nanite")]
                         {
                             self.nanite_radius = cfg.lod.radius;
                         }
+                        // Keep a handle to the terrain so the FPS controller can ride it.
+                        self.height_field = Some(Arc::clone(&out.hf));
+                        self.terrain_height_scale = cfg.lod.height_scale;
                         self.planet_view = Some(planet_view_from_hf(cfg, out.hf));
                     }
+
 
                     // Nanite (Stage 2): the deep per-face DAGs live in RAM; the GPU
                     // pool starts empty and the streamer uploads only the near-cut
@@ -987,7 +1074,7 @@ impl App {
             (self.active_camera(), self.altitude_m())
         };
         let nav_mode      = self.nav.mode();
-        let material_mode = self.material_mode;
+        let view_mode     = self.view_mode;
         let wireframe     = self.wireframe;
         let taa_on        = self.taa_enabled;
         // This frame's sub-pixel jitter (for rasterization); advance() rolls it
@@ -1005,17 +1092,25 @@ impl App {
         // This must run before begin_frame → begin_rendering.
         let ui_out = if self.egui.is_some() && self.window.is_some() && self.rhi.is_some() {
             let nanite_enabled    = self.nanite_enabled;
-            let nanite_debug_mode = self.nanite_debug_mode;
             let nanite_tau        = self.nanite_tau;
+            let ocean_enabled     = self.ocean_enabled;
+            let sea_level_m       = self.sea_level_m;
+            let wave_enabled      = self.wave_enabled;
+            let wave_choppiness   = self.wave_choppiness;
+            let wave_foam         = self.wave_foam;
+            // LoadTimings is Copy — snapshot it out so the popup can borrow it while
+            // egui mutably borrows self. Only passed while the popup is showing.
+            let load_stats        = if self.show_load_stats { self.load_timings } else { None };
             // egui, window, and rhi are independent fields — split-borrow.
             let egui   = self.egui.as_mut().unwrap();
             let window = self.window.as_ref().unwrap();
             let rhi    = self.rhi.as_ref().unwrap();
 
             Some(egui.build_frame(
-                window, rhi, nav_mode, altitude, dt, material_mode, wireframe, taa_on,
-                nanite_enabled, nanite_debug_mode, nanite_tau, cfg!(feature = "nanite"),
-                None, planet_stats.as_ref(),
+                window, rhi, nav_mode, altitude, dt, view_mode, wireframe, taa_on,
+                nanite_enabled, nanite_tau, cfg!(feature = "nanite"),
+                ocean_enabled, sea_level_m, wave_enabled, wave_choppiness, wave_foam,
+                None, planet_stats.as_ref(), load_stats.as_ref(),
             ))
         } else {
             None
@@ -1025,23 +1120,38 @@ impl App {
         // this frame still uses the pre-build snapshot (1-frame latency on toggles,
         // imperceptible); nav actions take effect via the &mut self calls below.
         if let Some(out) = ui_out {
-            self.material_mode     = out.material_mode;
+            self.view_mode         = out.view_mode;
             self.wireframe         = out.wireframe;
             self.taa_enabled       = out.taa;
             self.nanite_enabled    = out.nanite_enabled;
-            self.nanite_debug_mode = out.nanite_debug_mode;
             self.nanite_tau        = out.nanite_tau;
+            // Nanite-only geometry views (3–5) collapse to Lit when the classic path is active.
+            #[cfg(feature = "nanite")]
+            let nanite_on = self.nanite_enabled && self.nanite.is_some();
+            #[cfg(not(feature = "nanite"))]
+            let nanite_on = false;
+            if !nanite_on && (3..=5).contains(&self.view_mode) {
+                self.view_mode = 0;
+            }
+            self.ocean_enabled     = out.ocean_enabled;
+            self.sea_level_m       = out.sea_level_m;
+            self.wave_enabled      = out.wave_enabled;
+            self.wave_choppiness   = out.wave_choppiness;
+            self.wave_foam         = out.wave_foam;
             if out.cycle_nav {
                 self.cycle_nav_mode();
             }
             if out.exit_first_person && self.nav.mode() == NavMode::FirstPerson {
                 self.exit_first_person("UI button");
             }
+            if out.dismiss_load_stats {
+                self.show_load_stats = false;
+            }
         }
 
         // ── HUD window-title update ───────────────────────────────────────
         if let Some(window) = &self.window {
-            self.hud.update(window, dt, nav_mode, altitude, material_mode, wireframe,
+            self.hud.update(window, dt, nav_mode, altitude, view_mode, wireframe,
                 planet_stats.as_ref());
         }
 
@@ -1179,7 +1289,7 @@ impl App {
                         // resolves the per-frame stipple into a smooth blend).
                         let _ = n.update(
                             rhi, fi, camera_world_pos, &fu, screen_h_px,
-                            camera.fov_y_radians, self.nanite_tau, self.nanite_debug_mode,
+                            camera.fov_y_radians, self.nanite_tau, self.view_mode,
                             self.taa_enabled, self.frame_counter as u32,
                         );
                         let _ = n.record_cull(rhi, fi);
@@ -1191,7 +1301,7 @@ impl App {
                 rhi.set_viewport_scissor_full(fi);
                 if !nanite_active {
                     if let Some(pv) = self.planet_view.as_mut() {
-                        if let Err(e) = pv.record(rhi, fi, &fu, camera_world_pos, material_mode, wireframe) {
+                        if let Err(e) = pv.record(rhi, fi, &fu, camera_world_pos, view_mode, wireframe) {
                             log::error!("PlanetView::record error: {e}");
                         }
                     }
@@ -1204,12 +1314,55 @@ impl App {
                         let _ = n.record_draw(rhi, fi);
                     }
                 }
+
+
+                // Ocean: translucent sea-level shell (far / orbit), drawn after opaque.
+                if self.ocean_enabled {
+                    if let Some(o) = self.ocean.as_ref() {
+                        if let Err(e) =
+                            o.record(rhi, fi, &fu, camera_world_pos, self.sea_level_m)
+                        {
+                            log::error!("Ocean::record error: {e}");
+                        }
+                    }
+                }
+
+                // FFT wave surface (near detail) with screen-space refraction.
+                // begin_water_pass splits the 3D pass (TAA path only): it resolves the
+                // opaque scene to a sampled image, then reopens a 1× instance the water
+                // draws into, sampling that image for refraction.
+                let sea = self.sea_level_m;
+                let otime = self.ocean_time;
+                let odt = self.last_dt;
+                // Waves only matter near the surface; below ~20 km the patch fills
+                // the view, above it the smooth shell suffices (and we skip the
+                // pass-split cost). Refraction needs the TAA path.
+                let show_waves = self.wave_enabled && self.wave.is_some() && altitude < 20_000.0;
+                if show_waves {
+                    match rhi.begin_water_pass(fi) {
+                        Ok(true) => {
+                            let scene_view = rhi.refraction_src_view();
+                            let ext = rhi.extent();
+                            let w = self.wave.as_mut().unwrap();
+                            w.params.choppiness = self.wave_choppiness;
+                            w.params.foam_threshold = self.wave_foam;
+                            if let Err(e) = w.record(
+                                rhi, fi, &fu, camera_world_pos, sea, otime, odt,
+                                scene_view, (ext.width, ext.height),
+                            ) {
+                                log::error!("WaveSurface::record error: {e}");
+                            }
+                        }
+                        Ok(false) => {} // TAA off → no refraction split, no waves
+                        Err(e) => log::error!("begin_water_pass error: {e}"),
+                    }
+                }
             }
             RenderMode::Markers => {
                 rhi.begin_rendering(fi);
                 if let Some(scene) = self.scene.as_mut() {
                     let fu = FrameUniforms::new(&camera, aspect, &scene.lights);
-                    if let Err(e) = scene.record_frame(rhi, fi, &fu, &camera, material_mode, wireframe) {
+                    if let Err(e) = scene.record_frame(rhi, fi, &fu, &camera, view_mode, wireframe) {
                         log::error!("record_frame error: {e}");
                     }
                 }
@@ -1256,7 +1409,7 @@ impl App {
                 rhi.begin_rendering(fi);
                 rhi.set_viewport_scissor_full(fi);
                 if let Some(pv) = self.planet_view.as_mut() {
-                    if let Err(e) = pv.record(rhi, fi, &fu, camera_world_pos, material_mode, wireframe) {
+                    if let Err(e) = pv.record(rhi, fi, &fu, camera_world_pos, view_mode, wireframe) {
                         log::error!("PlanetView::record error (soak): {e}");
                     }
                 }

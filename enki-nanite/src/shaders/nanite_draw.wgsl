@@ -5,8 +5,12 @@
 // the vertex from the cluster storage buffers, and transforms it camera-relative.
 // Triangles past a cluster's real tri_count are emitted off-screen (degenerate).
 //
-// The fragment debug mode mirrors enki_nanite::debug::id_color:
-//   0 = lit, 1 = per-triangle, 2 = per-cluster, 3 = per-LOD.
+// The fragment view mode (unified with the classic terrain.wgsl scheme):
+//   0 = lit, 1 = unlit (flat albedo), 2 = normal,
+//   3 = per-triangle, 4 = per-cluster, 5 = per-LOD,
+//   6 = plate (per-plate tint), 7 = height (elevation grayscale),
+//   8 = material (rock hardness ramp), 9 = wetness (dry→wet ramp),
+//   10 = volcano (arc/hotspot cone influence, dark→hot ramp).
 
 struct ClusterMeta {
     bounds: vec4<f32>,
@@ -76,6 +80,11 @@ struct VsOut {
     // this sub-range of [0,1). Adjacent LODs share boundaries → exact partition.
     @location(5) @interpolate(flat) t_self: f32,
     @location(6) @interpolate(flat) t_par: f32,
+    @location(7) material: f32,
+    @location(8) wetness: f32,
+    @location(9) volcanism: f32,
+    @location(10) elevation: f32,
+    @location(11) plate: vec3<f32>,
 };
 
 @vertex
@@ -118,6 +127,11 @@ fn vs_pull(@builtin(vertex_index) vid: u32) -> VsOut {
         out.cluster_id = m.range.w; // stable id (not buffer slot) → flicker-free debug
         out.tri_id = 0u;
         out.lod = 0u;
+        out.material = 0.0;
+        out.wetness = 0.0;
+        out.volcanism = 0.0;
+        out.elevation = 0.0;
+        out.plate = vec3<f32>(0.0);
         return out;
     }
 
@@ -126,7 +140,7 @@ fn vs_pull(@builtin(vertex_index) vid: u32) -> VsOut {
     // vertex base is needed.
     let gt = ci * MAX_TRIS + tri;
     let vidx = tris[gt * 3u + corner];
-    let base = vidx * 9u;
+    let base = vidx * 16u; // stride: pos3 + normal3 + color3 + material1 + wetness1 + volcanism1 + elevation1 + plate3
     let pos = vec3<f32>(verts[base + 0u], verts[base + 1u], verts[base + 2u]);
     let nrm = vec3<f32>(verts[base + 3u], verts[base + 4u], verts[base + 5u]);
     let col = vec3<f32>(verts[base + 6u], verts[base + 7u], verts[base + 8u]);
@@ -138,6 +152,11 @@ fn vs_pull(@builtin(vertex_index) vid: u32) -> VsOut {
     out.cluster_id = m.range.w; // stable id (not buffer slot) → flicker-free debug
     out.tri_id = tri;
     out.lod = u32(m.err.z);
+    out.material = verts[base + 9u];
+    out.wetness = verts[base + 10u];
+    out.volcanism = verts[base + 11u];
+    out.elevation = verts[base + 12u];
+    out.plate = vec3<f32>(verts[base + 13u], verts[base + 14u], verts[base + 15u]);
     return out;
 }
 
@@ -192,6 +211,40 @@ fn aces_filmic(x: vec3<f32>) -> vec3<f32> {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+// Material (rock hardness) ramp, soft→hard: 5-stop indigo→cyan→lime→orange→crimson
+// at [0, 0.25, 0.5, 0.75, 1] (mirrors ki's materials view).
+fn material_ramp(t: f32) -> vec3<f32> {
+    let c0 = vec3<f32>(0.29, 0.13, 0.65); // indigo
+    let c1 = vec3<f32>(0.10, 0.75, 0.85); // cyan
+    let c2 = vec3<f32>(0.55, 0.85, 0.20); // lime
+    let c3 = vec3<f32>(0.95, 0.55, 0.10); // orange
+    let c4 = vec3<f32>(0.85, 0.10, 0.20); // crimson
+    if (t < 0.25) { return mix(c0, c1, t / 0.25); }
+    else if (t < 0.5) { return mix(c1, c2, (t - 0.25) / 0.25); }
+    else if (t < 0.75) { return mix(c2, c3, (t - 0.5) / 0.25); }
+    return mix(c3, c4, (t - 0.75) / 0.25);
+}
+
+// Wetness ramp, dry→wet: dry tan (#b8a07a, neutral) → wet blue (#2a6fb0), so
+// rivers/lakes read as blue threads over a neutral surface.
+fn wetness_ramp(t: f32) -> vec3<f32> {
+    let dry = vec3<f32>(0.722, 0.627, 0.478); // #b8a07a
+    let wet = vec3<f32>(0.165, 0.435, 0.690); // #2a6fb0
+    return mix(dry, wet, t);
+}
+
+// Volcano ramp, none→peak: near-black basalt → deep red → orange → hot yellow,
+// so arc/hotspot cones read as glowing hot spots over a dark surface.
+fn volcano_ramp(t: f32) -> vec3<f32> {
+    let c0 = vec3<f32>(0.06, 0.06, 0.08); // near-black basalt (no cone influence)
+    let c1 = vec3<f32>(0.55, 0.08, 0.04); // deep red
+    let c2 = vec3<f32>(0.95, 0.45, 0.10); // orange
+    let c3 = vec3<f32>(1.00, 0.92, 0.55); // hot yellow-white
+    if (t < 0.5) { return mix(c0, c1, t / 0.5); }
+    else if (t < 0.8) { return mix(c1, c2, (t - 0.5) / 0.3); }
+    return mix(c2, c3, (t - 0.8) / 0.2);
+}
+
 @fragment
 fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
     // Dithered LOD cross-fade (frame.debug.y = enabled). This cluster keeps only the
@@ -216,11 +269,30 @@ fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
         let d1 = max(dot(n, frame.sun1_dir.xyz), 0.0) * frame.sun1_color.xyz * albedo;
         rgb = aces_filmic(ambient_term + hemi + d0 + d1);
     } else if (pc.mode == 1u) {
-        rgb = id_color(hash2(in.cluster_id, in.tri_id));
+        // Unlit — flat biome albedo (no lighting, no ACES).
+        rgb = in.color;
     } else if (pc.mode == 2u) {
+        // Normal — world-space normal → RGB.
+        rgb = normalize(in.normal) * 0.5 + vec3<f32>(0.5);
+    } else if (pc.mode == 3u) {
+        rgb = id_color(hash2(in.cluster_id, in.tri_id));
+    } else if (pc.mode == 4u) {
         rgb = id_color(in.cluster_id);
-    } else {
+    } else if (pc.mode == 5u) {
         rgb = id_color(in.lod + 1u);
+    } else if (pc.mode == 6u) {
+        // Plate — per-plate tint.
+        rgb = in.plate;
+    } else if (pc.mode == 7u) {
+        // Height — signed normalized elevation → grayscale (ocean dark, peaks bright).
+        let g = clamp(in.elevation * 0.5 + 0.5, 0.0, 1.0);
+        rgb = vec3<f32>(g);
+    } else if (pc.mode == 8u) {
+        rgb = material_ramp(clamp(in.material, 0.0, 1.0));
+    } else if (pc.mode == 9u) {
+        rgb = wetness_ramp(clamp(in.wetness, 0.0, 1.0));
+    } else {
+        rgb = volcano_ramp(clamp(in.volcanism, 0.0, 1.0));
     }
     return vec4<f32>(rgb, 1.0);
 }

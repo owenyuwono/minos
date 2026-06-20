@@ -369,6 +369,14 @@ impl Rhi {
         self.buffers.destroy_buffer(unsafe { &mut *dev_a }, handle);
     }
 
+    /// Copy the contents of a host-visible buffer back into a `Vec<u8>` (the full
+    /// allocated size). Only valid for `host_visible` buffers. Used by the flora
+    /// screenshot path to read back a TRANSFER_DST readback buffer after a GPU
+    /// image→buffer copy + `wait_idle`.
+    pub fn read_buffer(&self, handle: BufferHandle) -> Result<Vec<u8>, RhiError> {
+        self.buffers.read_buffer(handle)
+    }
+
     // ── M2 Streaming API ───────────────────────────────────────────────────
 
     /// Upload mesh vertex/index data to DEVICE_LOCAL buffers via a staging ring.
@@ -919,6 +927,106 @@ impl Rhi {
         taa.history_layout[prev_index] = read;
         taa.write_index = prev_index;
         Ok(())
+    }
+
+    /// Split the 3D pass for refractive water (TAA path only). After opaque draws,
+    /// this closes the MSAA opaque instance (resolving it to `current`), copies the
+    /// resolved opaque color into a history scratch image (the refraction source),
+    /// and reopens a 1× rendering instance on `current` (+ `resolved_depth`) so the
+    /// water can sample the scene behind it. `taa_resolve` then closes this instance
+    /// and runs the history blend as usual. No-op (returns false) when TAA is off.
+    pub fn begin_water_pass(&mut self, fi: u32) -> Result<bool, RhiError> {
+        if fi == u32::MAX || !self.taa_active() {
+            return Ok(false);
+        }
+        let fi_idx = fi as usize;
+        let cmd = self.commands.frames[fi_idx].buffer;
+        let extent = self.swapchain.extent;
+        let (cur_img, cur_view, depth_view, scr_img, scr_old) = {
+            let taa = self.taa.as_ref().unwrap();
+            let im = taa.images.as_ref().unwrap();
+            let w = taa.write_index;
+            (im.current.image, im.current.view, im.resolved_depth.view, im.history[w].image, taa.history_layout[w])
+        };
+        let color = color_subresource_range();
+        let read = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        let device = &self.device.handle;
+        unsafe {
+            device.cmd_end_rendering(cmd); // close opaque instance → `current` = opaque color
+
+            // current → TRANSFER_SRC, scratch → TRANSFER_DST.
+            let b_cur = img_barrier(
+                cur_img, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_READ, color,
+            );
+            let b_scr = img_barrier(
+                scr_img, scr_old, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::PipelineStageFlags2::ALL_COMMANDS, vk::AccessFlags2::NONE,
+                vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_WRITE, color,
+            );
+            device.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&[b_cur, b_scr]));
+
+            let sub = vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .mip_level(0)
+                .base_array_layer(0)
+                .layer_count(1);
+            let offs = [
+                vk::Offset3D { x: 0, y: 0, z: 0 },
+                vk::Offset3D { x: extent.width as i32, y: extent.height as i32, z: 1 },
+            ];
+            let region = vk::ImageBlit::default()
+                .src_subresource(sub).src_offsets(offs)
+                .dst_subresource(sub).dst_offsets(offs);
+            device.cmd_blit_image(
+                cmd, cur_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                scr_img, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                std::slice::from_ref(&region), vk::Filter::NEAREST,
+            );
+
+            // scratch → SHADER_READ (refraction source), current → COLOR_ATTACHMENT.
+            let b_scr2 = img_barrier(
+                scr_img, vk::ImageLayout::TRANSFER_DST_OPTIMAL, read,
+                vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_WRITE,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ, color,
+            );
+            let b_cur2 = img_barrier(
+                cur_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_READ,
+                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE, color,
+            );
+            device.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&[b_scr2, b_cur2]));
+
+            // Reopen a 1× instance on current (+ depth), LOAD both (blend water over opaque).
+            let color_att = vk::RenderingAttachmentInfo::default()
+                .image_view(cur_view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::LOAD)
+                .store_op(vk::AttachmentStoreOp::STORE);
+            let depth_att = vk::RenderingAttachmentInfo::default()
+                .image_view(depth_view)
+                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::LOAD)
+                .store_op(vk::AttachmentStoreOp::STORE);
+            let info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent })
+                .layer_count(1)
+                .color_attachments(std::slice::from_ref(&color_att))
+                .depth_attachment(&depth_att);
+            device.cmd_begin_rendering(cmd, &info);
+        }
+        // `taa_resolve`'s b_hist transitions the scratch from UNDEFINED, so the
+        // tracked layout doesn't need updating here.
+        Ok(true)
+    }
+
+    /// The image view holding the opaque scene color this frame (refraction source
+    /// for the water pass). Valid only between `begin_water_pass` and `taa_resolve`.
+    pub fn refraction_src_view(&self) -> vk::ImageView {
+        let taa = self.taa.as_ref().unwrap();
+        let im = taa.images.as_ref().unwrap();
+        im.history[taa.write_index].view
     }
 
     // ── GPU-driven command recording (compute + indirect; generic) ──────────
@@ -1839,6 +1947,16 @@ impl Rhi {
     /// the frame's command buffer after `begin_rendering`.
     pub fn current_command_buffer(&self, fi: u32) -> vk::CommandBuffer {
         self.commands.frames[fi as usize].buffer
+    }
+
+    /// The raw `VkBuffer` backing a `BufferHandle` from the static buffer store.
+    ///
+    /// For self-contained sub-renderers (e.g. the flora sub-renderer) that build
+    /// their OWN descriptor sets and must point a binding at an RHI-created
+    /// buffer. Narrow + read-only: it does not bypass any resource-tracking
+    /// invariant — the buffer is still owned and reclaimed by the RHI.
+    pub fn vk_buffer(&self, handle: BufferHandle) -> Result<vk::Buffer, RhiError> {
+        self.buffers.vk_buffer(handle)
     }
 
     // ── Private helpers ────────────────────────────────────────────────────

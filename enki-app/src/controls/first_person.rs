@@ -9,6 +9,9 @@
 //! local up; pitch tilts the view.  Movement advances the player along the
 //! sphere surface at a configurable speed.
 
+use std::sync::Arc;
+
+use enki_planet::height::HeightField;
 use enki_render::camera::Camera;
 use glam::{DVec3, Quat, Vec3};
 
@@ -55,37 +58,60 @@ const MOUSE_SENSITIVITY: f32 = 0.002;
 /// - `forward` = player heading, kept ⟂ `up` at all times.
 /// - `right`   = `forward × up` (left-handed tangent plane basis; we
 ///   normalise in camera() to absorb floating-point drift).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FirstPersonController {
-    /// Feet position on the sphere surface (world, f64).
+    /// Feet position on the terrain surface (world, f64).
     feet: DVec3,
     /// Player heading direction in the tangent plane (f32, unit vector in world space).
     /// Always perpendicular to `up`.
     heading: Vec3,
     /// Current pitch in radians, clamped to ±MAX_PITCH.
     pitch: f32,
-    /// Surface radius of the planet (m).  Treat as constant (terrain query hook later).
-    surface_radius: f64,
+    /// Terrain source: feet ride `base_radius + height(dir) * height_scale`.
+    hf: Arc<dyn HeightField>,
+    /// Base sphere radius (m) — the terrain's `e = 0` datum.
+    base_radius: f64,
+    /// Elevation scale (m) applied to the height field; matches the rendered bake.
+    height_scale: f64,
 }
 
 impl FirstPersonController {
-    /// Create a new controller.
+    /// Create a new controller grounded on the terrain.
     ///
-    /// - `feet_pos`       — initial feet position; will be renormalised to `surface_radius`.
-    /// - `surface_radius` — planet (or terrain) radius at this point (m).
+    /// - `feet_pos`       — picked surface point; only its *direction* is used. The radius
+    ///   is recomputed from the terrain so the player stands on the surface, not under it.
+    /// - `hf`/`base_radius`/`height_scale` — terrain source + the same datum/scale the
+    ///   renderer bakes with, so the feet match the visible ground.
     /// - `initial_heading`— preferred forward direction; must not be parallel to `feet_pos`.
     ///   Projected onto the tangent plane and normalised.  Falls back to a safe default if
     ///   the projection is degenerate.
-    pub fn new(feet_pos: DVec3, surface_radius: f64, initial_heading: Vec3) -> Self {
-        let up = feet_pos.normalize();
-        let feet = up * surface_radius;
-        let heading = project_onto_tangent_plane(initial_heading, up.as_vec3());
-        Self {
-            feet,
+    pub fn new(
+        feet_pos: DVec3,
+        hf: Arc<dyn HeightField>,
+        base_radius: f64,
+        height_scale: f64,
+        initial_heading: Vec3,
+    ) -> Self {
+        let dir = feet_pos.normalize();
+        let heading = project_onto_tangent_plane(initial_heading, dir.as_vec3());
+        let mut ctrl = Self {
+            feet: DVec3::ZERO,
             heading,
             pitch: 0.0,
-            surface_radius,
-        }
+            hf,
+            base_radius,
+            height_scale,
+        };
+        ctrl.feet = dir * ctrl.surface_radius_at(dir);
+        ctrl
+    }
+
+    /// Terrain surface radius (m) along unit `dir`, matching the rendered bake (level 0).
+    ///
+    /// ponytail: radial up only — the player rides terrain *height*, not its slope/tilt.
+    /// Add a slope-aligned frame if walking up steep faces needs to feel grounded.
+    fn surface_radius_at(&self, dir: DVec3) -> f64 {
+        self.base_radius + self.hf.height(dir, 0) * self.height_scale
     }
 
     /// Mouse-look: yaw in the tangent plane, pitch clamped to ±85°.
@@ -132,9 +158,10 @@ impl FirstPersonController {
         let dir = delta.normalize();
         let move_dist = speed * dt as f64;
 
-        // Move in world space along the tangent direction, then snap back to sphere
-        let new_feet_f64 = self.feet + dir.as_dvec3() * move_dist;
-        self.feet = new_feet_f64.normalize() * self.surface_radius;
+        // Move along the tangent, then re-ground on the terrain at the new direction
+        // (radius follows the height field — the player walks over hills, not through them).
+        let new_dir = (self.feet + dir.as_dvec3() * move_dist).normalize();
+        self.feet = new_dir * self.surface_radius_at(new_dir);
 
         // Reproject heading onto the new tangent plane (the up direction rotated)
         let new_up = self.local_up().as_vec3();
@@ -154,8 +181,9 @@ impl FirstPersonController {
         // Orthogonal up in the camera frame (= world up when pitch == 0)
         let cam_up = right.cross(self.heading).normalize();
 
-        // Apply pitch: tilt forward/cam_up by self.pitch
-        let pitch_rot = Quat::from_axis_angle(right, -self.pitch);
+        // Apply pitch: tilt forward/cam_up by self.pitch.
+        // +pitch (mouse up / dy<0) looks up, -pitch (mouse down) looks down.
+        let pitch_rot = Quat::from_axis_angle(right, self.pitch);
         let forward = pitch_rot * self.heading;
         let view_up = pitch_rot * cam_up;
 
@@ -220,11 +248,30 @@ mod tests {
 
     const SURFACE_R: f64 = PLANET_RADIUS;
 
+    /// Flat terrain: zero elevation everywhere → surface sits at `base_radius`.
+    struct FlatHf;
+    impl HeightField for FlatHf {
+        fn height(&self, _dir: DVec3, _level: u8) -> f64 {
+            0.0
+        }
+    }
+
+    /// Elevation = the +Y component of `dir` (so it varies as the player moves),
+    /// scaled so the surface radius clearly differs from the base sphere.
+    struct SlopeHf;
+    impl HeightField for SlopeHf {
+        fn height(&self, dir: DVec3, _level: u8) -> f64 {
+            dir.normalize().y
+        }
+    }
+
     fn north_pole_controller() -> FirstPersonController {
-        // Feet at north pole (+Y)
+        // Feet at north pole (+Y), flat terrain → behaves like a fixed-radius sphere.
         FirstPersonController::new(
             DVec3::new(0.0, SURFACE_R, 0.0),
+            Arc::new(FlatHf),
             SURFACE_R,
+            1.0,
             Vec3::new(0.0, 0.0, -1.0), // initial heading toward -Z
         )
     }
@@ -273,6 +320,46 @@ mod tests {
         let r = ctrl.feet_position().length();
         assert!((r - SURFACE_R).abs() < 1.0,
             "feet radius {r} drifted from surface {SURFACE_R}");
+    }
+
+    #[test]
+    fn feet_ride_terrain_not_base_sphere() {
+        // height_scale 1000 m, elevation = dir.y. At the north pole dir.y == 1,
+        // so the surface is base + 1000 m — the player must stand there, not at base.
+        let scale = 1_000.0;
+        let ctrl = FirstPersonController::new(
+            DVec3::new(0.0, SURFACE_R, 0.0), // picked point on the *base* sphere
+            Arc::new(SlopeHf),
+            SURFACE_R,
+            scale,
+            Vec3::new(0.0, 0.0, -1.0),
+        );
+        let r = ctrl.feet_position().length();
+        assert!((r - (SURFACE_R + scale)).abs() < 1e-3,
+            "feet radius {r} should be base+elevation {}", SURFACE_R + scale);
+    }
+
+    #[test]
+    fn feet_follow_terrain_height_while_moving() {
+        // Invariant: after moving, the feet still sit exactly on the terrain surface
+        // for their current direction (radius tracks the height field, no burrowing).
+        let scale = 1_000.0;
+        let mut ctrl = FirstPersonController::new(
+            DVec3::new(0.0, SURFACE_R, 0.0),
+            Arc::new(SlopeHf),
+            SURFACE_R,
+            scale,
+            Vec3::new(0.0, 0.0, -1.0),
+        );
+        let input = MoveInput { forward: true, sprint: true, ..Default::default() };
+        for _ in 0..200 {
+            ctrl.on_move(input, 0.1); // walk far enough that dir.y (elevation) changes
+        }
+        let feet = ctrl.feet_position();
+        let dir = feet.normalize();
+        let expected = SURFACE_R + dir.y * scale;
+        assert!((feet.length() - expected).abs() < 1e-3,
+            "feet radius {} drifted off terrain surface {expected}", feet.length());
     }
 
     #[test]

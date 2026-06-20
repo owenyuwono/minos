@@ -18,4 +18,19 @@ pub trait HeightField: Send + Sync {
     fn climate(&self, _dir: DVec3, _height: f64) -> (f32, f32) {
         (15.0, 0.5)
     }
+
+    /// Rock hardness 0..1 (soft→hard) — debug "material" view. Default 0.0.
+    fn material(&self, _dir: DVec3) -> f32 {
+        0.0
+    }
+
+    /// Surface wetness 0..1 (open water: rivers ∪ lakes) — debug "wetness" view. Default 0.0.
+    fn wetness(&self, _dir: DVec3) -> f32 {
+        0.0
+    }
+
+    /// Volcano-cone influence 0..1 (arc + hotspot) — debug "volcano" view. Default 0.0.
+    fn volcanism(&self, _dir: DVec3) -> f32 {
+        0.0
+    }
 }

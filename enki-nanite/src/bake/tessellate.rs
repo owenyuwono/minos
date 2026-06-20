@@ -34,6 +34,16 @@ pub struct PatchMesh {
     pub positions: Vec<[f32; 3]>,
     pub normals: Vec<[f32; 3]>,
     pub colors: Vec<[f32; 3]>,
+    /// Per-vertex rock hardness 0..1 (debug "material" view), parallel to `colors`.
+    pub material: Vec<f32>,
+    /// Per-vertex surface wetness 0..1 (debug "wetness" view), parallel to `colors`.
+    pub wetness: Vec<f32>,
+    /// Per-vertex volcano-cone influence 0..1 (debug "volcano" view), parallel to `colors`.
+    pub volcanism: Vec<f32>,
+    /// Per-vertex signed normalized elevation h (~[-1,1]) (debug "height" view).
+    pub elevation: Vec<f32>,
+    /// Per-vertex per-plate tint (debug "plate" view), parallel to `colors`.
+    pub plate: Vec<[f32; 3]>,
     /// Triangle-list indices, CCW from outside, 32-bit.
     pub indices: Vec<u32>,
     /// Per-vertex: `true` if the vertex lies on an outer patch edge (lock for DAG).
@@ -110,6 +120,11 @@ pub fn tessellate_patch(p: &PatchParams, hf: &dyn HeightField) -> PatchMesh {
     let mut positions = vec![[0.0f32; 3]; vcount];
     let mut normals = vec![[0.0f32; 3]; vcount];
     let mut colors = vec![[0.0f32; 3]; vcount];
+    let mut material = vec![0.0f32; vcount];
+    let mut wetness = vec![0.0f32; vcount];
+    let mut volcanism = vec![0.0f32; vcount];
+    let mut elevation = vec![0.0f32; vcount];
+    let mut plate = vec![[0.0f32; 3]; vcount];
     let mut boundary = vec![false; vcount];
     let mut dir_cache = vec![DVec3::ZERO; vcount];
     let mut h_cache = vec![0.0f64; vcount];
@@ -142,6 +157,13 @@ pub fn tessellate_patch(p: &PatchParams, hf: &dyn HeightField) -> PatchMesh {
             let slope = (1.0 - n.dot(dir)).clamp(0.0, 1.0) as f32;
             let (temp, moisture) = hf.climate(dir, h_cache[vi]);
             colors[vi] = enki_planet::coloring::biome_color(temp, moisture, h_cache[vi] as f32, slope);
+
+            // Debug-view scalars, sampled at the same `dir` as color (default hf → 0).
+            material[vi] = hf.material(dir);
+            wetness[vi] = hf.wetness(dir);
+            volcanism[vi] = hf.volcanism(dir);
+            elevation[vi] = h_cache[vi] as f32;
+            plate[vi] = hf.plate_color(dir);
         }
     }
 
@@ -157,7 +179,7 @@ pub fn tessellate_patch(p: &PatchParams, hf: &dyn HeightField) -> PatchMesh {
         }
     }
 
-    PatchMesh { positions, normals, colors, indices, boundary, origin }
+    PatchMesh { positions, normals, colors, material, wetness, volcanism, elevation, plate, indices, boundary, origin }
 }
 
 #[cfg(test)]

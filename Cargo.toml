@@ -7,4 +7,5 @@ members = [
     "enki-planet",
     "enki-jobs",
     "enki-nanite",
+    "enki-flora",
 ]

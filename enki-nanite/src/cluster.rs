@@ -8,9 +8,10 @@
 //! translation is applied at draw time.
 
 use glam::{DVec3, Vec3};
+use serde::{Deserialize, Serialize};
 
 /// World-space bounding sphere; `center` is patch-origin-relative (f32).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BoundingSphere {
     pub center: Vec3,
     pub radius: f32,
@@ -18,7 +19,7 @@ pub struct BoundingSphere {
 
 /// Normal cone for backface cluster culling (meshopt convention): cull when
 /// `dot(normalize(apex - camera), axis) >= cutoff`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct NormalCone {
     pub apex: Vec3,
     pub axis: Vec3,
@@ -27,12 +28,23 @@ pub struct NormalCone {
 
 /// One cluster-local vertex. Clusters are self-contained, so vertices shared
 /// across cluster boundaries are duplicated — the standard meshlet layout.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ClusterVertex {
     /// Patch-origin-relative position (f32).
     pub position: [f32; 3],
     pub normal: [f32; 3],
     pub color: [f32; 3],
+    /// Rock hardness 0..1 (soft→hard) — debug "material" view. Rides along by
+    /// vertex identity through cluster build + DAG (meshopt simplifies on pos only).
+    pub material: f32,
+    /// Surface wetness 0..1 — debug "wetness" view. Same free-ride as `material`.
+    pub wetness: f32,
+    /// Volcano-cone influence 0..1 (arc + hotspot) — debug "volcano" view. Same free-ride.
+    pub volcanism: f32,
+    /// Signed normalized elevation h (~[-1,1]) — debug "height" view. Same free-ride.
+    pub elevation: f32,
+    /// Per-plate tint — debug "plate" view. Same free-ride as `material`.
+    pub plate: [f32; 3],
 }
 
 /// Parent error for root clusters: `+inf` always passes the cut's upper test.
@@ -46,7 +58,7 @@ pub const ROOT_PARENT_ERROR: f32 = f32::INFINITY;
 /// up. Monotonicity (`parent_error >= self_error`) and nested parent bounds are
 /// guaranteed by the baker — together they make the per-cluster test a globally
 /// consistent, crack-free DAG cut.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Cluster {
     pub vertices: Vec<ClusterVertex>,
     /// Triangles as cluster-local vertex indices (each `< vertices.len() <= 64`).
@@ -79,7 +91,7 @@ impl Cluster {
 }
 
 /// The full baked cluster DAG for one terrain patch — the resident bundle for v1.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClusterAsset {
     pub clusters: Vec<Cluster>,
     /// Absolute planet-space origin (f64); cluster positions are relative to this.

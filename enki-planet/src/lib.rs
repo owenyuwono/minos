@@ -1,6 +1,7 @@
 pub mod coloring;
 pub mod cubemap;
 pub mod climate;
+pub mod erosion;
 pub mod face_bases;
 pub mod frustum;
 pub mod height;

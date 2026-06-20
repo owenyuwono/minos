@@ -16,15 +16,17 @@
 //     visualizations, not HDR radiance). The hardware sRGB OETF still applies to
 //     all modes via the _SRGB surface — no manual encoding needed in any mode.
 //
-// ── Material modes ─────────────────────────────────────────────────────────────
-//   0 — Normal-lit   : ambient + hemisphere + 2 directional, vertex-color albedo,
-//                      ACES filmic tonemap. (Mode 0 is the only lit path.)
-//   1 — Debug normals: world-space normal → RGB visualisation (n * 0.5 + 0.5).
-//                      No ACES — raw [0,1] value written directly.
-//   2 — Plate-color  : plate_color vertex attribute output directly.
-//                      No ACES — raw sRGB tint written directly.
-//   3 — Heightmap    : elevation above PLANET_RADIUS remapped to grayscale [0,1].
-//                      No ACES — raw scalar written directly.
+// ── View modes (unified with the Nanite nanite_draw.wgsl scheme) ───────────────
+//   0  Lit      : biome albedo + ambient/hemisphere/2 suns + ACES (the only lit path).
+//   1  Unlit    : biome albedo, flat (no lighting, no ACES).
+//   2  Normal   : world-space normal → RGB (n * 0.5 + 0.5).
+//   6  Plate    : per-plate tectonic tint (plate_color attribute), raw.
+// Nanite-only modes 3/4/5 (triangle/cluster/LOD) and the data-channel modes
+// 7/8/9/10 (height/material/wetness/volcano) are NOT yet supported on the classic
+// quadtree path — its 4×vec3 vertex format (pos/normal/color/plate, hardcoded in
+// enki-rhi) has no room for the elevation/material/wetness/volcanism scalars. They
+// fall back to Lit here; full parity needs a 5th vertex channel through the enki-rhi
+// streaming/pipeline layout. The Nanite path already supports all of them.
 
 // ── Uniforms ────────────────────────────────────────────────────────────────
 
@@ -139,70 +141,39 @@ fn aces_filmic(x: vec3<f32>) -> vec3<f32> {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
-// Heightmap constants — must match the prototype planet parameters.
-const PLANET_RADIUS: f32 = 50000.0;
-const HEIGHT_SCALE : f32 = 1200.0;
-
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let n = normalize(in.world_normal);
 
-    // ── Mode 0: Normal-lit ─────────────────────────────────────────────────────
-    // Ambient isotropic + hemisphere + two directional lights, vertex-color
-    // albedo, ACES filmic tonemap. This is the only mode that touches lighting
-    // or the tonemap. The swapchain is _SRGB so the hardware applies the sRGB
-    // OETF on write — no manual encoding here.
-    if pc.material_mode == 0u {
-        let albedo = in.albedo;
-
-        let ambient_term = frame.ambient.xyz * albedo;
-        let hemi_term    = hemisphere_ambient(n, frame.hemi_sky.xyz, frame.hemi_ground.xyz) * albedo;
-        let diff0        = directional_diffuse(n, frame.sun0_dir.xyz, frame.sun0_color.xyz) * albedo;
-        let diff1        = directional_diffuse(n, frame.sun1_dir.xyz, frame.sun1_color.xyz) * albedo;
-
-        var lit = ambient_term + hemi_term + diff0 + diff1;
-        lit = aces_filmic(lit);
-
-        return vec4<f32>(lit, 1.0);
-    }
-
-    // ── Debug modes 1–3: no lighting, no ACES ─────────────────────────────────
-    // These modes output raw data values that must read as-is from the image.
-    // Applying ACES (or any tone curve) to a data visualization distorts the
-    // encoded value, so it is intentionally omitted. The _SRGB swapchain still
-    // applies its hardware OETF on write, which is acceptable for visual
-    // debugging.
-
-    // ── Mode 1: Debug normals ──────────────────────────────────────────────────
-    // Map world-space normal to [0,1] RGB so every component is visible.
-    // Output is independent of lighting and valid on any mesh geometry.
-    // TODO: with real terrain this slot becomes LOD-level coloring.
+    // ── Mode 1: Unlit ──────────────────────────────────────────────────────────
+    // Biome albedo, flat — no lighting, no ACES (the _SRGB swapchain still applies
+    // its hardware OETF on write).
     if pc.material_mode == 1u {
-        let vis = n * 0.5 + vec3<f32>(0.5);
-        return vec4<f32>(vis, 1.0);
+        return vec4<f32>(in.albedo, 1.0);
     }
 
-    // ── Mode 2: Plate-color ────────────────────────────────────────────────────
-    // Output the tectonic plate tint directly. On placeholder geometry
-    // plate_color equals the vertex color; with real terrain it carries the
-    // per-plate tint from the generator.
+    // ── Mode 2: Normal ─────────────────────────────────────────────────────────
+    // World-space normal → [0,1] RGB. Independent of lighting.
     if pc.material_mode == 2u {
+        return vec4<f32>(n * 0.5 + vec3<f32>(0.5), 1.0);
+    }
+
+    // ── Mode 6: Plate ──────────────────────────────────────────────────────────
+    // Per-plate tectonic tint, raw. (Populated by the mesher via hf.plate_color.)
+    if pc.material_mode == 6u {
         return vec4<f32>(in.plate_color, 1.0);
     }
 
-    // ── Mode 3: Heightmap (grayscale) ─────────────────────────────────────────
-    // Elevation = distance from planet centre minus PLANET_RADIUS, divided by
-    // HEIGHT_SCALE. This maps the nominal surface (radius = PLANET_RADIUS) to
-    // ~0.0 and the maximum terrain height (~PLANET_RADIUS + HEIGHT_SCALE) to
-    // ~1.0. The placeholder sphere has radius ≈ PLANET_RADIUS, so all fragments
-    // land near 0.0 and the ramp shows as near-black — that is correct.
-    // Clamp to [0,1] so any out-of-range geometry doesn't wrap or NaN.
-    if pc.material_mode == 3u {
-        let elevation = (length(in.world_pos) - PLANET_RADIUS) / HEIGHT_SCALE;
-        let g = clamp(elevation, 0.0, 1.0);
-        return vec4<f32>(g, g, g, 1.0);
-    }
-
-    // ── Fallback: out-of-range mode → bright magenta for easy identification ──
-    return vec4<f32>(1.0, 0.0, 1.0, 1.0);
+    // ── Mode 0 Lit + fallback ──────────────────────────────────────────────────
+    // Ambient isotropic + hemisphere + two directional lights, biome-color albedo,
+    // ACES filmic tonemap. Modes the classic path can't yet serve (3/4/5 Nanite-only;
+    // 7/8/9/10 need vertex channels the 4×vec3 format lacks) also land here.
+    let albedo = in.albedo;
+    let ambient_term = frame.ambient.xyz * albedo;
+    let hemi_term    = hemisphere_ambient(n, frame.hemi_sky.xyz, frame.hemi_ground.xyz) * albedo;
+    let diff0        = directional_diffuse(n, frame.sun0_dir.xyz, frame.sun0_color.xyz) * albedo;
+    let diff1        = directional_diffuse(n, frame.sun1_dir.xyz, frame.sun1_color.xyz) * albedo;
+    var lit = ambient_term + hemi_term + diff0 + diff1;
+    lit = aces_filmic(lit);
+    return vec4<f32>(lit, 1.0);
 }

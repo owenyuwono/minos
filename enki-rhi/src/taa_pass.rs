@@ -42,14 +42,18 @@ impl TaaImages {
         let color = vk::ImageAspectFlags::COLOR;
         let depth = vk::ImageAspectFlags::DEPTH;
         let sampled_color = vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED;
-        let history_usage = sampled_color | vk::ImageUsageFlags::TRANSFER_SRC;
+        // current is also blitted from for the refraction capture (TRANSFER_SRC);
+        // history is the refraction scratch (blit dest, TRANSFER_DST) + resolve blit src.
+        let history_usage =
+            sampled_color | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
 
         let hdr_msaa = AllocatedImage::new_render_target(
             device, allocator, extent, color_format, samples,
             vk::ImageUsageFlags::COLOR_ATTACHMENT, color, "taa_msaa",
         )?;
         let current = AllocatedImage::new_render_target(
-            device, allocator, extent, color_format, one, sampled_color, color, "taa_current",
+            device, allocator, extent, color_format, one,
+            sampled_color | vk::ImageUsageFlags::TRANSFER_SRC, color, "taa_current",
         )?;
         let resolved_depth = AllocatedImage::new_render_target(
             device, allocator, extent, vk::Format::D32_SFLOAT, one,

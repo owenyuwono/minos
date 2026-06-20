@@ -32,6 +32,7 @@ use egui_winit::State as WinitState;
 use enki_rhi::Rhi;
 
 use crate::controls::nav_mode::NavMode;
+use crate::loading::LoadTimings;
 use crate::planet_view::PlanetViewStats;
 
 // ── UiOutput ────────────────────────────────────────────────────────────────
@@ -42,19 +43,32 @@ use crate::planet_view::PlanetViewStats;
 /// settings fields are the new values; the action flags are one-shot edges.
 #[derive(Debug, Clone, Copy)]
 pub struct UiOutput {
-    pub material_mode: u32,
+    /// Unified view mode 0–10 — View: 0 Lit, 1 Unlit, 2 Normal, 3 Triangle,
+    /// 4 Cluster, 5 LOD (3–5 Nanite-only); Planet: 6 Plate, 7 Height, 8 Material,
+    /// 9 Wetness, 10 Volcano.
+    pub view_mode: u32,
     pub wireframe: bool,
     /// Temporal anti-aliasing (hides discrete-LOD shimmer + edge aliasing).
     pub taa: bool,
     pub nanite_enabled: bool,
-    /// 0 = Off, 1 = Triangle, 2 = Cluster, 3 = LOD.
-    pub nanite_debug_mode: u32,
     /// LOD pixel-error threshold (lower = finer / smoother LOD, heavier).
     pub nanite_tau: f32,
+    /// Draw the translucent ocean shell over the planet.
+    pub ocean_enabled: bool,
+    /// Sea level as a metre offset from the terrain's `e = 0` datum.
+    pub sea_level_m: f64,
+    /// Draw the FFT spectral wave surface (near-surface detail; needs TAA on).
+    pub wave_enabled: bool,
+    /// Wave horizontal displacement gain ("choppiness").
+    pub wave_choppiness: f32,
+    /// Jacobian value below which whitecap foam forms.
+    pub wave_foam: f32,
     /// Cycle nav mode (same as Tab).
     pub cycle_nav: bool,
     /// Exit first-person (same as Esc).
     pub exit_first_person: bool,
+    /// User dismissed the load-stats popup this frame.
+    pub dismiss_load_stats: bool,
 }
 
 // ── EguiState ─────────────────────────────────────────────────────────────
@@ -151,27 +165,37 @@ impl EguiState {
         nav_mode:          NavMode,
         altitude_m:        f64,
         frame_time_s:      f32,
-        material_mode:     u32,
+        view_mode:         u32,
         wireframe:         bool,
         taa:               bool,
         nanite_enabled:    bool,
-        nanite_debug_mode: u32,
         nanite_tau:        f32,
         nanite_available:  bool,
+        ocean_enabled:     bool,
+        sea_level_m:       f64,
+        wave_enabled:      bool,
+        wave_choppiness:   f32,
+        wave_foam:         f32,
         stress_stats:      Option<&str>,
         planet_stats:      Option<&PlanetViewStats>,
+        load_stats:        Option<&LoadTimings>,
     ) -> UiOutput {
         let raw_input = self.winit.take_egui_input(window);
 
         let mut out = UiOutput {
-            material_mode,
+            view_mode,
             wireframe,
             taa,
             nanite_enabled,
-            nanite_debug_mode,
             nanite_tau,
+            ocean_enabled,
+            sea_level_m,
+            wave_enabled,
+            wave_choppiness,
+            wave_foam,
             cycle_nav: false,
             exit_first_person: false,
+            dismiss_load_stats: false,
         };
 
         let full_output = self.ctx.run(raw_input, |ctx| {
@@ -180,92 +204,157 @@ impl EguiState {
                 .default_pos([8.0, 8.0])
                 .default_width(220.0)
                 .show(ctx, |ui| {
-                    // ── Navigation ───────────────────────────────────────────
-                    ui.heading("Navigation");
-                    ui.label(format!("Mode: {nav_mode:?}"));
-                    ui.label(format!("Altitude: {:.1} km", altitude_m / 1000.0));
-                    ui.horizontal(|ui| {
-                        if ui.button("Cycle mode").clicked() {
-                            out.cycle_nav = true;
-                        }
-                        if nav_mode == NavMode::FirstPerson
-                            && ui.button("Exit first-person").clicked()
-                        {
-                            out.exit_first_person = true;
-                        }
-                    });
+                    use egui::CollapsingHeader;
 
-                    ui.separator();
+                    // ── Navigation ───────────────────────────────────────────
+                    CollapsingHeader::new("Navigation").default_open(true).show(ui, |ui| {
+                        ui.label(format!("Mode: {nav_mode:?}"));
+                        ui.label(format!("Altitude: {:.1} km", altitude_m / 1000.0));
+                        ui.horizontal(|ui| {
+                            if ui.button("Cycle mode").clicked() {
+                                out.cycle_nav = true;
+                            }
+                            if nav_mode == NavMode::FirstPerson
+                                && ui.button("Exit first-person").clicked()
+                            {
+                                out.exit_first_person = true;
+                            }
+                        });
+                    });
 
                     // ── Performance ──────────────────────────────────────────
-                    ui.heading("Performance");
-                    let fps = if frame_time_s > 0.0 { 1.0 / frame_time_s } else { 0.0 };
-                    ui.label(format!("FPS: {fps:.0}   ({:.2} ms)", frame_time_s * 1000.0));
-
-                    ui.separator();
+                    CollapsingHeader::new("Performance").default_open(true).show(ui, |ui| {
+                        let fps = if frame_time_s > 0.0 { 1.0 / frame_time_s } else { 0.0 };
+                        ui.label(format!("FPS: {fps:.0}   ({:.2} ms)", frame_time_s * 1000.0));
+                    });
 
                     // ── View ─────────────────────────────────────────────────
-                    ui.heading("View");
-                    ui.horizontal(|ui| {
-                        ui.label("Material:");
-                        for m in 0..4u32 {
-                            ui.selectable_value(&mut out.material_mode, m, m.to_string());
-                        }
-                    });
-                    ui.checkbox(&mut out.wireframe, "Wireframe");
-                    ui.checkbox(&mut out.taa, "TAA (temporal AA)");
-
-                    ui.separator();
-
-                    // ── Nanite (debug) ───────────────────────────────────────
-                    // Present now so the panel layout is visible; these controls
-                    // go live when N2 (the runtime cluster renderer) lands.
-                    ui.heading("Nanite (debug)");
-                    ui.add_enabled_ui(nanite_available, |ui| {
-                        ui.checkbox(&mut out.nanite_enabled, "Enable Nanite view");
+                    CollapsingHeader::new("View").default_open(true).show(ui, |ui| {
+                        // Geometry-debug views (Triangle/Cluster/LOD) need the Nanite path.
+                        let nanite_active = nanite_available && out.nanite_enabled;
                         ui.horizontal(|ui| {
-                            ui.label("Color:");
-                            ui.selectable_value(&mut out.nanite_debug_mode, 0, "Off");
-                            ui.selectable_value(&mut out.nanite_debug_mode, 1, "Triangle");
-                            ui.selectable_value(&mut out.nanite_debug_mode, 2, "Cluster");
-                            ui.selectable_value(&mut out.nanite_debug_mode, 3, "LOD");
+                            ui.label("View:");
+                            ui.selectable_value(&mut out.view_mode, 0, "Lit");
+                            ui.selectable_value(&mut out.view_mode, 1, "Unlit");
+                            ui.selectable_value(&mut out.view_mode, 2, "Normal");
+                            ui.add_enabled_ui(nanite_active, |ui| {
+                                ui.selectable_value(&mut out.view_mode, 3, "Triangle");
+                                ui.selectable_value(&mut out.view_mode, 4, "Cluster");
+                                ui.selectable_value(&mut out.view_mode, 5, "LOD");
+                            });
                         });
-                        ui.add(
-                            egui::Slider::new(&mut out.nanite_tau, 0.25..=8.0)
-                                .text("LOD threshold (px)"),
+                        ui.horizontal(|ui| {
+                            ui.label("Planet:");
+                            ui.selectable_value(&mut out.view_mode, 6, "Plate");
+                            ui.selectable_value(&mut out.view_mode, 7, "Height");
+                            ui.selectable_value(&mut out.view_mode, 8, "Material");
+                            ui.selectable_value(&mut out.view_mode, 9, "Wetness");
+                            ui.selectable_value(&mut out.view_mode, 10, "Volcano");
+                        });
+                        ui.checkbox(&mut out.wireframe, "Wireframe");
+                        ui.checkbox(&mut out.taa, "TAA (temporal AA)");
+                    });
+
+                    // ── Ocean ────────────────────────────────────────────────
+                    CollapsingHeader::new("Ocean").default_open(true).show(ui, |ui| {
+                        ui.checkbox(&mut out.ocean_enabled, "Show ocean");
+                        ui.add_enabled(
+                            out.ocean_enabled,
+                            egui::Slider::new(&mut out.sea_level_m, -1200.0..=1200.0)
+                                .text("Sea level (m)")
+                                .step_by(5.0),
+                        );
+                        ui.separator();
+                        ui.checkbox(&mut out.wave_enabled, "FFT waves (near surface)");
+                        ui.add_enabled(
+                            out.wave_enabled,
+                            egui::Slider::new(&mut out.wave_choppiness, 0.0..=2.5).text("Choppiness"),
+                        );
+                        ui.add_enabled(
+                            out.wave_enabled,
+                            egui::Slider::new(&mut out.wave_foam, 0.0..=1.0).text("Foam amount"),
                         );
                     });
-                    if !nanite_available {
-                        ui.small("Build with the `nanite` feature to enable.");
-                    }
+
+                    // ── Nanite ───────────────────────────────────────────────
+                    CollapsingHeader::new("Nanite").default_open(true).show(ui, |ui| {
+                        ui.add_enabled_ui(nanite_available, |ui| {
+                            ui.checkbox(&mut out.nanite_enabled, "Enable Nanite");
+                            ui.add(
+                                egui::Slider::new(&mut out.nanite_tau, 0.25..=8.0)
+                                    .text("LOD threshold (px)"),
+                            );
+                        });
+                        if !nanite_available {
+                            ui.small("Built without the `nanite` feature.");
+                        }
+                    });
 
                     // ── Planet LOD stats ─────────────────────────────────────
                     if let Some(ps) = planet_stats {
-                        ui.separator();
-                        ui.heading("Planet LOD");
-                        ui.label(format!("Resident chunks: {}", ps.resident_count));
-                        ui.label(format!("Build queue: {}", ps.build_queue_depth));
-                        ui.label(format!(
-                            "LOD levels: {}-{}",
-                            ps.min_lod_level, ps.max_lod_level
-                        ));
+                        CollapsingHeader::new("Planet LOD").default_open(true).show(ui, |ui| {
+                            ui.label(format!("Resident chunks: {}", ps.resident_count));
+                            ui.label(format!("Build queue: {}", ps.build_queue_depth));
+                            ui.label(format!(
+                                "LOD levels: {}-{}",
+                                ps.min_lod_level, ps.max_lod_level
+                            ));
+                        });
                     }
 
                     // ── Stress stats ─────────────────────────────────────────
                     if let Some(stats) = stress_stats {
-                        ui.separator();
-                        ui.heading("Stress");
-                        ui.label(stats);
+                        CollapsingHeader::new("Stress").default_open(true).show(ui, |ui| {
+                            ui.label(stats);
+                        });
                     }
 
-                    ui.separator();
-                    ui.collapsing("Key hints", |ui| {
+                    CollapsingHeader::new("Key hints").show(ui, |ui| {
                         ui.label("[M] cycle material");
                         ui.label("[W] toggle wireframe");
                         ui.label("[Tab] cycle nav mode");
                         ui.label("[Esc] exit first-person");
                     });
                 });
+
+            // One-time load-stats popup: total + per-stage breakdown. Shown until
+            // the user clicks OK or closes it (caller stops passing `load_stats`).
+            if let Some(t) = load_stats {
+                let total = t.total_ms.max(1.0);
+                let mut open = true;
+                egui::Window::new("Load complete")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_TOP, [0.0, 48.0])
+                    .open(&mut open)
+                    .show(ctx, |ui| {
+                        ui.heading(format!("Loaded in {:.1} s", t.total_ms / 1000.0));
+                        ui.add_space(6.0);
+                        egui::Grid::new("load_stats").num_columns(3).striped(true).show(ui, |ui| {
+                            let row = |ui: &mut egui::Ui, name: &str, ms: f64, pct: bool| {
+                                ui.label(name);
+                                ui.label(format!("{:.2} s", ms / 1000.0));
+                                ui.label(if pct { format!("{:.0}%", 100.0 * ms / total) } else { String::new() });
+                                ui.end_row();
+                            };
+                            row(ui, "Heightfield", t.heightfield_ms, true);
+                            // Bake fields are 0 without the `nanite` feature — hide them then.
+                            if t.bake_wall_ms > 0.0 {
+                                row(ui, "Nanite bake", t.bake_wall_ms, true);
+                                row(ui, "    tessellate", t.tessellate_ms, false);
+                                row(ui, "    clusters", t.clusters_ms, false);
+                                row(ui, "    dag", t.dag_ms, false);
+                            }
+                        });
+                        ui.add_space(8.0);
+                        if ui.button("OK").clicked() {
+                            out.dismiss_load_stats = true;
+                        }
+                    });
+                if !open {
+                    out.dismiss_load_stats = true;
+                }
+            }
         });
 
         // Upload any new/changed textures (font atlas, etc.) to the GPU.

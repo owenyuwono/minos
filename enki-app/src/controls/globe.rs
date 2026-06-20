@@ -99,12 +99,18 @@ impl GlobeControls {
         self.dragged_this_frame = true;
     }
 
-    /// Scroll input: zoom in/out exponentially toward the planet.
+    /// Scroll input: zoom in/out geometrically toward the planet.
     ///
-    /// Positive `delta` zooms in (decreases radius), negative zooms out.
+    /// Positive `delta` zooms in (decreases radius), negative zooms out. The step is
+    /// proportional to ALTITUDE (distance to the surface), not radius (distance to the
+    /// centre): each notch changes altitude by a fixed fraction, so zoom slows as you
+    /// approach the surface (fine control up close) and stays fast from orbit — and it
+    /// can't overshoot through the surface. Altitude is ≥ MIN_ALTITUDE by the clamp, so
+    /// the step never collapses to zero.
     pub fn on_scroll(&mut self, delta: f32) {
-        let log_r = (self.target_radius as f32) - delta * SCROLL_SENSITIVITY * self.target_radius as f32;
-        self.target_radius = (log_r as f64).clamp(
+        let altitude = (self.target_radius - PLANET_RADIUS) as f32;
+        let step = delta * SCROLL_SENSITIVITY * altitude;
+        self.target_radius = (self.target_radius - step as f64).clamp(
             PLANET_RADIUS + MIN_ALTITUDE,
             PLANET_RADIUS + MAX_ALTITUDE,
         );
@@ -314,6 +320,26 @@ mod tests {
         ctrl.update(10.0);
         assert!(ctrl.altitude() <= MAX_ALTITUDE + 1.0,
             "altitude {} above max {}", ctrl.altitude(), MAX_ALTITUDE);
+    }
+
+    #[test]
+    fn zoom_step_scales_with_altitude() {
+        // One scroll notch should move a far SMALLER absolute distance near the surface
+        // than from orbit (geometric zoom → slow, fine control up close).
+        let mut near = GlobeControls::new(1_000.0); // 1 km up
+        let near_before = near.altitude();
+        near.on_scroll(1.0);
+        near.update(10.0); // large dt converges the zoom blend
+        let near_step = (near_before - near.altitude()).abs();
+
+        let mut far = GlobeControls::new(MAX_ALTITUDE); // orbit
+        let far_before = far.altitude();
+        far.on_scroll(1.0);
+        far.update(10.0);
+        let far_step = (far_before - far.altitude()).abs();
+
+        assert!(far_step > near_step * 50.0,
+            "zoom step should scale with altitude: near={near_step}, far={far_step}");
     }
 
     #[test]

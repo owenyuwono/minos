@@ -53,10 +53,25 @@ Both feature configs (default = `nanite` on, and `--no-default-features`) must a
 
 `enki-render/taa.rs` (Halton jitter, `ResolveParams`, camera-relative reprojection — the engine renders camera-at-origin, so the resolve bakes the camera-translation delta into the previous view-proj) + `shaders/taa_resolve.wgsl` (depth→world reproject, 3×3 neighborhood clamp, history blend) + `enki-rhi/taa_pass.rs` (MSAA target → resolved current+depth, 2 ping-pong history, resolve pipeline). Toggle in the egui View section, **default OFF**; the frame bracket branches on `taa_active()` so OFF is byte-identical to the non-TAA path. History is 8-bit (swapchain format, for sRGB linear-space blend without duplicating pipelines).
 
+## Ocean (FFT waves + foam + refraction)
+
+Two layers in `enki-app/src/ocean/`:
+- **`Ocean`** — the smooth translucent sea-level **shell** (full sphere) for the orbit / far view. Alpha-blended in the MSAA opaque pass; sea level = `PLANET_RADIUS + sea_level_m`.
+- **`WaveSurface`** — a Tessendorf-style **spectral FFT ocean** (ported from `poseidon/`, a TS/WebGPU project; gasgiant/FFT-Ocean lineage) for near-surface detail. Drawn only below ~20 km altitude.
+
+**Sim (CPU, `ocean/{fft,spectrum,sim}.rs`):** JONSWAP×TMA×Donelan spectrum → `h0(k)` → time-evolve → inverse FFT → displacement (xyz, choppy) + slope normals + **Jacobian foam** (turbulence accumulation). Single cascade (N=128, 250 m tile) for now; runs each frame on the main thread and uploads one `OceanTexel` per grid point to a storage buffer. ponytail: CPU FFT first (unit-tested, no storage-image support needed in the RHI); **GPU compute is the upgrade path** (enki-rhi already has compute + storage buffers).
+
+**Surface (`shaders/ocean_surface.wgsl`):** a camera-anchored tangent-plane grid curved onto the sphere (sagitta), FFT-displaced; camera-relative + reversed-Z like the rest. Custom set 0 (frame UBO + field storage + ocean UBO + scene color sampler) bound via `cmd_bind_pipeline`/`cmd_bind_descriptor_set` (not the rhi set0 ring). Shading = Fresnel sky reflection + sun glint + SSS + foam.
+
+**Refraction (TAA path only):** `rhi.begin_water_pass()` splits the 3D pass — it closes the opaque MSAA instance (resolving to the TAA `current` image), blits that opaque color into a history scratch (the refraction source), and reopens a **1× instance on `current`** that the water draws into OPAQUE (blend off), sampling the scratch at a normal-distorted screen UV. So the water is single-sample and **requires TAA on**; with TAA off only the shell shows. The capture reuses TAA's `current`/history (no new image) — `taa_resolve` then runs unchanged.
+
+**Gotchas:** the grid mesh and `placeholder_sphere` must be wound so cull-BACK keeps the **camera-facing** face (both were initially backwards → invisible). Graphics pipelines with no push constants must pass `push_constant_size: 0` (the RHI now skips the 0-size range). GUI: Ocean section toggles + sea-level / choppiness / foam sliders.
+
 ## Testing
 
 - `cargo test -p enki-nanite` — bake invariants (crack-free, monotonic error), residency/page-pool logic, flatten, and **naga shader validation**. Headless.
-- `cargo test -p enki-rhi` / `-p enki-render` — RHI buffer/descriptor + TAA jitter/resolve.
+- `cargo test -p enki-rhi` / `-p enki-render` — RHI buffer/descriptor + TAA jitter/resolve + `ocean_surface.wgsl` naga validation.
+- `cargo test -p enki-app` — ocean FFT/spectrum/sim math (FFT vs DFT, spectrum energy, wave animation, unit normals).
 
 ## Known open items / WIP
 
