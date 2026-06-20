@@ -88,8 +88,13 @@ impl GlobeControls {
     /// The velocity is SET (not accumulated) so that on release the coast
     /// starts at the last frame's drag speed without compounding.
     pub fn on_drag(&mut self, dx: f32, dy: f32) {
-        let d_theta = -dx * DRAG_SENSITIVITY;
-        let d_phi   = -dy * DRAG_SENSITIVITY; // negated so dragging up tilts the view up (natural)
+        // Scale rotation by altitude/radius so panning slows near the surface (fine
+        // control up close) and stays fast from orbit — same intent as the altitude-scaled
+        // zoom. The factor is ~0 at the surface and saturates near ~0.89 at max orbit, so
+        // the sub-camera surface point tracks the cursor instead of whipping past.
+        let alt_factor = ((self.radius - PLANET_RADIUS) / self.radius) as f32;
+        let d_theta = -dx * DRAG_SENSITIVITY * alt_factor;
+        let d_phi   = -dy * DRAG_SENSITIVITY * alt_factor; // negated so dragging up tilts the view up (natural)
         // Apply delta directly — 1:1 tracking during drag.
         self.theta += d_theta;
         self.phi = (self.phi + d_phi).clamp(POLAR_CLAMP, std::f32::consts::PI - POLAR_CLAMP);
@@ -343,6 +348,24 @@ mod tests {
     }
 
     #[test]
+    fn pan_step_scales_with_altitude() {
+        // One drag should rotate FAR less near the surface than from orbit (slow, fine
+        // pan up close) — the surface point tracks the cursor instead of whipping past.
+        let mut near = GlobeControls::new(1_000.0);
+        let near_before = near.theta();
+        near.on_drag(50.0, 0.0);
+        let near_step = (near_before - near.theta()).abs();
+
+        let mut far = GlobeControls::new(MAX_ALTITUDE);
+        let far_before = far.theta();
+        far.on_drag(50.0, 0.0);
+        let far_step = (far_before - far.theta()).abs();
+
+        assert!(far_step > near_step * 20.0,
+            "pan step should scale with altitude: near={near_step}, far={far_step}");
+    }
+
+    #[test]
     fn initial_altitude_within_bounds() {
         let ctrl = GlobeControls::new(500.0);
         assert!(ctrl.altitude() >= MIN_ALTITUDE);
@@ -426,7 +449,8 @@ mod tests {
         let mut globe = GlobeControls::new(100_000.0);
         let dx = 5.0f32;
         let initial_theta = globe.theta();
-        let expected_step = dx * DRAG_SENSITIVITY; // radians per frame
+        let alt_factor = ((globe.radius() - PLANET_RADIUS) / globe.radius()) as f32;
+        let expected_step = dx * DRAG_SENSITIVITY * alt_factor; // radians per frame (altitude-scaled)
 
         // Phase 1: sustained drag for 10 frames — 1:1 tracking, monotonic, bounded.
         let mut prev_theta = initial_theta;
@@ -478,9 +502,10 @@ mod tests {
         let initial_theta = ctrl.theta();
 
         // Single drag event from rest — vel was 0, so only this frame's delta should apply.
+        let alt_factor = ((ctrl.radius() - PLANET_RADIUS) / ctrl.radius()) as f32;
         ctrl.on_drag(10.0, 0.0);
 
-        let expected_delta = -10.0 * DRAG_SENSITIVITY;
+        let expected_delta = -10.0 * DRAG_SENSITIVITY * alt_factor;
         let actual_delta = ctrl.theta() - initial_theta;
 
         assert!(
