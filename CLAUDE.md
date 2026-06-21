@@ -23,7 +23,7 @@ Both feature configs (default = `nanite` on, and `--no-default-features`) must a
 - **enki-render** — camera, `FrameUniforms`, lights, projection, TAA jitter + resolve (`taa.rs`).
 - **enki-planet** — heightfield (tectonic + simple), cube-sphere bases, quadtree LOD (`lod.rs`), mesher, climate/biome coloring.
 - **enki-jobs** — background worker pool for chunk meshing.
-- **enki-app** — winit 0.30 app shell, egui panel (`gui.rs`), HUD, `PlanetView` (quadtree grid terrain), async startup loader (`loading.rs`), and the Nanite integration.
+- **enki-app** — winit 0.30 app shell, egui panel (`gui.rs`), HUD, `PlanetView` (quadtree grid terrain), async startup loader (`loading.rs`), the Nanite integration, and the third-person controller + animated `Character` (see below).
 - **enki-nanite** — Nanite-style virtualized geometry. **Self-contained, feature-gated, deletable** (see below).
 
 ## Core conventions
@@ -41,7 +41,7 @@ Both feature configs (default = `nanite` on, and `--no-default-features`) must a
 2. **Residency (CPU, `residency.rs`):** `ClusterResidency::select` picks the clusters that should be GPU-resident for the camera — a *superset* of the GPU cut, widened by a margin, **nearest-first** sorted. `ClusterStreamer` wraps it with camera-delta throttling.
 3. **Page pool (`render.rs`):** the resident set streams into a **shared, fixed-stride, slot-indexed** GPU pool (`PagePool` from `stream.rs`, timeline-graveyard reuse). `update_residency` uploads only *added* clusters and frees *removed* ones (O(delta), no whole-set re-pack) — this is what makes zoom smooth. Each cluster owns a stable slot; geometry is only ever written to FREE slots (never mid-flight). A per-frame `active_slots` buffer lists the live slots.
 4. **GPU cull (`nanite_cull.wgsl`):** one thread per active slot; frustum-cull + the two-sided screen-error cut (`self_px ≤ tau && parent_px > tau`). Appends slots to a `visible` list + advances an indirect draw arg.
-5. **Draw (`nanite_draw.wgsl`):** one indirect, non-indexed, vertex-pulling draw; fixed-stride addressing (`slot*MAX_TRIS + tri`, tris store global vertex indices). Debug color modes: 0=lit (matches terrain lighting), 1=triangle, 2=cluster, 3=LOD — keyed on a **stable id** (`meta.range[3]`), not the buffer slot, so colors don't flicker on re-pack.
+5. **Draw (`nanite_draw.wgsl`):** one indirect, non-indexed, vertex-pulling draw; fixed-stride addressing (`slot*MAX_TRIS + tri`, tris store global vertex indices). Per-vertex stride is **16 floats** (pos3+normal3+color3+material1+wetness1+volcanism1+elevation1+plate3) — must match `render.rs` `SLOT_FLOATS`. Surface color comes from the unified `view_mode` (see **View modes**); id-based modes key on a **stable id** (`meta.range[3]`), not the buffer slot, so they don't flicker on re-pack.
 6. **Popping → dithered LOD cross-fade + TAA:** with TAA on, the cull widens to a transition band (`tau*FADE_HI`); the draw partitions pixels between overlapping LODs by an exact interval `[t_self, t_par)` (no holes/overlap) using a stable per-pixel dither, and TAA resolves the stipple into a smooth blend. Mirrors Unreal's dither+TAA. Gated on `taa_enabled` (off → strict hard cut).
 
 **Gotchas:**
@@ -51,7 +51,18 @@ Both feature configs (default = `nanite` on, and `--no-default-features`) must a
 
 ## TAA
 
-`enki-render/taa.rs` (Halton jitter, `ResolveParams`, camera-relative reprojection — the engine renders camera-at-origin, so the resolve bakes the camera-translation delta into the previous view-proj) + `shaders/taa_resolve.wgsl` (depth→world reproject, 3×3 neighborhood clamp, history blend) + `enki-rhi/taa_pass.rs` (MSAA target → resolved current+depth, 2 ping-pong history, resolve pipeline). Toggle in the egui View section, **default OFF**; the frame bracket branches on `taa_active()` so OFF is byte-identical to the non-TAA path. History is 8-bit (swapchain format, for sRGB linear-space blend without duplicating pipelines).
+`enki-render/taa.rs` (Halton jitter, `ResolveParams`, camera-relative reprojection — the engine renders camera-at-origin, so the resolve bakes the camera-translation delta into the previous view-proj) + `shaders/taa_resolve.wgsl` (depth→world reproject, 3×3 neighborhood clamp, history blend) + `enki-rhi/taa_pass.rs` (MSAA target → resolved current+depth, 2 ping-pong history, resolve pipeline). Toggle in the egui View section — **now default ON** alongside Nanite (see View modes); the frame bracket branches on `taa_active()` so OFF is byte-identical to the non-TAA path. History is 8-bit (swapchain format, for sRGB linear-space blend without duplicating pipelines).
+
+## View modes
+
+A single **`view_mode` (0–10)** drives surface shading in BOTH render paths (push value: `pc.material_mode` in `terrain.wgsl`, `pc.mode` in `nanite_draw.wgsl`), shown in the egui View section as two grouped selectors:
+- **View** (shading): 0 Lit · 1 Unlit · 2 Normal · 3 Triangle · 4 Cluster · 5 LOD (3–5 Nanite-only, greyed otherwise).
+- **Planet** (data): 6 Plate · 7 Height · 8 Material (rock hardness) · 9 Wetness · 10 Volcano (arc/hotspot cones).
+
+Data modes read **per-vertex channels** baked at tessellation (`material`/`wetness`/`volcanism`/`elevation`/`plate`), riding alongside `color` through the whole Nanite DAG (cluster→tessellate→dag→cluster_build→`render.rs` vbuf→WGSL pull). Adding a channel = bump the Nanite vertex stride (`render.rs SLOT_FLOATS` + the `base + k` indices in `nanite_draw.wgsl`) in lockstep.
+
+- **Nanite (default renderer) = full parity** (all 11 modes). **Nanite + TAA are default-ON** (`main.rs` AppState).
+- **Classic/quadtree = partial**: Lit/Unlit/Normal/Plate only; Height/Material/Wetness/Volcano fall back to Lit — **blocked** on the classic vertex layout being hardcoded `4×vec3` in `enki-rhi/src/pipeline.rs` (shared by 6 pipelines; a 5th data channel needs an optional `vec4` binding gated by a `GraphicsPipelineDesc` flag). Low priority since Nanite is the default.
 
 ## Ocean (FFT waves + foam + refraction)
 
@@ -67,11 +78,35 @@ Two layers in `enki-app/src/ocean/`:
 
 **Gotchas:** the grid mesh and `placeholder_sphere` must be wound so cull-BACK keeps the **camera-facing** face (both were initially backwards → invisible). Graphics pipelines with no push constants must pass `push_constant_size: 0` (the RHI now skips the 0-size range). GUI: Ocean section toggles + sea-level / choppiness / foam sliders.
 
+## Third-person controller + character
+
+A surface controller with an animated character. Lives in `enki-app` (`controls/third_person.rs` + `character.rs`); nothing below `enki-app` references it.
+
+**Nav modes (`controls/nav_mode.rs`):** `Globe → Placement → Surface → Globe`. `Surface` (renamed from the old `FirstPerson`) hosts the `ThirdPersonController`; it has a **1st/3rd-person view toggle** (V), so a single mode/controller serves both. The standalone `FirstPersonController` is **no longer wired** but kept for its tests + the shared grounding helpers — don't delete it without moving those. Spawn = the existing `Tab → Placement → click` ray-cast.
+
+**`ThirdPersonController`:** headless (no winit/GPU, fully unit-tested). Feet ride the terrain via `first_person::surface_radius` (the single source of the feet-on-ground invariant — both walkers call it so they can't drift from the bake). Movement is **camera-relative WASD**; the body yaws toward its travel direction. Mouse orbits the chase cam (`cam_dir`/`cam_pitch`), scroll sets the boom (`cam_dist`), and an **8-step occlusion march** pulls the boom in so the camera never clips terrain. `camera()` branches on the view: third = boom behind a shoulder anchor; first = at the eye (caller hides the mesh).
+
+**`Character` (CPU skinning):** an ~11-bone box humanoid built procedurally (`build_rig`); a hierarchical gait solver (`solve_pose`, mirrors the flora wind-solver shape) swings legs/arms in anti-phase scaled by speed, with idle breathing. **Skinned on the CPU** (one bone/vertex) into a **per-frame-in-flight pos/nrm vertex-buffer ring** (`write_storage_bytes` each frame; mirrors flora's `bone_ubos` ring so writing this frame never races the GPU reading last frame's), then drawn with the **existing terrain pipeline** (`material_mode 0`) via `ChunkPush::camera_relative`. Rest pose at `speed==0 && phase==0` is an exact standing figure.
+- ponytail: **CPU skin + terrain pipeline** — no skinning shader, no custom descriptor set, no extra vertex channel. One low-poly character is trivial to re-skin per frame; move to the GPU/flora skinning path only when there's a crowd. glTF import + 4-weight skinning is the other upgrade path (the rig generalizes to it).
+
+**Gotchas:**
+- Character verts are in **local character space** (feet at origin, +Y up, +Z facing); planet placement is the draw's model matrix `from_cols(right, up, forward, _)` with `right = up × forward` (det +1 → CCW winding preserved for cull-BACK). Boxes are wound CCW outward in `push_box`.
+- Drawn **after terrain/Nanite, before the ocean**, inside the opaque MSAA instance; only when `nav == Surface` and the view is third-person. `Character::update` (skin + upload) runs *before* `begin_rendering` (it's a host-visible memcpy, fine either side); `draw` runs inside.
+- `Character::new` (built at startup in Planet mode) clones the terrain pipeline desc byte-for-byte, so it inherits reversed-Z / MSAA / swapchain format with no special-casing.
+- Controls: Tab → click to drop · WASD (camera-relative) · Shift sprint · mouse orbit · scroll zoom · **V** 1st/3rd · Esc → orbit.
+
+## Terrain ↔ ki parity (determinism gate)
+
+The landmass (tectonics + heightFn + rockHardness + cube-sphere) is a faithful port of **ki** ("Demiurge", a TS/WebGPU sibling at `../ki`). `enki-planet/tests/determinism.rs` gates it against `tests/goldens/golden.json`.
+- **`golden.json` is dumped from ki itself** — `cd ../ki && npx -y tsx tools/dump-golden.mjs` (imports ki's modules at their native config; writes to enki's golden path). `noise`/`fbm`/`ridged`/`tectonics` are ki-sourced byte gates (1e-9); `height` is an enki self-snapshot (enki ships a B-path erosion the dump tool doesn't run) — regen after a *reviewed* height change via `cargo test -p enki-planet --test determinism -- --ignored regen_golden_height_samples`.
+- **Tectonics bakes at `RES=512`** (`tectonics.rs`) to match ki seed-for-seed — the crack/arc bands are absolute radians, so a smaller RES bakes a *different* set of continents. Was 256; **do not revert.** enki matches ki on **28/30 tectonic samples byte-exact**; the gate carves out conv/shear at the exact poles (`degenerate_pole`) — gradient-derived (`t_hat = −∇dist/|∇dist|`) and irreducibly amplified across JS↔Rust float at the near-zero-gradient singularity, NOT an algorithm divergence.
+- **Cost:** RES=512 makes the tectonics bake ~4× heavier (~18s debug / ~1–3s release, async on the loader thread) — a slow first-load is expected.
+
 ## Testing
 
 - `cargo test -p enki-nanite` — bake invariants (crack-free, monotonic error), residency/page-pool logic, flatten, and **naga shader validation**. Headless.
 - `cargo test -p enki-rhi` / `-p enki-render` — RHI buffer/descriptor + TAA jitter/resolve + `ocean_surface.wgsl` naga validation.
-- `cargo test -p enki-app` — ocean FFT/spectrum/sim math (FFT vs DFT, spectrum energy, wave animation, unit normals).
+- `cargo test -p enki-app` — ocean FFT/spectrum/sim math (FFT vs DFT, spectrum energy, wave animation, unit normals); nav-mode transitions; `ThirdPersonController` (grounding, camera finiteness, turn-toward-velocity, occlusion stays above terrain, zoom clamp); `Character` rig/gait (rest pose grounded, limbs animate, anti-phase legs).
 
 ## Known open items / WIP
 
@@ -79,4 +114,6 @@ Two layers in `enki-app/src/ocean/`:
 - Backface cluster culling (normal cones are baked into `ClusterAsset` but not yet plumbed to `GpuClusterMeta`/cull) + the ~30% degenerate-vertex draw waste.
 - On-demand procedural baking for sub-meter close-up detail (current detail is capped by the startup bake resolution).
 - Cube-edge seams are an inherent inflated-cube artifact (deprioritized).
+- Character is procedural + CPU-skinned: no glTF import, no foot-IK/slope-align (feet ride terrain *height*, not tilt), no GPU skinning. Upgrade paths in order of likely need: glTF rigged import → GPU skinning (flora path) for crowds → foot IK.
+- **ki feature-parity roadmap** (the planet still lacks ki's "living world" layers) — top wins in order: (1) **paint rivers + lakes into the lit terrain color** (geometry already carves valleys + flattens lakes and `hf.wetness()` is sampled at `tessellate.rs:163` — it's just not shown; ~S), (2) **atmosphere scattering shell** (port ki `Atmosphere.ts`; kills the flat near-black void + hard silhouette; ~M), (3) **volumetric clouds** over it (ki `VolumetricClouds.ts`; baked `wind_at` + moisture cubemap already exist; ~L), then wind-flow streaklines + climate/wind/tectonics **data debug views** (data exists, slots into the per-vertex-channel pattern). **Skip:** ki's fan/floodplain/delta deposit classifier (dead on ki's own B-path), caves/interior (XL, incompatible with the heightfield path), subsurface.
 </content>

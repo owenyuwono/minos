@@ -30,6 +30,11 @@ const ZOOM_SPEED: f32 = 6.0;
 const SCROLL_SENSITIVITY: f32 = 0.15;
 /// Radians per pixel of drag.
 const DRAG_SENSITIVITY: f32 = 0.005;
+/// Floor on the altitude/radius pan-speed factor. Near the surface altitude/radius → 0
+/// (radius is dominated by the 50 km planet radius), which makes panning crawl; clamp it
+/// so close-up pan stays usable for traversal. Raise toward 1.0 for faster close-up pan,
+/// lower for slower. Orbit saturates the factor near ~0.89 regardless.
+const PAN_MIN_ALT_FACTOR: f32 = 0.4;
 /// Polar clamp — stay this many radians away from north/south poles.
 const POLAR_CLAMP: f32 = 0.01_f32;
 
@@ -88,11 +93,11 @@ impl GlobeControls {
     /// The velocity is SET (not accumulated) so that on release the coast
     /// starts at the last frame's drag speed without compounding.
     pub fn on_drag(&mut self, dx: f32, dy: f32) {
-        // Scale rotation by altitude/radius so panning slows near the surface (fine
-        // control up close) and stays fast from orbit — same intent as the altitude-scaled
-        // zoom. The factor is ~0 at the surface and saturates near ~0.89 at max orbit, so
-        // the sub-camera surface point tracks the cursor instead of whipping past.
-        let alt_factor = ((self.radius - PLANET_RADIUS) / self.radius) as f32;
+        // Scale rotation by altitude/radius so panning is slower near the surface (finer
+        // control up close) and faster from orbit — same intent as the altitude-scaled
+        // zoom. Floored at PAN_MIN_ALT_FACTOR so close-up pan stays usable (pure
+        // altitude/radius → ~0 near the surface, which crawls).
+        let alt_factor = (((self.radius - PLANET_RADIUS) / self.radius) as f32).max(PAN_MIN_ALT_FACTOR);
         let d_theta = -dx * DRAG_SENSITIVITY * alt_factor;
         let d_phi   = -dy * DRAG_SENSITIVITY * alt_factor; // negated so dragging up tilts the view up (natural)
         // Apply delta directly — 1:1 tracking during drag.
@@ -361,7 +366,7 @@ mod tests {
         far.on_drag(50.0, 0.0);
         let far_step = (far_before - far.theta()).abs();
 
-        assert!(far_step > near_step * 20.0,
+        assert!(far_step > near_step * 1.5,
             "pan step should scale with altitude: near={near_step}, far={far_step}");
     }
 
@@ -449,7 +454,7 @@ mod tests {
         let mut globe = GlobeControls::new(100_000.0);
         let dx = 5.0f32;
         let initial_theta = globe.theta();
-        let alt_factor = ((globe.radius() - PLANET_RADIUS) / globe.radius()) as f32;
+        let alt_factor = (((globe.radius() - PLANET_RADIUS) / globe.radius()) as f32).max(PAN_MIN_ALT_FACTOR);
         let expected_step = dx * DRAG_SENSITIVITY * alt_factor; // radians per frame (altitude-scaled)
 
         // Phase 1: sustained drag for 10 frames — 1:1 tracking, monotonic, bounded.
@@ -502,7 +507,7 @@ mod tests {
         let initial_theta = ctrl.theta();
 
         // Single drag event from rest — vel was 0, so only this frame's delta should apply.
-        let alt_factor = ((ctrl.radius() - PLANET_RADIUS) / ctrl.radius()) as f32;
+        let alt_factor = (((ctrl.radius() - PLANET_RADIUS) / ctrl.radius()) as f32).max(PAN_MIN_ALT_FACTOR);
         ctrl.on_drag(10.0, 0.0);
 
         let expected_delta = -10.0 * DRAG_SENSITIVITY * alt_factor;
