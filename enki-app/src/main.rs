@@ -75,7 +75,7 @@ use controls::{
 };
 use gui::EguiState;
 use fps::FpsMeter;
-use ocean::{Ocean, OceanMesh, WaveSurface};
+use ocean::{Ocean, WaveSurface};
 use planet_view::{PlanetConfig, PlanetView, PlanetViewStats, RhiUploaderDummy, planet_view_from_hf};
 use scene::Scene;
 use stress::StressHarness;
@@ -188,8 +188,6 @@ struct App {
     wave_choppiness:   f32,
     /// Foam threshold (Jacobian below which whitecaps form) — GUI-tunable.
     wave_foam:         f32,
-    /// Which wave mesh to use (Warped / Projected / Clipmap) — GUI-tunable.
-    ocean_mesh:        OceanMesh,
     /// Sea level as a metre offset from the terrain's `e = 0` datum (= PLANET_RADIUS).
     sea_level_m:       f64,
 
@@ -273,7 +271,6 @@ impl App {
             wave_enabled:      true,
             wave_choppiness:   1.3,
             wave_foam:         0.4,
-            ocean_mesh:        OceanMesh::default(),
             sea_level_m:       0.0,
             mouse_delta:   (0.0, 0.0),
             lmb_held:      false,
@@ -1134,7 +1131,6 @@ impl App {
             let wave_enabled      = self.wave_enabled;
             let wave_choppiness   = self.wave_choppiness;
             let wave_foam         = self.wave_foam;
-            let ocean_mesh        = self.ocean_mesh;
             // LoadTimings is Copy — snapshot it out so the popup can borrow it while
             // egui mutably borrows self. Only passed while the popup is showing.
             let load_stats        = if self.show_load_stats { self.load_timings } else { None };
@@ -1146,7 +1142,7 @@ impl App {
             Some(egui.build_frame(
                 window, rhi, nav_mode, altitude, frame_time, view_mode, wireframe, taa_on,
                 nanite_enabled, nanite_tau, cfg!(feature = "nanite"),
-                ocean_enabled, sea_level_m, wave_enabled, wave_choppiness, wave_foam, ocean_mesh,
+                ocean_enabled, sea_level_m, wave_enabled, wave_choppiness, wave_foam,
                 None, planet_stats.as_ref(), load_stats.as_ref(),
             ))
         } else {
@@ -1175,7 +1171,6 @@ impl App {
             self.wave_enabled      = out.wave_enabled;
             self.wave_choppiness   = out.wave_choppiness;
             self.wave_foam         = out.wave_foam;
-            self.ocean_mesh        = out.ocean_mesh;
             if out.cycle_nav {
                 self.cycle_nav_mode();
             }
@@ -1395,7 +1390,6 @@ impl App {
                         if let Err(e) = w.record(
                             rhi, fi, &fu, &camera, sea,
                             scene_view, scene_depth, (ext.width, ext.height), draw_waves,
-                            self.ocean_mesh,
                         ) {
                             log::error!("WaveSurface::record error: {e}");
                         }

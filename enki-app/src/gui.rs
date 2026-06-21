@@ -33,7 +33,6 @@ use enki_rhi::Rhi;
 
 use crate::controls::nav_mode::NavMode;
 use crate::loading::LoadTimings;
-use crate::ocean::OceanMesh;
 use crate::planet_view::PlanetViewStats;
 
 // ── UiOutput ────────────────────────────────────────────────────────────────
@@ -64,8 +63,6 @@ pub struct UiOutput {
     pub wave_choppiness: f32,
     /// Jacobian value below which whitecap foam forms.
     pub wave_foam: f32,
-    /// Which mesh the wave surface uses (Warped / Projected / Clipmap).
-    pub ocean_mesh: OceanMesh,
     /// Cycle nav mode (same as Tab).
     pub cycle_nav: bool,
     /// Exit the surface walker back to orbit (same as Esc).
@@ -179,7 +176,6 @@ impl EguiState {
         wave_enabled:      bool,
         wave_choppiness:   f32,
         wave_foam:         f32,
-        ocean_mesh:        OceanMesh,
         stress_stats:      Option<&str>,
         planet_stats:      Option<&PlanetViewStats>,
         load_stats:        Option<&LoadTimings>,
@@ -197,7 +193,6 @@ impl EguiState {
             wave_enabled,
             wave_choppiness,
             wave_foam,
-            ocean_mesh,
             cycle_nav: false,
             exit_surface: false,
             dismiss_load_stats: false,
@@ -284,12 +279,6 @@ impl EguiState {
                             out.wave_enabled,
                             egui::Slider::new(&mut out.wave_foam, 0.0..=1.0).text("Foam amount"),
                         );
-                        ui.horizontal(|ui| {
-                            ui.label("Mesh:");
-                            ui.selectable_value(&mut out.ocean_mesh, OceanMesh::Warped, "Warped");
-                            ui.selectable_value(&mut out.ocean_mesh, OceanMesh::Projected, "Projected");
-                            ui.selectable_value(&mut out.ocean_mesh, OceanMesh::Clipmap, "Clipmap");
-                        });
                     });
 
                     // ── Nanite ───────────────────────────────────────────────

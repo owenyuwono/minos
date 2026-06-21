@@ -32,19 +32,6 @@ use enki_rhi::{
 };
 use glam::{DVec3, Mat4, Vec3};
 
-/// Which mesh the wave surface uses (selectable in the GUI).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum OceanMesh {
-    /// A: one camera-anchored tangent patch, radially warped (dense center).
-    #[default]
-    Warped,
-    /// C: a screen-space grid ray-cast onto the sea sphere — waves fill the whole
-    /// view, no patch (the projected grid is the entire ocean; no shell).
-    Projected,
-    /// D: concentric power-of-two clipmap rings (log-distance density).
-    Clipmap,
-}
-
 use sim::{OceanSim, OceanTexel, WaveParams};
 use spectrum::{CascadeParams, Spectrum};
 
@@ -133,12 +120,8 @@ fn shell_scale(base_radius: f64, sea_level_m: f64) -> f32 {
     ((base_radius + sea_level_m) / base_radius) as f32
 }
 
-// ── FFT wave surface (near / detailed view) ────────────────────────────────────
+// ── FFT wave surface (projected-grid; near + horizon in one screen-space mesh) ──
 
-/// Grid tessellation (cells per side) of the camera-anchored wave patch.
-const GRID_RES: u32 = 400;
-/// Half-extent of the wave patch in metres (covers the near field + horizon at low altitude).
-const PATCH_HALF: f32 = 4000.0;
 /// FFT resolution per cascade (power of two) — matches poseidon's N=256.
 /// Affordable at 3 cascades thanks to the rustfft backend.
 const FFT_N: usize = 256;
@@ -147,13 +130,7 @@ const N_CASCADES: usize = 3;
 /// Per-cascade world tile sizes (m) — poseidon's [250,17,5] for cm-scale ripple
 /// detail; tiling is broken by the domain warp + world-anchored amplitude field.
 const LENGTH_SCALES: [f32; 3] = [250.0, 17.0, 5.0];
-
-/// Clipmap (mode D): center block half-width (cells), finest cell (m), ring count.
-/// Extent = `CLIP_BLOCK · CLIP_C0 · 2^CLIP_LEVELS` ≈ the warped patch's half-size.
-const CLIP_BLOCK: i32 = 16;
-const CLIP_C0: f32 = 4.0;
-const CLIP_LEVELS: u32 = 6;
-/// Projected grid (mode C): screen-space lattice resolution (cells per side).
+/// Projected grid: screen-space lattice resolution (cells per side).
 const PROJ_RES: u32 = 224;
 
 /// GPU mirror of `ocean_surface.wgsl`'s `Ocean` uniform (std140, all vec4).
@@ -176,8 +153,7 @@ struct OceanParamsGpu {
     sun_color:     [f32; 4],
     shading:       [f32; 4], // sss, foam_threshold, foam_scale, alpha
     screen:        [f32; 4], // width, height, refract_strength, deep_tint
-    center_rel:    [f32; 4], // xyz = planet centre − camera; w = cell factor (C)
-    shell_model:   [[f32; 4]; 4], // vs_shell camera-relative + sea scale
+    center_rel:    [f32; 4], // xyz = planet centre − camera; w = cell factor
 }
 
 /// Per-frame-in-flight GPU resources for the wave surface.
@@ -188,34 +164,20 @@ struct WaveFrame {
     set:       vk::DescriptorSet,
 }
 
-/// Unified refractive ocean: a smooth sea-level shell sphere (far/orbit) + the
-/// camera-anchored FFT wave patch (near), both sharing refraction + depth color.
+/// Refractive FFT ocean: a screen-space lattice ray-cast onto the sea sphere each
+/// frame (projected grid) — fills the whole view, no patch, no shell.
 pub struct WaveSurface {
-    pipeline:  PipelineHandle,        // warped patch / clipmap (vs_main)
-    shell_pipeline: PipelineHandle,   // shell sphere (vs_shell)
     proj_pipeline:  PipelineHandle,   // projected grid (vs_projected)
     layout:    vk::PipelineLayout,
     /// Scene-texture sampler (caller-owned; freed in [`Self::destroy`]).
     sampler:   vk::Sampler,
-    // A — warped patch.
-    grid_pos:  BufferHandle,
-    grid_idx:  BufferHandle,
-    idx_count: u32,
-    // D — clipmap rings (reuses the vs_main path).
-    clip_pos:  BufferHandle,
-    clip_idx:  BufferHandle,
-    clip_count: u32,
-    // C — projected grid: static NDC lattice (CPU) + index buffer + a per-frame
-    // dynamic vertex buffer of sphere-projected positions (rebuilt each frame).
+    // Projected grid: static NDC lattice (CPU) + index buffer + a per-frame dynamic
+    // vertex buffer of sphere-projected positions (rebuilt each frame).
     proj_ndc:  Vec<[f32; 2]>,
     proj_idx:  BufferHandle,
     proj_count: u32,
     proj_dyn:  Vec<BufferHandle>,
     proj_scratch: Vec<[f32; 3]>,
-    shell_pos: BufferHandle,
-    shell_nrm: BufferHandle,
-    shell_idx: BufferHandle,
-    shell_count: u32,
     // ── Background FFT worker (keeps the heavy N=256×3 sim off the render thread) ──
     /// Latest completed field, written by the worker, copied to the GPU each frame.
     latest:        Arc<Mutex<Vec<OceanTexel>>>,
@@ -243,20 +205,8 @@ impl WaveSurface {
         _samples:     vk::SampleCountFlags,
         base_radius:  f64,
     ) -> Result<Self, RhiError> {
-        // ── Mode A: warped grid (positions in tangent metres; .xz pos, .y cell) ──
-        let (positions, indices) = mesh::grid_mesh(GRID_RES, PATCH_HALF);
-        let grid_pos = rhi.create_vertex_buffer(cast_slice(&positions))?;
-        let grid_idx = rhi.create_index_buffer(&indices)?;
-        let idx_count = indices.len() as u32;
-
-        // ── Mode D: clipmap rings (same tangent layout → shares vs_main) ──────────
-        let (clip_p, clip_i) = mesh::clipmap_mesh(CLIP_BLOCK, CLIP_C0, CLIP_LEVELS);
-        let clip_pos = rhi.create_vertex_buffer(cast_slice(&clip_p))?;
-        let clip_idx = rhi.create_index_buffer(&clip_i)?;
-        let clip_count = clip_i.len() as u32;
-
-        // ── Mode C: projected grid — static NDC lattice + index buffer; the
-        // per-frame sphere-projected positions live in a dynamic per-FiF buffer. ──
+        // ── Projected grid: static NDC lattice + index buffer; the per-frame
+        // sphere-projected positions live in a dynamic per-FiF vertex buffer. ──
         let (proj_ndc, proj_i) = mesh::ndc_grid(PROJ_RES);
         let proj_idx = rhi.create_index_buffer(&proj_i)?;
         let proj_count = proj_i.len() as u32;
@@ -277,11 +227,10 @@ impl WaveSurface {
 
         let shader = rhi.create_shader_module(OCEAN_SURFACE_WGSL)?;
         // Draws into the TAA 1× `current` target (the refraction split): single-sample,
-        // blend ON so depth-write is OFF (the shell must not occlude wave troughs; the
-        // shader outputs alpha 1 → opaque). Wave (vs_main) over shell (vs_shell).
-        let desc = |vs: &'static str| GraphicsPipelineDesc {
+        // blend ON so depth-write is OFF; the shader outputs alpha 1 → opaque.
+        let proj_pipeline = rhi.create_graphics_pipeline(&GraphicsPipelineDesc {
             shader,
-            vs_entry:           vs,
+            vs_entry:           "vs_projected",
             fs_entry:           "fs_main",
             push_constant_size: 0,
             set0_layout:        layout_handle,
@@ -290,21 +239,9 @@ impl WaveSurface {
             samples:            vk::SampleCountFlags::TYPE_1,
             blend:              true,
             fill:               true,
-        };
-        let pipeline = rhi.create_graphics_pipeline(&desc("vs_main"))?;
-        let shell_pipeline = rhi.create_graphics_pipeline(&desc("vs_shell"))?;
-        let proj_pipeline = rhi.create_graphics_pipeline(&desc("vs_projected"))?;
+        })?;
         rhi.destroy_shader_module(shader);
-        let layout = rhi.pipeline_layout(pipeline)?;
-
-        // ── Shell sphere (smooth sea-level surface) ──────────────────────────────
-        let shell_mesh = placeholder_sphere(base_radius as f32, 96);
-        let mut shell_indices = shell_mesh.indices.clone();
-        for tri in shell_indices.chunks_exact_mut(3) { tri.swap(0, 2); } // near hemisphere faces camera
-        let shell_pos = rhi.create_vertex_buffer(cast_slice(&shell_mesh.positions))?;
-        let shell_nrm = rhi.create_vertex_buffer(cast_slice(&shell_mesh.normals))?;
-        let shell_idx = rhi.create_index_buffer(&shell_indices)?;
-        let shell_count = shell_indices.len() as u32;
+        let layout = rhi.pipeline_layout(proj_pipeline)?;
 
         // ── Spectral sim: 3 cascades over disjoint wavenumber bands ──────────────
         // Each cascade carries one band (boundary = 2π/L · factor); overlaid at
@@ -399,21 +336,18 @@ impl WaveSurface {
         }
 
         Ok(Self {
-            pipeline, shell_pipeline, proj_pipeline, layout, sampler,
-            grid_pos, grid_idx, idx_count,
-            clip_pos, clip_idx, clip_count,
+            proj_pipeline, layout, sampler,
             proj_ndc, proj_idx, proj_count, proj_dyn, proj_scratch,
-            shell_pos, shell_nrm, shell_idx, shell_count,
             latest, shared_params, active, running, worker: Some(worker),
             length_scales, cascade_count,
             params: WaveParams::default(), debug_intensity: false, frames, base_radius,
         })
     }
 
-    /// Draw the refractive ocean in the selected `mode`. Call after
-    /// `begin_water_pass`, inside the reopened 1× instance, sampling the resolved
-    /// opaque `scene_view` + `scene_depth`. `draw_waves` gates the FFT worker + the
-    /// near-field patch (Warped/Clipmap); the Projected grid always draws.
+    /// Draw the refractive projected-grid ocean. Call after `begin_water_pass`,
+    /// inside the reopened 1× instance, sampling the resolved opaque `scene_view` +
+    /// `scene_depth`. `draw_waves` gates the FFT worker (waves only matter near the
+    /// surface); the projected grid itself draws at every altitude.
     #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
@@ -426,7 +360,6 @@ impl WaveSurface {
         scene_depth:  vk::ImageView,
         extent:       (u32, u32),
         draw_waves:   bool,
-        mode:         OceanMesh,
     ) -> Result<(), RhiError> {
         let camera_pos = camera.position;
 
@@ -448,7 +381,9 @@ impl WaveSurface {
         }
         rhi.write_storage_bytes(f.frame_ubo, bytemuck::bytes_of(fu))?;
 
-        // Tangent frame at the sub-camera point + the shell's camera-relative model.
+        // Tangent frame at the sub-camera point (FFT sampling) + projection extras:
+        // planet centre relative to camera + a cell-size factor (cell ≈
+        // distance·factor, since the projected grid is ~screen-uniform).
         let sea_radius = self.base_radius + sea_level_m;
         let up = camera_pos.normalize();
         let sub_rel = (up * sea_radius - camera_pos).as_vec3();
@@ -456,11 +391,6 @@ impl WaveSurface {
         let east = ref_axis.cross(up).normalize().as_vec3();
         let north = up.cross(east.as_dvec3()).normalize().as_vec3();
         let up = up.as_vec3();
-        let shell_scale = (sea_radius / self.base_radius) as f32;
-        let shell_model =
-            ChunkPush::camera_relative(DVec3::ZERO, camera_pos, Mat4::from_scale(Vec3::splat(shell_scale)), 0).model;
-        // Projected grid (C) extras: planet centre relative to camera + a cell-size
-        // factor (cell ≈ distance·factor, since the grid is ~screen-uniform).
         let center_rel = (-camera_pos).as_vec3();
         let tan_half = (camera.fov_y_radians * 0.5).tan();
         let cell_factor = 2.0 * tan_half / PROJ_RES as f32;
@@ -471,7 +401,7 @@ impl WaveSurface {
             north:         [north.x, north.y, north.z, 0.0],
             up:            [up.x, up.y, up.z, 0.0],
             sub_point_rel: [sub_rel.x, sub_rel.y, sub_rel.z, sea_radius as f32],
-            cfg:           [PATCH_HALF, FFT_N as f32, 0.75, self.cascade_count as f32],
+            cfg:           [0.0, FFT_N as f32, 0.0, self.cascade_count as f32],
             scales:        [s[0], s.get(1).copied().unwrap_or(0.0), s.get(2).copied().unwrap_or(0.0), 0.0],
             amp:           [9.0, 0.25, 1.6, if self.debug_intensity { 1.0 } else { 0.0 }],
             // near, far (globe camera), extinction (1/m), clarity (seabed visibility).
@@ -485,60 +415,34 @@ impl WaveSurface {
             shading:       [1.0, self.params.foam_threshold, 2.5, 0.92],
             screen:        [extent.0 as f32, extent.1 as f32, 0.05, 0.55],
             center_rel:    [center_rel.x, center_rel.y, center_rel.z, cell_factor],
-            shell_model,
         };
         rhi.write_storage_bytes(f.ocean_ubo, bytemuck::bytes_of(&params))?;
 
-        rhi.cmd_bind_descriptor_set(fi, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, f.set);
-
-        match mode {
-            // C: project the NDC lattice onto the sea sphere (CPU f64), upload, draw.
-            // Covers the whole view → it IS the ocean, so no separate shell.
-            OceanMesh::Projected => {
-                let fwd = (camera.orientation * Vec3::NEG_Z).as_dvec3();
-                let rgt = (camera.orientation * Vec3::X).as_dvec3();
-                let upc = (camera.orientation * Vec3::Y).as_dvec3();
-                let tan_half = tan_half as f64;
-                let aspect = extent.0 as f64 / extent.1.max(1) as f64;
-                let center = -camera_pos;
-                {
-                    let ndc = &self.proj_ndc;
-                    let scratch = &mut self.proj_scratch;
-                    for (i, p) in ndc.iter().enumerate() {
-                        let dir = fwd
-                            + rgt * (p[0] as f64 * tan_half * aspect)
-                            + upc * (p[1] as f64 * tan_half);
-                        let h = mesh::project_to_sphere(dir, center, sea_radius, 0.5).as_vec3();
-                        scratch[i] = [h.x, h.y, h.z];
-                    }
-                }
-                rhi.write_storage_bytes(self.proj_dyn[fi as usize], cast_slice(&self.proj_scratch))?;
-                let pd = self.proj_dyn[fi as usize];
-                rhi.cmd_bind_pipeline(fi, vk::PipelineBindPoint::GRAPHICS, self.proj_pipeline)?;
-                rhi.bind_vertex_buffers(fi, &[pd, pd, pd, pd])?;
-                rhi.bind_index_buffer(fi, self.proj_idx)?;
-                rhi.draw_indexed(fi, self.proj_count);
-            }
-            // A / D: shell first (fills the disk), then the near-field patch.
-            _ => {
-                rhi.cmd_bind_pipeline(fi, vk::PipelineBindPoint::GRAPHICS, self.shell_pipeline)?;
-                rhi.bind_vertex_buffers(fi, &[self.shell_pos, self.shell_nrm, self.shell_nrm, self.shell_nrm])?;
-                rhi.bind_index_buffer(fi, self.shell_idx)?;
-                rhi.draw_indexed(fi, self.shell_count);
-
-                if draw_waves {
-                    let (pos, idx, count) = if mode == OceanMesh::Clipmap {
-                        (self.clip_pos, self.clip_idx, self.clip_count)
-                    } else {
-                        (self.grid_pos, self.grid_idx, self.idx_count)
-                    };
-                    rhi.cmd_bind_pipeline(fi, vk::PipelineBindPoint::GRAPHICS, self.pipeline)?;
-                    rhi.bind_vertex_buffers(fi, &[pos, pos, pos, pos])?;
-                    rhi.bind_index_buffer(fi, idx)?;
-                    rhi.draw_indexed(fi, count);
-                }
+        // Project the NDC lattice onto the sea sphere (CPU f64), upload, draw.
+        let fwd = (camera.orientation * Vec3::NEG_Z).as_dvec3();
+        let rgt = (camera.orientation * Vec3::X).as_dvec3();
+        let upc = (camera.orientation * Vec3::Y).as_dvec3();
+        let tan_half = tan_half as f64;
+        let aspect = extent.0 as f64 / extent.1.max(1) as f64;
+        let center = -camera_pos;
+        {
+            let ndc = &self.proj_ndc;
+            let scratch = &mut self.proj_scratch;
+            for (i, p) in ndc.iter().enumerate() {
+                let dir = fwd
+                    + rgt * (p[0] as f64 * tan_half * aspect)
+                    + upc * (p[1] as f64 * tan_half);
+                let h = mesh::project_to_sphere(dir, center, sea_radius, 0.5).as_vec3();
+                scratch[i] = [h.x, h.y, h.z];
             }
         }
+        rhi.write_storage_bytes(self.proj_dyn[fi as usize], cast_slice(&self.proj_scratch))?;
+        let pd = self.proj_dyn[fi as usize];
+        rhi.cmd_bind_descriptor_set(fi, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, f.set);
+        rhi.cmd_bind_pipeline(fi, vk::PipelineBindPoint::GRAPHICS, self.proj_pipeline)?;
+        rhi.bind_vertex_buffers(fi, &[pd, pd, pd, pd])?;
+        rhi.bind_index_buffer(fi, self.proj_idx)?;
+        rhi.draw_indexed(fi, self.proj_count);
         Ok(())
     }
 
@@ -580,7 +484,7 @@ mod tests {
 
     #[test]
     fn ocean_params_is_std140_sized() {
-        // 17 × vec4 + mat4 (4 vec4) = 336 bytes (std140-friendly).
-        assert_eq!(std::mem::size_of::<OceanParamsGpu>(), 336);
+        // 17 × vec4 = 272 bytes (std140-friendly).
+        assert_eq!(std::mem::size_of::<OceanParamsGpu>(), 272);
     }
 }

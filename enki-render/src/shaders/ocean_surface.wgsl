@@ -46,8 +46,7 @@ struct Ocean {
     sun_color     : vec4<f32>,
     shading       : vec4<f32>,   // sss, foam_threshold, foam_scale, alpha
     screen        : vec4<f32>,   // width, height, refract_strength, deep_tint
-    center_rel    : vec4<f32>,   // xyz = planet centre − camera; w = cell factor (C)
-    shell_model   : mat4x4<f32>, // vs_shell: camera-relative + sea-level scale
+    center_rel    : vec4<f32>,   // xyz = planet centre − camera; w = cell factor
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;
@@ -110,11 +109,6 @@ fn fbm3(p: vec3<f32>) -> f32 {
     return clamp(v / 0.875, 0.0, 1.0);
 }
 
-fn surface_dir(grid: vec2<f32>) -> vec3<f32> {
-    return normalize(ocean.up.xyz
-        + (ocean.east.xyz * grid.x + ocean.north.xyz * grid.y) / ocean.sub_point_rel.w);
-}
-
 fn wave_intensity(dir: vec3<f32>) -> f32 { return fbm3(dir * ocean.amp.x); }
 fn amp_from_dir(dir: vec3<f32>) -> f32 { return mix(ocean.amp.y, ocean.amp.z, wave_intensity(dir)); }
 
@@ -133,53 +127,9 @@ struct VsOut {
     @location(1)       grid      : vec2<f32>,
     @location(2)       fade      : f32,
     @location(3)       wdir      : vec3<f32>,
-    @location(4)       mode      : f32,   // 0 = wave, 1 = shell
 }
 
-fn edge_fade(grid: vec2<f32>) -> f32 {
-    let r = max(abs(grid.x), abs(grid.y));
-    return 1.0 - smoothstep(ocean.cfg.z * ocean.cfg.x, ocean.cfg.x, r);
-}
-
-@vertex
-fn vs_main(v: VsIn) -> VsOut {
-    var out: VsOut;
-    let grid = v.position.xz;
-    let cell = v.position.y;        // local world cell size (radial warp packs it here)
-    let fade = edge_fade(grid);
-    let wdir = surface_dir(grid);
-    let warp = warp_world(wdir);
-    let cc = i32(ocean.cfg.w);
-
-    // Sum cascade displacement, fading a cascade out where the cell is too coarse
-    // to carry its waves (Nyquist) — without this, the warp's large rim cells
-    // alias the fine cascades into geometry crawl. (Their detail still rides the
-    // per-pixel normals in fs_main, which the mesh density doesn't bound.)
-    var disp = vec3<f32>(0.0);
-    for (var c = 0; c < 3; c = c + 1) {
-        if (c >= cc) { break; }
-        let tile = cascade_scale(c);
-        let w = 1.0 - smoothstep(tile * 0.4, tile * 0.8, cell);
-        disp = disp + sample_cascade(c, (grid + warp) / tile).disp.xyz * w;
-    }
-    disp = disp * amp_from_dir(wdir) * fade;
-
-    let east = ocean.east.xyz; let north = ocean.north.xyz; let up = ocean.up.xyz;
-    let sea_radius = ocean.sub_point_rel.w;
-    let sag = (grid.x * grid.x + grid.y * grid.y) / (2.0 * sea_radius);
-    var p = ocean.sub_point_rel.xyz + east * grid.x + north * grid.y - up * sag;
-    p = p + east * disp.x + north * disp.z + up * disp.y;
-
-    out.clip = frame.view_proj * vec4<f32>(p, 1.0);
-    out.world_pos = p;
-    out.grid = grid;
-    out.fade = fade;
-    out.wdir = wdir;
-    out.mode = 0.0;
-    return out;
-}
-
-// Projected grid (C): each vertex is a screen-space lattice point already ray-cast
+// Projected grid: each vertex is a screen-space lattice point already ray-cast
 // onto the sea sphere on the CPU (camera-relative). Derive its local frame from
 // the sphere normal + the sub-point tangent, displace by the FFT (faded by the
 // ~screen-uniform cell size), and shade as a wave.
@@ -210,21 +160,6 @@ fn vs_projected(v: VsIn) -> VsOut {
     out.grid = grid;
     out.fade = 1.0;
     out.wdir = up;
-    out.mode = 0.0;
-    return out;
-}
-
-@vertex
-fn vs_shell(v: VsIn) -> VsOut {
-    var out: VsOut;
-    let world_pos = (ocean.shell_model * vec4<f32>(v.position, 1.0)).xyz;
-    let m3 = mat3x3<f32>(ocean.shell_model[0].xyz, ocean.shell_model[1].xyz, ocean.shell_model[2].xyz);
-    out.clip = frame.view_proj * vec4<f32>(world_pos, 1.0);
-    out.world_pos = world_pos;
-    out.grid = vec2<f32>(0.0);
-    out.fade = 1.0;
-    out.wdir = normalize(m3 * v.normal); // radial world direction (≈ surface normal)
-    out.mode = 1.0;
     return out;
 }
 
@@ -301,20 +236,15 @@ fn shade_water(world_pos: vec3<f32>, N: vec3<f32>, fade: f32, frag_xy: vec2<f32>
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Per-pixel world footprint (m), computed in uniform control flow (drives the
-    // detail + specular roughening with distance for both shell and waves).
+    // detail + specular roughening with distance).
     let fp = max(length(dpdx(in.world_pos)), length(dpdy(in.world_pos)));
 
-    // Debug: heat-map the spatial wave-intensity field (shell + waves alike).
+    // Debug: heat-map the spatial wave-intensity field.
     if (ocean.amp.w > 0.5) {
         return vec4<f32>(heat(wave_intensity(in.wdir)) * (0.4 + 0.6 * in.fade), 1.0);
     }
 
-    // Shell: flat sea-level surface (normal = radial world dir).
-    if (in.mode > 0.5) {
-        return vec4<f32>(aces(shade_water(in.world_pos, normalize(in.wdir), in.fade, in.clip.xy, in.clip.z, fp)), 1.0);
-    }
-
-    // Waves: sum cascade derivatives (→ normal) + foam, domain-warped. Each
+    // Sum cascade derivatives (→ normal) + foam, domain-warped. Each
     // cascade is faded by the per-pixel screen FOOTPRINT (world metres per pixel) —
     // detail the pixel can't resolve is dropped, so far / zoomed-out water doesn't
     // alias foam + fine normals into white speckle.
