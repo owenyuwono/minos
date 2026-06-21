@@ -38,3 +38,7 @@ pub mod wind_solver;
 /// CPU leaf-cluster texture rasterizer (Rust port of dryad `leafTexture.js`
 /// `makeLeafClusterTexture` cluster branch + `buildLeafNormalMap`).
 pub mod leaf_texture;
+
+/// CPU bark-swatch rasterizer (debug-only, representative port of `flora.wgsl`'s
+/// `barkAlbedo`) for the flora-viewer Inspector bark preview.
+pub mod bark_swatch;

@@ -24,7 +24,7 @@
 use std::time::Instant;
 
 use enki_app::flora_render::{FloraRenderer, ShadowUniforms};
-use enki_app::flora_view::{FloraView, LeafMode, RenderMode};
+use enki_app::flora_view::{FloraView, LeafMode, LeafTuning, RenderMode};
 #[cfg(all(feature = "flora", feature = "nanite"))]
 use enki_app::flora_nanite::FloraNanite;
 use enki_app::staging::Staging;
@@ -213,6 +213,64 @@ struct FloraGui {
     winit: egui_winit::State,
     renderer: egui_ash_renderer::Renderer,
     output: Option<egui::FullOutput>,
+    /// Debug INSPECTOR dock state (dryad inspectorPanels port). Holds the cached
+    /// egui texture handles for the baked leaf COLOR / NORMAL sprites + the CPU
+    /// bark swatch, plus a change-key so they're only re-baked when the genome
+    /// changes. Pigment swatch/ramp + cross-section are painter-drawn every frame
+    /// (cheap, always current) and need no caching.
+    inspector: Inspector,
+}
+
+/// Cached Inspector previews. The leaf/bark images are expensive CPU bakes, so
+/// they're keyed on a cheap change-stamp (`leaf_genes` is `Copy`; bark genes are
+/// the push-vec4s) and only rebuilt when that stamp changes.
+#[derive(Default)]
+struct Inspector {
+    leaf_color: Option<egui::TextureHandle>,
+    leaf_normal: Option<egui::TextureHandle>,
+    bark: Option<egui::TextureHandle>,
+    /// Stamp the cached images were baked for: (leaf genes, leaf mode flag, bark
+    /// vec4s). Compared each frame; a mismatch triggers a re-bake.
+    stamp: Option<InspectorStamp>,
+}
+
+/// Cheap equality stamp for the Inspector's cached bakes. Built from the live
+/// `FloraView` each frame; when it differs from the cached one the leaf/bark
+/// images are re-baked.
+#[derive(Clone, Copy, PartialEq)]
+struct InspectorStamp {
+    /// Leaf-shape genes + pigment + seed (the bake inputs). Stored as the bit
+    /// patterns so it's `Eq` without `f64: Eq`.
+    leaf: [u64; 8],
+    single: bool,
+    bark: [u32; 12],
+}
+
+impl InspectorStamp {
+    fn new(flora: &FloraView) -> Self {
+        let lg = flora.leaf_genes();
+        let leaf = [
+            lg.pigment.to_bits(),
+            lg.leaf_width.to_bits(),
+            lg.leaf_length.to_bits(),
+            lg.leaf_tip.to_bits(),
+            lg.leaf_serration.to_bits(),
+            lg.leaf_lobing.to_bits(),
+            lg.leaf_skew.to_bits(),
+            lg.seed as u64,
+        ];
+        let (b0, b1, b2) = flora.bark_genes();
+        let bark = [
+            b0[0].to_bits(), b0[1].to_bits(), b0[2].to_bits(), b0[3].to_bits(),
+            b1[0].to_bits(), b1[1].to_bits(), b1[2].to_bits(), b1[3].to_bits(),
+            b2[0].to_bits(), b2[1].to_bits(), b2[2].to_bits(), b2[3].to_bits(),
+        ];
+        InspectorStamp {
+            leaf,
+            single: flora.leaf_mode() == LeafMode::Single,
+            bark,
+        }
+    }
 }
 
 /// What the panel changed this frame, for the viewer to apply after build.
@@ -327,6 +385,55 @@ fn apply_dryad_style(ctx: &egui::Context) {
     });
 }
 
+/// Draw the stem CROSS-SECTION outline (dryad inspectorPanels `crossSectionPoints`
+/// + branchMesh `ringProfile`) into `rect` with the egui painter. Filled brown,
+/// dark stroke, fitted to the rect. ribCount is derived from `segmentation` per
+/// dryad: `clamp(8 + round(segmentation*8), 8, 16)`.
+fn draw_cross_section(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    ribbing: f32,
+    flatness: f32,
+    segmentation: f32,
+) {
+    // dryad branchMesh.js constants.
+    const RIB_DEPTH: f32 = 0.35;
+    const FLAT_MAX: f32 = 0.80;
+    let rib_count = (8.0 + (segmentation * 8.0).round()).clamp(8.0, 16.0);
+
+    const STEPS: usize = 180;
+    let mut pts: Vec<(f32, f32)> = Vec::with_capacity(STEPS);
+    let mut max_r = 1e-6f32;
+    for i in 0..STEPS {
+        let theta = std::f32::consts::TAU * i as f32 / STEPS as f32;
+        // ringProfile: rScale = 1 - ribbing*RIB_DEPTH*0.5*(1 + cos(ribCount*θ)).
+        let r_scale = 1.0 - ribbing * RIB_DEPTH * 0.5 * (1.0 + (rib_count * theta).cos());
+        let u_scale = 1.0 - flatness * FLAT_MAX;
+        let x = r_scale * theta.cos() * u_scale;
+        let y = r_scale * theta.sin();
+        pts.push((x, y));
+        max_r = max_r.max((x * x + y * y).sqrt());
+    }
+    // Normalize so max radius = 1, then fit into the rect (with padding, +Y up).
+    let pad = 12.0;
+    let half = (rect.width().min(rect.height()) * 0.5 - pad).max(1.0);
+    let center = rect.center();
+    let poly: Vec<egui::Pos2> = pts
+        .iter()
+        .map(|(x, y)| {
+            let nx = x / max_r;
+            let ny = y / max_r;
+            egui::pos2(center.x + nx * half, center.y - ny * half) // flip Y
+        })
+        .collect();
+
+    painter.add(egui::Shape::convex_polygon(
+        poly,
+        egui::Color32::from_rgb(0x78, 0x56, 0x34), // dryad rgba(120,86,52)
+        egui::Stroke::new(1.25, egui::Color32::from_rgb(0x3C, 0x28, 0x18)),
+    ));
+}
+
 impl FloraGui {
     fn new(rhi: &Rhi, window: &Window) -> Self {
         let ctx = egui::Context::default();
@@ -359,7 +466,7 @@ impl FloraGui {
         )
         .expect("failed to create egui-ash renderer");
 
-        Self { ctx, winit, renderer, output: None }
+        Self { ctx, winit, renderer, output: None, inspector: Inspector::default() }
     }
 
     fn on_window_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
@@ -388,6 +495,7 @@ impl FloraGui {
         env: &mut Env,
         mode: &mut RenderMode,
         leaf_mode: &mut LeafMode,
+        leaf_tuning: &mut LeafTuning,
         seed: &mut u32,
         tab: &mut Tab,
         wind_on: &mut bool,
@@ -396,10 +504,67 @@ impl FloraGui {
         gizmo_on: &mut bool,
         bloom_on: &mut bool,
         bloom_strength: &mut f32,
+        flora: Option<&FloraView>,
         stats: &Stats,
     ) -> PanelOut {
         let raw_input = self.winit.take_egui_input(window);
         let mut out = PanelOut::default();
+
+        // ── INSPECTOR bakes (BEFORE ctx.run, so load_texture's one-shot upload
+        //    submit lands outside the rendering instance — same constraint as the
+        //    panel build itself). Only re-bake the expensive leaf/bark images when
+        //    the genome changed (stamp mismatch); otherwise reuse the handles. ──
+        if let Some(flora) = flora {
+            let stamp = InspectorStamp::new(flora);
+            if self.inspector.stamp != Some(stamp) {
+                let lg = flora.leaf_genes();
+                let single = stamp.single;
+                let leaf = if single {
+                    enki_flora::leaf_texture::bake_leaf_single(&lg)
+                } else {
+                    enki_flora::leaf_texture::bake_leaf_cluster(&lg)
+                };
+                let sz = [leaf.size as usize, leaf.size as usize];
+                let color_img = egui::ColorImage::from_rgba_unmultiplied(sz, &leaf.color);
+                let normal_img = egui::ColorImage::from_rgba_unmultiplied(sz, &leaf.normal);
+                self.inspector.leaf_color = Some(self.ctx.load_texture(
+                    "insp_leaf_color",
+                    color_img,
+                    egui::TextureOptions::LINEAR,
+                ));
+                self.inspector.leaf_normal = Some(self.ctx.load_texture(
+                    "insp_leaf_normal",
+                    normal_img,
+                    egui::TextureOptions::LINEAR,
+                ));
+                // Bark swatch (CPU-eval of barkAlbedo — labeled APPROX).
+                let (b0, b1, b2) = flora.bark_genes();
+                let bg = enki_flora::bark_swatch::BarkGenes::from_vec4s(b0, b1, b2);
+                const BARK_SZ: u32 = 192;
+                let bark_px = enki_flora::bark_swatch::bake_bark_swatch(&bg, BARK_SZ);
+                let bark_img = egui::ColorImage::from_rgba_unmultiplied(
+                    [BARK_SZ as usize, BARK_SZ as usize],
+                    &bark_px,
+                );
+                self.inspector.bark = Some(self.ctx.load_texture(
+                    "insp_bark",
+                    bark_img,
+                    egui::TextureOptions::LINEAR,
+                ));
+                self.inspector.stamp = Some(stamp);
+            }
+        }
+        // Snapshot the pigment/cross genes for the painter-drawn panels.
+        let pigment = genome.pigment;
+        let ribbing = genome.ribbing;
+        let flatness = genome.flatness;
+        let segmentation = genome.segmentation;
+        let single_leaf = *leaf_mode == LeafMode::Single;
+        // TextureHandle is cheap to clone (Arc); clone out so the ctx.run closure
+        // doesn't borrow `self` (ctx is borrowed for the whole run).
+        let insp_leaf_color = self.inspector.leaf_color.clone();
+        let insp_leaf_normal = self.inspector.leaf_normal.clone();
+        let insp_bark = self.inspector.bark.clone();
 
         let full_output = self.ctx.run(raw_input, |ctx| {
             // ── (A) LEFT controls SidePanel: header (presets + generate/reroll/
@@ -626,6 +791,71 @@ impl FloraGui {
                         }
                     });
                     ui.separator();
+                    // ── Leaf placement (phyllotaxis) tuning — RENDER-SIDE knobs. ──
+                    // These adjust the leaf STRIP orientation/droop/size in
+                    // build_leaf_mesh on top of the gen-core SoA; they are NOT
+                    // genome genes, so editing them rebuilds ONLY the leaf mesh and
+                    // never touches the golden gen-core path. Identity defaults
+                    // (lift/up_bias 0, droop/size ×1.0) reproduce the current look.
+                    egui::CollapsingHeader::new("Leaf placement")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            // Divergence angle readout (the golden angle the gen-
+                            // core azimuth blends toward — reference only).
+                            let golden_deg =
+                                (enki_flora::foliage::GOLDEN_ANGLE * 180.0
+                                    / std::f64::consts::PI) as f32;
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Divergence (golden): {golden_deg:.3}°"
+                                ))
+                                .color(egui::Color32::from_rgb(0x6E, 0x8C, 0xA8)),
+                            );
+                            let mut c = false;
+                            c |= ui
+                                .add(
+                                    egui::Slider::new(&mut leaf_tuning.lift, -1.0..=1.0)
+                                        .text("Insertion / lift"),
+                                )
+                                .changed();
+                            c |= ui
+                                .add(
+                                    egui::Slider::new(&mut leaf_tuning.up_bias, 0.0..=1.0)
+                                        .text("Up-bias"),
+                                )
+                                .changed();
+                            c |= ui
+                                .add(
+                                    egui::Slider::new(&mut leaf_tuning.droop, 0.0..=3.0)
+                                        .text("Droop"),
+                                )
+                                .changed();
+                            c |= ui
+                                .add(
+                                    egui::Slider::new(&mut leaf_tuning.size, 0.2..=2.0)
+                                        .text("Leaf size"),
+                                )
+                                .changed();
+                            // ponytail: render-side leaf DENSITY (smooth subsample,
+                            // sidesteps the cliffy appendageDensity gene). 0 = bare,
+                            // 1 = every twig anchor; rebuilds the leaf mesh on edit.
+                            c |= ui
+                                .add(
+                                    egui::Slider::new(&mut leaf_tuning.density, 0.0..=1.0)
+                                        .text("Leaf density"),
+                                )
+                                .changed();
+                            if ui.button("Reset").clicked() {
+                                *leaf_tuning = LeafTuning::default();
+                                c = true;
+                            }
+                            // Editing any knob rebuilds the leaf mesh (the existing
+                            // rebuild path re-runs build_leaf_mesh).
+                            if c {
+                                out.rebuild = true;
+                            }
+                        });
+                    ui.separator();
                     // Wind (animation only — NOT a rebuild; read live in render()).
                     // `env.wind` (Climate tab) is the MORPHOLOGY gene; this is the
                     // procedural global-field sway.
@@ -642,6 +872,167 @@ impl FloraGui {
                         *bloom_on,
                         egui::Slider::new(bloom_strength, 0.0..=1.0).text("strength"),
                     );
+                });
+
+            // ── (D) INSPECTOR dock — dryad inspectorPanels port. A scrollable
+            //    window of live previews of the generated components, each LABELED,
+            //    updating when the genome/sliders change. Placed bottom-right by
+            //    default (clear of Stats/View), draggable. ──
+            let dim = egui::Color32::from_rgb(0x6E, 0x8C, 0xA8);
+            let heading = egui::Color32::from_rgb(0xCC, 0xDD, 0xEE);
+            egui::Window::new("Inspector")
+                .anchor(egui::Align2::RIGHT_BOTTOM, [-8.0, -8.0])
+                .resizable(true)
+                .default_width(180.0)
+                .show(ctx, |ui| {
+                    egui::ScrollArea::vertical()
+                        // Fit the scroll region to the actual (DPI-scaled) viewport
+                        // so the dock never overflows the screen — scroll internally.
+                        .max_height((ui.ctx().screen_rect().height() - 120.0).max(240.0))
+                        .show(ui, |ui| {
+                            let img_w = (ui.available_width() - 8.0).clamp(80.0, 128.0);
+
+                            // (1) LEAF TEXTURE — baked COLOR sprite.
+                            ui.label(
+                                egui::RichText::new(if single_leaf {
+                                    "LEAF TEXTURE (single)"
+                                } else {
+                                    "LEAF TEXTURE (cluster)"
+                                })
+                                .color(heading),
+                            );
+                            if let Some(t) = &insp_leaf_color {
+                                ui.image((t.id(), egui::vec2(img_w, img_w)));
+                            } else {
+                                ui.label(egui::RichText::new("(no tree)").color(dim));
+                            }
+
+                            // (4) LEAF SHAPE — the silhouette = the sprite ALPHA. We
+                            // show the same COLOR image again labeled as the shape
+                            // (its cutout IS the silhouette); a checker behind would
+                            // need an extra blit — skipped (ponytail shortcut).
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("LEAF SHAPE (alpha)").color(heading));
+                            ui.label(
+                                egui::RichText::new(
+                                    "silhouette = the sprite's alpha cutout above",
+                                )
+                                .color(dim),
+                            );
+
+                            // LEAF NORMAL map.
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new("LEAF NORMAL").color(heading));
+                            if let Some(t) = &insp_leaf_normal {
+                                ui.image((t.id(), egui::vec2(img_w, img_w)));
+                            }
+
+                            ui.separator();
+
+                            // (2) PIGMENT swatch + readout + ramp (painter-drawn).
+                            ui.label(egui::RichText::new("PIGMENT").color(heading));
+                            let [pr, pg, pb] = enki_flora::color::pigment_to_color(pigment);
+                            let swcol = egui::Color32::from_rgb(
+                                (pr * 255.0).round() as u8,
+                                (pg * 255.0).round() as u8,
+                                (pb * 255.0).round() as u8,
+                            );
+                            let (rect, _) = ui.allocate_exact_size(
+                                egui::vec2(img_w, 22.0),
+                                egui::Sense::hover(),
+                            );
+                            ui.painter().rect_filled(rect, 3.0, swcol);
+                            // hex + p= readout, luminance-aware text color.
+                            let hex = format!(
+                                "#{:02X}{:02X}{:02X}  p={:.2}",
+                                (pr * 255.0).round() as u8,
+                                (pg * 255.0).round() as u8,
+                                (pb * 255.0).round() as u8,
+                                pigment
+                            );
+                            let lum = 0.299 * pr + 0.587 * pg + 0.114 * pb;
+                            let tcol = if lum > 0.5 {
+                                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200)
+                            } else {
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220)
+                            };
+                            ui.painter().text(
+                                rect.left_center() + egui::vec2(6.0, 0.0),
+                                egui::Align2::LEFT_CENTER,
+                                hex,
+                                egui::FontId::monospace(10.0),
+                                tcol,
+                            );
+
+                            // Pigment RAMP (full hue sweep) + current marker.
+                            ui.add_space(2.0);
+                            let (ramp, _) = ui.allocate_exact_size(
+                                egui::vec2(img_w, 12.0),
+                                egui::Sense::hover(),
+                            );
+                            let cols = 48usize;
+                            for c in 0..cols {
+                                let t0 = c as f32 / cols as f32;
+                                let t1 = (c + 1) as f32 / cols as f32;
+                                let [rr, gg, bb] =
+                                    enki_flora::color::pigment_to_color(t0 as f64);
+                                let slice = egui::Rect::from_min_max(
+                                    egui::pos2(ramp.left() + ramp.width() * t0, ramp.top()),
+                                    egui::pos2(ramp.left() + ramp.width() * t1, ramp.bottom()),
+                                );
+                                ui.painter().rect_filled(
+                                    slice,
+                                    0.0,
+                                    egui::Color32::from_rgb(
+                                        (rr * 255.0).round() as u8,
+                                        (gg * 255.0).round() as u8,
+                                        (bb * 255.0).round() as u8,
+                                    ),
+                                );
+                            }
+                            // Marker at the current pigment.
+                            let mx = ramp.left() + ramp.width() * pigment as f32;
+                            ui.painter().vline(
+                                mx,
+                                ramp.y_range(),
+                                egui::Stroke::new(2.0, egui::Color32::WHITE),
+                            );
+                            ui.painter().vline(
+                                mx + 1.5,
+                                ramp.y_range(),
+                                egui::Stroke::new(1.0, egui::Color32::BLACK),
+                            );
+
+                            ui.separator();
+
+                            // (3) BARK SWATCH — CPU-eval of barkAlbedo (APPROX).
+                            ui.label(egui::RichText::new("BARK SWATCH").color(heading));
+                            ui.label(
+                                egui::RichText::new(
+                                    "CPU approx of in-shader barkAlbedo; V = twig→trunk",
+                                )
+                                .color(dim),
+                            );
+                            if let Some(t) = &insp_bark {
+                                ui.image((t.id(), egui::vec2(img_w, img_w)));
+                            }
+
+                            ui.separator();
+
+                            // (5) CROSS-SECTION — stem ring outline (painter-drawn).
+                            ui.label(egui::RichText::new("STEM CROSS-SECTION").color(heading));
+                            let (cs, _) = ui.allocate_exact_size(
+                                egui::vec2(img_w, img_w * 0.8),
+                                egui::Sense::hover(),
+                            );
+                            draw_cross_section(
+                                ui.painter(),
+                                cs,
+                                ribbing as f32,
+                                flatness as f32,
+                                segmentation as f32,
+                            );
+                        });
                 });
         });
 
@@ -959,6 +1350,10 @@ struct App {
     /// Leaf rendering mode (Cluster = one card/cluster, Single = one card/leaf).
     /// Flipping it forces a tree rebuild (mesh expansion + sprite re-bake).
     leaf_mode: LeafMode,
+    /// Render-side leaf-placement tuning (lift/up_bias/droop/size). RENDER-ONLY
+    /// (not a genome gene) — editing it rebuilds the leaf mesh but never touches
+    /// the golden gen-core path. Defaults are identity (current look unchanged).
+    leaf_tuning: LeafTuning,
     /// Active left-panel CAS tab (Climate / Trunk / Branches / Leaves / Root).
     tab: Tab,
     last_frame: Instant,
@@ -1081,6 +1476,13 @@ impl App {
             // Initial leaf mode from FLORA_LEAFMODE (default Cluster), so a
             // headless screenshot can capture the Single fan without the panel.
             leaf_mode: LeafMode::from_env(),
+            // FLORA_LEAFDENSITY overrides the 0.7 default for headless capture of
+            // the smooth sparse→full range (slider still drives it interactively).
+            leaf_tuning: {
+                let mut t = LeafTuning::default();
+                t.density = LeafTuning::density_from_env(t.density);
+                t
+            },
             tab: Tab::Climate,
             last_frame: Instant::now(),
             minimized: false,
@@ -1117,12 +1519,13 @@ impl App {
         // shutdown (FloraView has no Drop) — acceptable for a debug tool. The
         // flora-owned pipelines are NOT rebuilt here (they live in
         // FloraRenderer, built once); only the per-tree meshes are re-uploaded.
-        match FloraView::from_genome_with_mode(
+        match FloraView::from_genome_with_mode_tuned(
             rhi,
             &self.genome,
             &self.env,
             DVec3::ZERO,
             self.leaf_mode,
+            self.leaf_tuning,
         ) {
             Ok(mut f) => {
                 // A fresh FloraView defaults to Lit; carry the live mode forward
@@ -1390,6 +1793,7 @@ impl App {
                 &mut self.env,
                 &mut self.mode,
                 &mut self.leaf_mode,
+                &mut self.leaf_tuning,
                 &mut self.seed,
                 &mut self.tab,
                 &mut self.wind_on,
@@ -1398,6 +1802,7 @@ impl App {
                 &mut self.gizmo_on,
                 &mut self.bloom_on,
                 &mut self.bloom_strength,
+                self.flora.as_ref(),
                 &stats,
             );
         }

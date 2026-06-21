@@ -46,6 +46,7 @@ struct Ocean {
     sun_color     : vec4<f32>,
     shading       : vec4<f32>,   // sss, foam_threshold, foam_scale, alpha
     screen        : vec4<f32>,   // width, height, refract_strength, deep_tint
+    center_rel    : vec4<f32>,   // xyz = planet centre − camera; w = cell factor (C)
     shell_model   : mat4x4<f32>, // vs_shell: camera-relative + sea-level scale
 }
 
@@ -144,15 +145,22 @@ fn edge_fade(grid: vec2<f32>) -> f32 {
 fn vs_main(v: VsIn) -> VsOut {
     var out: VsOut;
     let grid = v.position.xz;
+    let cell = v.position.y;        // local world cell size (radial warp packs it here)
     let fade = edge_fade(grid);
     let wdir = surface_dir(grid);
     let warp = warp_world(wdir);
     let cc = i32(ocean.cfg.w);
 
+    // Sum cascade displacement, fading a cascade out where the cell is too coarse
+    // to carry its waves (Nyquist) — without this, the warp's large rim cells
+    // alias the fine cascades into geometry crawl. (Their detail still rides the
+    // per-pixel normals in fs_main, which the mesh density doesn't bound.)
     var disp = vec3<f32>(0.0);
     for (var c = 0; c < 3; c = c + 1) {
         if (c >= cc) { break; }
-        disp = disp + sample_cascade(c, (grid + warp) / cascade_scale(c)).disp.xyz;
+        let tile = cascade_scale(c);
+        let w = 1.0 - smoothstep(tile * 0.4, tile * 0.8, cell);
+        disp = disp + sample_cascade(c, (grid + warp) / tile).disp.xyz * w;
     }
     disp = disp * amp_from_dir(wdir) * fade;
 
@@ -167,6 +175,41 @@ fn vs_main(v: VsIn) -> VsOut {
     out.grid = grid;
     out.fade = fade;
     out.wdir = wdir;
+    out.mode = 0.0;
+    return out;
+}
+
+// Projected grid (C): each vertex is a screen-space lattice point already ray-cast
+// onto the sea sphere on the CPU (camera-relative). Derive its local frame from
+// the sphere normal + the sub-point tangent, displace by the FFT (faded by the
+// ~screen-uniform cell size), and shade as a wave.
+@vertex
+fn vs_projected(v: VsIn) -> VsOut {
+    var out: VsOut;
+    let base = v.position;                                   // on the sea sphere, cam-relative
+    let up = normalize(base - ocean.center_rel.xyz);         // sphere normal at this point
+    let east = ocean.east.xyz; let north = ocean.north.xyz;
+    let rel = base - ocean.sub_point_rel.xyz;
+    let grid = vec2<f32>(dot(rel, east), dot(rel, north));   // tangent coords for FFT
+    let cell = length(base) * ocean.center_rel.w;            // ~screen-uniform world cell
+    let warp = warp_world(up);
+    let cc = i32(ocean.cfg.w);
+
+    var disp = vec3<f32>(0.0);
+    for (var c = 0; c < 3; c = c + 1) {
+        if (c >= cc) { break; }
+        let tile = cascade_scale(c);
+        let w = 1.0 - smoothstep(tile * 0.4, tile * 0.8, cell);
+        disp = disp + sample_cascade(c, (grid + warp) / tile).disp.xyz * w;
+    }
+    disp = disp * amp_from_dir(up);
+
+    let p = base + east * disp.x + north * disp.z + up * disp.y;
+    out.clip = frame.view_proj * vec4<f32>(p, 1.0);
+    out.world_pos = p;
+    out.grid = grid;
+    out.fade = 1.0;
+    out.wdir = up;
     out.mode = 0.0;
     return out;
 }
@@ -187,11 +230,17 @@ fn vs_shell(v: VsIn) -> VsOut {
 
 // ── Shading ────────────────────────────────────────────────────────────────────
 
-fn sky_color(dir: vec3<f32>) -> vec3<f32> {
+// `gloss` (1 near → 0 far) gates the sharp mirror sun disc: a near-mirror surface
+// turns the sun into sparkly dots wherever a per-pixel normal lines up, so the
+// sharp disc is kept only where the surface is actually resolved; the broad sky
+// gradient + soft sun glow always remain.
+fn sky_color(dir: vec3<f32>, gloss: f32) -> vec3<f32> {
     let h = dot(dir, ocean.up.xyz);
     let grad = mix(ocean.sky_horizon.xyz, ocean.sky_zenith.xyz, smoothstep(-0.05, 0.4, h));
     let sd = max(dot(dir, frame.sun0_dir.xyz), 0.0);
-    return grad + pow(sd, 1200.0) * ocean.sun_color.xyz * 8.0 + pow(sd, 7.0) * ocean.sun_color.xyz * 0.35;
+    let disc = pow(sd, 1200.0) * 8.0 * gloss;
+    let glow = pow(sd, 7.0) * 0.35;
+    return grad + (disc + glow) * ocean.sun_color.xyz;
 }
 
 fn aces(x: vec3<f32>) -> vec3<f32> {
@@ -211,14 +260,18 @@ fn view_dist(d: f32) -> f32 {
 }
 
 // Shared water body: screen-space refraction + depth-based absorption + Fresnel sky.
-fn shade_water(world_pos: vec3<f32>, N: vec3<f32>, fade: f32, frag_xy: vec2<f32>, frag_depth: f32) -> vec3<f32> {
+// `fp` = per-pixel world footprint (m); it roughens the specular with distance.
+fn shade_water(world_pos: vec3<f32>, N: vec3<f32>, fade: f32, frag_xy: vec2<f32>, frag_depth: f32, fp: f32) -> vec3<f32> {
     let up = ocean.up.xyz;
     let V = normalize(-world_pos);
     let fresnel = 0.02 + 0.98 * pow(1.0 - max(dot(N, V), 0.0), 5.0);
 
+    // Specular gloss: sharp only where the surface is resolved (small footprint),
+    // so distant / zoomed-out water reflects the smooth sky, not a sparkly sun.
+    let gloss = 1.0 - smoothstep(4.0, 30.0, fp);
     var R = reflect(-V, N);
     R = R - up * min(dot(R, up), 0.0) + up * 0.02;
-    let reflection = sky_color(normalize(R));
+    let reflection = sky_color(normalize(R), gloss);
 
     let suv = frag_xy / ocean.screen.xy;
     let refr_uv = clamp(suv + vec2<f32>(N.x, N.z) * ocean.screen.z, vec2<f32>(0.002), vec2<f32>(0.998));
@@ -247,6 +300,10 @@ fn shade_water(world_pos: vec3<f32>, N: vec3<f32>, fade: f32, frag_xy: vec2<f32>
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    // Per-pixel world footprint (m), computed in uniform control flow (drives the
+    // detail + specular roughening with distance for both shell and waves).
+    let fp = max(length(dpdx(in.world_pos)), length(dpdy(in.world_pos)));
+
     // Debug: heat-map the spatial wave-intensity field (shell + waves alike).
     if (ocean.amp.w > 0.5) {
         return vec4<f32>(heat(wave_intensity(in.wdir)) * (0.4 + 0.6 * in.fade), 1.0);
@@ -254,10 +311,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     // Shell: flat sea-level surface (normal = radial world dir).
     if (in.mode > 0.5) {
-        return vec4<f32>(aces(shade_water(in.world_pos, normalize(in.wdir), in.fade, in.clip.xy, in.clip.z)), 1.0);
+        return vec4<f32>(aces(shade_water(in.world_pos, normalize(in.wdir), in.fade, in.clip.xy, in.clip.z, fp)), 1.0);
     }
 
-    // Waves: sum cascade derivatives (→ normal) + foam, domain-warped.
+    // Waves: sum cascade derivatives (→ normal) + foam, domain-warped. Each
+    // cascade is faded by the per-pixel screen FOOTPRINT (world metres per pixel) —
+    // detail the pixel can't resolve is dropped, so far / zoomed-out water doesn't
+    // alias foam + fine normals into white speckle.
     let cc = i32(ocean.cfg.w);
     let amp = amp_from_dir(in.wdir);
     let warp = warp_world(in.wdir);
@@ -265,9 +325,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var foam = 0.0;
     for (var c = 0; c < 3; c = c + 1) {
         if (c >= cc) { break; }
-        let tx = sample_cascade(c, (in.grid + warp) / cascade_scale(c));
-        deriv = deriv + tx.deriv;
-        if (c < cc - 1) { foam = foam + clamp((ocean.shading.y - tx.disp.w) * ocean.shading.z, 0.0, 1.0); }
+        let tile = cascade_scale(c);
+        let w = 1.0 - smoothstep(tile * 0.4, tile * 0.9, fp);
+        let tx = sample_cascade(c, (in.grid + warp) / tile);
+        deriv = deriv + tx.deriv * w;
+        if (c < cc - 1) { foam = foam + clamp((ocean.shading.y - tx.disp.w) * ocean.shading.z, 0.0, 1.0) * w; }
     }
     let east = ocean.east.xyz; let north = ocean.north.xyz; let up = ocean.up.xyz;
     let slope_x = amp * deriv.x / (1.0 + deriv.z);
@@ -276,9 +338,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     n_t = mix(vec3<f32>(0.0, 1.0, 0.0), n_t, in.fade);
     let N = normalize(east * n_t.x + up * n_t.y + north * n_t.z);
 
-    var water = shade_water(in.world_pos, N, in.fade, in.clip.xy, in.clip.z);
+    var water = shade_water(in.world_pos, N, in.fade, in.clip.xy, in.clip.z, fp);
 
-    let coverage = smoothstep(0.2, 0.9, foam * clamp(amp, 0.0, 1.3) * in.fade);
+    // Foam is a near-field detail only — fade it out entirely as pixels cover
+    // more ocean, so zoomed-out water shows no whitecaps. (Tune the 8..35 m
+    // footprint band for how close you must be to see foam.)
+    let foam_fade = 1.0 - smoothstep(8.0, 35.0, fp);
+    let coverage = smoothstep(0.2, 0.9, foam * clamp(amp, 0.0, 1.3) * in.fade) * foam_fade;
     let foam_light = 0.55 + 0.6 * clamp(dot(N, frame.sun0_dir.xyz), 0.0, 1.0);
     water = mix(water, ocean.foam_color.xyz * foam_light, coverage);
 

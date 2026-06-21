@@ -39,7 +39,7 @@
 mod character;
 mod controls;
 mod gui;
-mod hud;
+mod fps;
 mod loading;
 mod ocean;
 mod planet_view;
@@ -74,8 +74,8 @@ use controls::{
     PLANET_RADIUS,
 };
 use gui::EguiState;
-use hud::Hud;
-use ocean::{Ocean, WaveSurface};
+use fps::FpsMeter;
+use ocean::{Ocean, OceanMesh, WaveSurface};
 use planet_view::{PlanetConfig, PlanetView, PlanetViewStats, RhiUploaderDummy, planet_view_from_hf};
 use scene::Scene;
 use stress::StressHarness;
@@ -144,7 +144,7 @@ struct App {
     load_timings: Option<loading::LoadTimings>,
     /// Show the one-time load-stats popup until the user dismisses it.
     show_load_stats: bool,
-    hud:          Hud,
+    fps:          FpsMeter,
     mode:         RenderMode,
     last_tick:    Instant,
     minimized:    bool,
@@ -188,6 +188,8 @@ struct App {
     wave_choppiness:   f32,
     /// Foam threshold (Jacobian below which whitecaps form) — GUI-tunable.
     wave_foam:         f32,
+    /// Which wave mesh to use (Warped / Projected / Clipmap) — GUI-tunable.
+    ocean_mesh:        OceanMesh,
     /// Sea level as a metre offset from the terrain's `e = 0` datum (= PLANET_RADIUS).
     sea_level_m:       f64,
 
@@ -249,7 +251,7 @@ impl App {
             pending_planet_cfg: None,
             load_timings:  None,
             show_load_stats: false,
-            hud:           Hud::new(),
+            fps:           FpsMeter::new(),
             mode,
             last_tick:     Instant::now(),
             minimized:     false,
@@ -271,6 +273,7 @@ impl App {
             wave_enabled:      true,
             wave_choppiness:   1.3,
             wave_foam:         0.4,
+            ocean_mesh:        OceanMesh::default(),
             sea_level_m:       0.0,
             mouse_delta:   (0.0, 0.0),
             lmb_held:      false,
@@ -797,6 +800,10 @@ impl ApplicationHandler for App {
                     if let Err(e) = rhi.wait_idle() {
                         log::error!("wait_idle failed: {e}");
                     }
+                    // Free caller-owned GPU resources before RHI teardown.
+                    if let Some(wave) = &self.wave {
+                        wave.destroy(rhi);
+                    }
                 }
                 event_loop.exit();
                 return;
@@ -1023,6 +1030,9 @@ impl App {
         // ── Delta time ────────────────────────────────────────────────────
         let now = Instant::now();
         let dt  = now.duration_since(self.last_tick).as_secs_f32().min(0.1);
+        // Smoothed/throttled frame time for the egui FPS readout (raw dt drives motion).
+        self.fps.tick(dt);
+        let frame_time = self.fps.frame_time_s();
         self.last_tick = now;
 
         // ── Async loading: show a progress bar until the worker finishes ──
@@ -1124,6 +1134,7 @@ impl App {
             let wave_enabled      = self.wave_enabled;
             let wave_choppiness   = self.wave_choppiness;
             let wave_foam         = self.wave_foam;
+            let ocean_mesh        = self.ocean_mesh;
             // LoadTimings is Copy — snapshot it out so the popup can borrow it while
             // egui mutably borrows self. Only passed while the popup is showing.
             let load_stats        = if self.show_load_stats { self.load_timings } else { None };
@@ -1133,9 +1144,9 @@ impl App {
             let rhi    = self.rhi.as_ref().unwrap();
 
             Some(egui.build_frame(
-                window, rhi, nav_mode, altitude, dt, view_mode, wireframe, taa_on,
+                window, rhi, nav_mode, altitude, frame_time, view_mode, wireframe, taa_on,
                 nanite_enabled, nanite_tau, cfg!(feature = "nanite"),
-                ocean_enabled, sea_level_m, wave_enabled, wave_choppiness, wave_foam,
+                ocean_enabled, sea_level_m, wave_enabled, wave_choppiness, wave_foam, ocean_mesh,
                 None, planet_stats.as_ref(), load_stats.as_ref(),
             ))
         } else {
@@ -1164,6 +1175,7 @@ impl App {
             self.wave_enabled      = out.wave_enabled;
             self.wave_choppiness   = out.wave_choppiness;
             self.wave_foam         = out.wave_foam;
+            self.ocean_mesh        = out.ocean_mesh;
             if out.cycle_nav {
                 self.cycle_nav_mode();
             }
@@ -1175,11 +1187,6 @@ impl App {
             }
         }
 
-        // ── HUD window-title update ───────────────────────────────────────
-        if let Some(window) = &self.window {
-            self.hud.update(window, dt, nav_mode, altitude, view_mode, wireframe,
-                planet_stats.as_ref());
-        }
 
         // ── Acquire aspect + screen height from RHI ───────────────────────
         let (aspect, screen_h_px) = self.rhi.as_ref().map(|r| {
@@ -1386,8 +1393,9 @@ impl App {
                         w.params.foam_threshold = self.wave_foam;
                         w.debug_intensity = view_mode == 12; // Ocean: Intensity
                         if let Err(e) = w.record(
-                            rhi, fi, &fu, camera_world_pos, sea,
+                            rhi, fi, &fu, &camera, sea,
                             scene_view, scene_depth, (ext.width, ext.height), draw_waves,
+                            self.ocean_mesh,
                         ) {
                             log::error!("WaveSurface::record error: {e}");
                         }

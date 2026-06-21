@@ -372,6 +372,27 @@ impl Builder {
 // build_branch_mesh
 // ---------------------------------------------------------------------------
 
+/// Options for [`build_branch_mesh_with`]. `Default` == legacy behavior (no
+/// cull), so the golden / determinism paths and existing callers are byte
+/// identical to [`build_branch_mesh`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BranchMeshOpts {
+    /// Twig-tip wood cull: when `Some(level)`, the TUBE GEOMETRY of leaf-bearing
+    /// terminal twig chains whose start branch_level `>= level` is NOT emitted —
+    /// the foliage pass clothes those twigs with leaf cards, so rendering bark
+    /// there only produced the "bare reddish sticks poking through" artifact.
+    ///
+    /// Only TIP chains (no children) are eligible, so culling never orphans a
+    /// thicker parent's connection: the parent tube + its fork-parent shared ring
+    /// stay meshed; only the outermost leaf-covered twig stubs are dropped.
+    ///
+    /// The wind-bone hierarchy (`bones_wind`, `node_to_bone`) is built for ALL
+    /// chains regardless of the cull, so bone indices/parents stay valid and the
+    /// leaf pass's `nearest_bone` lookup is unchanged. The cull only suppresses
+    /// per-vertex tube emission for the culled chains.
+    pub twig_cull_level: Option<i32>,
+}
+
 /// Build a merged tapered-tube mesh from a solved skeleton `graph`.
 ///
 /// Walks bone chains (runs of single-child nodes broken by forks/tips), emits a
@@ -379,6 +400,12 @@ impl Builder {
 /// the fork-parent node as a shared ring, and collapses childless tips to an
 /// apex. Determinism: pure function of `graph`, no rng / time / global state.
 pub fn build_branch_mesh(graph: &Graph) -> BranchMesh {
+    build_branch_mesh_with(graph, BranchMeshOpts::default())
+}
+
+/// Like [`build_branch_mesh`], but with [`BranchMeshOpts`] (twig-tip wood cull).
+/// Deterministic: pure function of `graph` + `opts`.
+pub fn build_branch_mesh_with(graph: &Graph, opts: BranchMeshOpts) -> BranchMesh {
     let nodes = &graph.nodes;
     let bones = &graph.bones;
 
@@ -619,6 +646,43 @@ pub fn build_branch_mesh(graph: &Graph) -> BranchMesh {
         let level = nodes[chain[0]].branch_level.max(0);
         let segs = radial_segs_for(level);
         let is_tip = children_of[*chain.last().unwrap()].is_empty();
+
+        // ── Twig-tip wood cull (opt-in). The foliage pass clothes leaf-bearing
+        //    twigs (branch_level >= cull_level) in leaf cards, so rendering bark
+        //    there is the "bare sticks poking past the canopy" artifact. We strip
+        //    the TUBE on the outer twig portion of TIP chains only:
+        //      * Only TIP chains (no children) are eligible — truncating an
+        //        interior chain would orphan its child geometry; tips have none.
+        //      * Within a tip chain, branch_level rises monotonically toward the
+        //        tip, so the twig nodes (>= cull_level) form a contiguous TAIL.
+        //        We keep the leading rings (level < cull_level, plus ONE boundary
+        //        node so the kept stub still meets its leafy continuation flush)
+        //        and drop the rest. If the chain is twig all the way (the whole
+        //        thing is >= cull_level — e.g. a fine fork-child), drop it whole.
+        //    Bones/node_to_bone (built above) are UNAFFECTED, so the wind
+        //    hierarchy and the leaf pass's nearest_bone lookup are untouched. ──
+        let mut culled_tip = false; // dropped the real apex → no apex fan
+        let mut cull_keep: Option<usize> = None; // #rings to keep when truncating
+        if let Some(cull_level) = opts.twig_cull_level {
+            if is_tip {
+                // First node index whose branch_level reaches the twig level.
+                let twig_start = chain
+                    .iter()
+                    .position(|&ni| nodes[ni].branch_level >= cull_level);
+                if let Some(ts) = twig_start {
+                    // Keep up to and including the boundary node (ts), so the
+                    // surviving bark stub overlaps where leaves begin. Need >= 2
+                    // kept rings for a tube; otherwise the chain is essentially
+                    // all twig → drop it entirely.
+                    let keep = ts + 1;
+                    if keep < 2 {
+                        continue; // whole chain is twig wood: cull it
+                    }
+                    cull_keep = Some(keep);
+                    culled_tip = true; // the real tip (and its apex) is gone
+                }
+            }
+        }
         let bone_idx = ci as f64;
         // Pivot node index within the chain (0 if no prepend, 1 if prepended).
         let has_prepend = n >= 2 && parent_of_chain_start[chain[1]] == chain[0] as isize;
@@ -655,7 +719,21 @@ pub fn build_branch_mesh(graph: &Graph) -> BranchMesh {
         let mut cur_u = frame_u;
         let mut cur_v = frame_v;
 
-        let ring_count = if is_tip { n - 1 } else { n };
+        // Normal tip chains collapse the last node to an apex (ring_count = n-1,
+        // apex fan after). When the twig tail is culled we instead emit `keep`
+        // closed rings (the boundary node gets a real ring, not an apex) and skip
+        // the fan — `effective_is_tip` drives the apex block below.
+        let effective_is_tip = is_tip && !culled_tip;
+        let ring_count = match cull_keep {
+            Some(keep) => keep,
+            None => {
+                if is_tip {
+                    n - 1
+                } else {
+                    n
+                }
+            }
+        };
 
         for ni in 0..ring_count {
             let node = &nodes[chain[ni]];
@@ -718,7 +796,7 @@ pub fn build_branch_mesh(graph: &Graph) -> BranchMesh {
             b.emit_quad_strip(ring_indices[ri], ring_indices[ri + 1], segs);
         }
 
-        if is_tip {
+        if effective_is_tip {
             let tip_node = &nodes[chain[n - 1]];
             let prev_pos = nodes[chain[n - 2]].pos;
             let tip_seg = v3len(v3sub(tip_node.pos, prev_pos));
@@ -827,6 +905,78 @@ mod tests {
         let resolved2 = resolve(&genome, &env);
         let mesh3 = build_branch_mesh(&resolved2.graph);
         assert_eq!(mesh, mesh3, "mesh differs across identical resolves");
+    }
+
+    #[test]
+    fn seed_42_twig_cull_mesh_is_nonempty_finite_in_range_deterministic_and_smaller() {
+        let env = Env::default();
+        let genome = random_genome(&env, 42);
+        let resolved = resolve(&genome, &env);
+
+        // Baseline (no cull) and the twig-tip-culled output share the SAME graph.
+        let base = build_branch_mesh(&resolved.graph);
+        let opts = BranchMeshOpts { twig_cull_level: Some(3) };
+        let mesh = build_branch_mesh_with(&resolved.graph, opts);
+
+        // Non-empty: the trunk + thick branches always survive the cull.
+        assert!(mesh.vertex_count > 0, "expected vertices after twig cull");
+        assert!(mesh.triangle_count > 0, "expected triangles after twig cull");
+
+        // The cull removed leaf-bearing twig tubes → strictly fewer verts/tris.
+        assert!(
+            mesh.vertex_count < base.vertex_count,
+            "twig cull should drop vertices ({} !< {})",
+            mesh.vertex_count,
+            base.vertex_count
+        );
+        assert!(
+            mesh.triangle_count < base.triangle_count,
+            "twig cull should drop triangles ({} !< {})",
+            mesh.triangle_count,
+            base.triangle_count
+        );
+
+        // SoA lengths still consistent.
+        assert_eq!(mesh.positions.len(), mesh.vertex_count as usize * 3);
+        assert_eq!(mesh.normals.len(), mesh.vertex_count as usize * 3);
+        assert_eq!(mesh.uvs.len(), mesh.vertex_count as usize * 2);
+        assert_eq!(mesh.ao.len(), mesh.vertex_count as usize);
+        assert_eq!(mesh.radii.len(), mesh.vertex_count as usize);
+        assert_eq!(mesh.indices.len(), mesh.triangle_count as usize * 3);
+        assert_eq!(mesh.bone_index.len(), mesh.vertex_count as usize);
+        assert_eq!(mesh.bone_fraction.len(), mesh.vertex_count as usize);
+
+        // All floats finite; radii positive.
+        for &x in mesh.positions.iter().chain(&mesh.normals).chain(&mesh.uvs).chain(&mesh.ao).chain(&mesh.radii) {
+            assert!(x.is_finite(), "non-finite float after twig cull");
+        }
+        for &r in &mesh.radii {
+            assert!(r > 0.0, "radius must be positive after twig cull");
+        }
+
+        // Indices in range against the culled vertex count.
+        for &idx in &mesh.indices {
+            assert!(idx < mesh.vertex_count, "index {idx} out of range {}", mesh.vertex_count);
+        }
+
+        // Bone hierarchy is UNAFFECTED by the cull (built for all chains).
+        assert_eq!(mesh.bones_wind, base.bones_wind, "cull must not change wind bones");
+        assert_eq!(mesh.node_to_bone, base.node_to_bone, "cull must not change node_to_bone");
+        // Per-vertex bone index still valid against the (unchanged) bone count.
+        let bc = mesh.bones_wind.len();
+        for &bi in &mesh.bone_index {
+            assert!(bi.is_finite() && bi >= 0.0 && (bi as usize) < bc, "bone_index {bi} out of range {bc}");
+        }
+        for &bf in &mesh.bone_fraction {
+            assert!(bf.is_finite() && (0.0..=1.0).contains(&bf), "bone_fraction {bf} not in [0,1]");
+        }
+
+        // Deterministic on the NEW culled path: same graph + opts → identical buffers.
+        let mesh2 = build_branch_mesh_with(&resolved.graph, opts);
+        assert_eq!(mesh, mesh2, "twig-culled build_branch_mesh is not deterministic");
+        let resolved2 = resolve(&genome, &env);
+        let mesh3 = build_branch_mesh_with(&resolved2.graph, opts);
+        assert_eq!(mesh, mesh3, "twig-culled mesh differs across identical resolves");
     }
 
     #[test]
