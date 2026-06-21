@@ -35,6 +35,7 @@
 
 pub mod globe;
 pub mod first_person;
+pub mod third_person;
 pub mod surface_picker;
 pub mod nav_mode;
 
@@ -45,6 +46,8 @@ pub mod nav_mode;
 pub use globe::{GlobeControls, spherical_to_cartesian, cartesian_to_spherical, PLANET_RADIUS};
 #[allow(unused_imports)]
 pub use first_person::{FirstPersonController, MoveInput, SPRINT_MULTIPLIER};
+#[allow(unused_imports)]
+pub use third_person::{ThirdPersonController, View};
 #[allow(unused_imports)]
 pub use surface_picker::{SurfaceHit, pick, camera_ray};
 #[allow(unused_imports)]

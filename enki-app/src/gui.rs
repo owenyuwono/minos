@@ -65,8 +65,8 @@ pub struct UiOutput {
     pub wave_foam: f32,
     /// Cycle nav mode (same as Tab).
     pub cycle_nav: bool,
-    /// Exit first-person (same as Esc).
-    pub exit_first_person: bool,
+    /// Exit the surface walker back to orbit (same as Esc).
+    pub exit_surface: bool,
     /// User dismissed the load-stats popup this frame.
     pub dismiss_load_stats: bool,
 }
@@ -194,7 +194,7 @@ impl EguiState {
             wave_choppiness,
             wave_foam,
             cycle_nav: false,
-            exit_first_person: false,
+            exit_surface: false,
             dismiss_load_stats: false,
         };
 
@@ -214,10 +214,10 @@ impl EguiState {
                             if ui.button("Cycle mode").clicked() {
                                 out.cycle_nav = true;
                             }
-                            if nav_mode == NavMode::FirstPerson
-                                && ui.button("Exit first-person").clicked()
+                            if nav_mode == NavMode::Surface
+                                && ui.button("Exit to orbit").clicked()
                             {
-                                out.exit_first_person = true;
+                                out.exit_surface = true;
                             }
                         });
                     });
@@ -250,6 +250,11 @@ impl EguiState {
                             ui.selectable_value(&mut out.view_mode, 8, "Material");
                             ui.selectable_value(&mut out.view_mode, 9, "Wetness");
                             ui.selectable_value(&mut out.view_mode, 10, "Volcano");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Ocean:");
+                            ui.selectable_value(&mut out.view_mode, 11, "Surface");
+                            ui.selectable_value(&mut out.view_mode, 12, "Intensity");
                         });
                         ui.checkbox(&mut out.wireframe, "Wireframe");
                         ui.checkbox(&mut out.taa, "TAA (temporal AA)");
@@ -313,7 +318,8 @@ impl EguiState {
                         ui.label("[M] cycle material");
                         ui.label("[W] toggle wireframe");
                         ui.label("[Tab] cycle nav mode");
-                        ui.label("[Esc] exit first-person");
+                        ui.label("[V] 1st/3rd-person (surface)");
+                        ui.label("[Esc] exit to orbit");
                     });
                 });
 

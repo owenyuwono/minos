@@ -65,6 +65,15 @@ pub struct LeafGenes {
 /// `LEAF_NORMAL_STRENGTH` (leafTexture.js:965).
 const LEAF_NORMAL_STRENGTH: f32 = 2.5;
 
+/// ponytail: x_scale baked into the SINGLE-leaf sprite. dryad forces x_scale=1
+/// there (width moved to the card aspect), but at x_scale=1 the height-normalized
+/// superformula outline is a thin spike (normalized half-width ≈0.12 of height),
+/// which reads as a blade, not a leaf. A broad fixed x_scale shapes the single
+/// sprite into a recognizable ovate; the per-tree width gene still varies render
+/// width via the card's widthFactor on the mesh side (it does NOT re-bake here).
+/// Chosen so the leaf's pixel width ≈ 0.45 × its height (a typical broadleaf).
+const SINGLE_SPRITE_X_SCALE: f64 = 3.8;
+
 // ── superformula outline (leafTexture.js:44-156) ────────────────────────────
 
 #[derive(Clone, Copy)]
@@ -768,14 +777,21 @@ pub fn bake_leaf_single(g: &LeafGenes) -> LeafTexture {
     let size = LEAF_TEX_SIZE as usize;
     let mut canvas = Canvas::new(size);
 
-    // Single sprite is shape-only: x_scale forced to 1 (leafTexture.js:874) so
-    // leaf_width isn't baked twice (the card aspect / mesh scale carries width).
+    // Single sprite is shape-only: leaf_width isn't baked here (the card aspect /
+    // mesh scale carries width). dryad forces x_scale=1, but at x_scale=1 the
+    // height-normalized outline is intrinsically NARROW (normalized half-width
+    // ≈0.12 of height at default genes) → a thin blade. ponytail: bake the single
+    // sprite at a BROAD fixed x_scale so the silhouette reads as a proper ovate
+    // leaf; the per-tree width gene still varies on the card's widthFactor (mesh
+    // side), so this only sets the sprite's intrinsic broad shape, not the
+    // rendered width. axial_stretch still controls pointier/blunter.
     let mut bp = leaf_base_params(g);
-    bp.x_scale = 1.0;
+    bp.x_scale = SINGLE_SPRITE_X_SCALE;
     let outline = superformula_outline(&bp, 160); // 160 steps (vs 120 for cluster)
 
     // Fit the leaf to fill the card: leaf_h bounded by BOTH height AND width so a
-    // broad leaf doesn't clip the sprite edges (leafTexture.js:879-884).
+    // broad leaf doesn't clip the sprite edges (leafTexture.js:879-884). With the
+    // broad SINGLE_SPRITE_X_SCALE above the width bound now actually engages.
     let (mut min_x, mut max_x) = (f64::INFINITY, f64::NEG_INFINITY);
     for p in &outline {
         if p.x < min_x {
@@ -785,7 +801,7 @@ pub fn bake_leaf_single(g: &LeafGenes) -> LeafTexture {
             max_x = p.x;
         }
     }
-    let w_extent = (max_x - min_x).max(0.02);
+    let w_extent = (max_x - min_x).max(0.02); // outline y is already 0..1
     let leaf_h = (size as f64 * 0.92).min((size as f64 * 0.92) / (w_extent * 0.5));
     let cx = size as f64 / 2.0;
     let cy = size as f64 - size as f64 * 0.05; // base near the bottom edge
@@ -900,6 +916,100 @@ mod tests {
         }
         assert!(saw_zero, "expected fully-transparent background texels");
         assert!(saw_full, "expected fully-opaque leaf-body texels");
+    }
+
+    // ── Diagnostic sprite dump (ponytail) ───────────────────────────────────
+    // Writes the baked SINGLE + CLUSTER color sprites to PNGs so the leaf shape
+    // can be inspected visually (the screenshots can't show the sprite alone).
+    // Uses TREE_DEFAULT leaf genes (the no-FLORA_SEED viewer default), so the
+    // dumped sprite is exactly what the screenshots render. No `image` crate —
+    // a tiny self-contained PNG writer (stored zlib blocks + CRC) keeps the
+    // dep-free `enki-flora` clean. Run explicitly:
+    //   cargo test -p enki-flora dump_leaf_sprites -- --ignored --nocapture
+
+    /// CRC-32 (IEEE) — for PNG chunk CRCs and the zlib Adler trailer's sibling.
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc: u32 = 0xFFFF_FFFF;
+        for &b in bytes {
+            crc ^= b as u32;
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            }
+        }
+        !crc
+    }
+
+    /// Adler-32 over the raw (uncompressed) zlib payload.
+    fn adler32(bytes: &[u8]) -> u32 {
+        let (mut a, mut b): (u32, u32) = (1, 0);
+        for &x in bytes {
+            a = (a + x as u32) % 65521;
+            b = (b + a) % 65521;
+        }
+        (b << 16) | a
+    }
+
+    fn png_chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let mut crc_in = Vec::with_capacity(4 + data.len());
+        crc_in.extend_from_slice(kind);
+        crc_in.extend_from_slice(data);
+        out.extend_from_slice(&crc32(&crc_in).to_be_bytes());
+    }
+
+    /// Encode RGBA8 `px` (size×size) as a PNG using only stored zlib blocks.
+    fn encode_png(px: &[u8], size: u32) -> Vec<u8> {
+        // Raw scanlines: each row prefixed with filter byte 0 (None).
+        let w = size as usize;
+        let mut raw = Vec::with_capacity((w * 4 + 1) * w);
+        for y in 0..w {
+            raw.push(0u8);
+            raw.extend_from_slice(&px[y * w * 4..(y + 1) * w * 4]);
+        }
+        // zlib stream: 0x78 0x01 header, stored deflate blocks, adler trailer.
+        let mut z = vec![0x78u8, 0x01];
+        let mut i = 0usize;
+        while i < raw.len() {
+            let chunk = (raw.len() - i).min(65535);
+            let last = if i + chunk >= raw.len() { 1u8 } else { 0u8 };
+            z.push(last); // BFINAL, BTYPE=00 (stored)
+            z.extend_from_slice(&(chunk as u16).to_le_bytes());
+            z.extend_from_slice(&(!(chunk as u16)).to_le_bytes());
+            z.extend_from_slice(&raw[i..i + chunk]);
+            i += chunk;
+        }
+        z.extend_from_slice(&adler32(&raw).to_be_bytes());
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        let mut ihdr = Vec::with_capacity(13);
+        ihdr.extend_from_slice(&size.to_be_bytes());
+        ihdr.extend_from_slice(&size.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]); // 8-bit, RGBA, deflate, no filter, no interlace
+        png_chunk(&mut out, b"IHDR", &ihdr);
+        png_chunk(&mut out, b"IDAT", &z);
+        png_chunk(&mut out, b"IEND", &[]);
+        out
+    }
+
+    #[test]
+    #[ignore = "diagnostic: writes PNGs to disk; run with --ignored"]
+    fn dump_leaf_sprites() {
+        let g = default_genes(0); // TREE_DEFAULT leaf genes (seed unused by single)
+        let single = bake_leaf_single(&g);
+        let cluster = bake_leaf_cluster(&g);
+        let base = r"C:\Work\Prototype\enki";
+        let single_path = format!(r"{base}\flora_leaf_single_sprite.png");
+        let cluster_path = format!(r"{base}\flora_leaf_cluster_sprite.png");
+        std::fs::write(&single_path, encode_png(&single.color, single.size))
+            .expect("write single sprite PNG");
+        std::fs::write(&cluster_path, encode_png(&cluster.color, cluster.size))
+            .expect("write cluster sprite PNG");
+        eprintln!("wrote {single_path}");
+        eprintln!("wrote {cluster_path}");
     }
 
     #[test]

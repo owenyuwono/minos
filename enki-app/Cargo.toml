@@ -55,5 +55,8 @@ env_logger = "0.11.10"
 glam = "0.33.1"
 log = "0.4.32"
 lru = "0.12"
+# Optimized FFT for the spectral ocean — lets the CPU sim run at poseidon's
+# N=256 × 3 cascades (the hand-rolled radix-2 was only viable at N≤64).
+rustfft = "6"
 raw-window-handle = "0.6"
 winit = "0.30"

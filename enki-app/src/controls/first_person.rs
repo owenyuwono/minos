@@ -111,7 +111,7 @@ impl FirstPersonController {
     /// ponytail: radial up only — the player rides terrain *height*, not its slope/tilt.
     /// Add a slope-aligned frame if walking up steep faces needs to feel grounded.
     fn surface_radius_at(&self, dir: DVec3) -> f64 {
-        self.base_radius + self.hf.height(dir, 0) * self.height_scale
+        surface_radius(self.hf.as_ref(), self.base_radius, self.height_scale, dir)
     }
 
     /// Mouse-look: yaw in the tangent plane, pitch clamped to ±85°.
@@ -226,9 +226,22 @@ impl FirstPersonController {
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
+/// Terrain surface radius (m) along unit `dir`, matching the rendered bake
+/// (level 0). The single source of the feet-on-ground invariant — both the
+/// first-person and third-person walkers ride this so they never drift from
+/// the visible terrain. `dir` must be unit length.
+pub(crate) fn surface_radius(
+    hf: &dyn HeightField,
+    base_radius: f64,
+    height_scale: f64,
+    dir: DVec3,
+) -> f64 {
+    base_radius + hf.height(dir, 0) * height_scale
+}
+
 /// Project `v` onto the tangent plane defined by unit normal `up`, then
 /// normalise.  Falls back to a safe perpendicular to `up` if degenerate.
-fn project_onto_tangent_plane(v: Vec3, up: Vec3) -> Vec3 {
+pub(crate) fn project_onto_tangent_plane(v: Vec3, up: Vec3) -> Vec3 {
     let projected = v - up * v.dot(up);
     if projected.length_squared() < 1e-10 {
         // v was parallel to up — pick an arbitrary perpendicular

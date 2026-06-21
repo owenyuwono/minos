@@ -642,6 +642,9 @@ pub struct Resolved {
     pub rib_count: u32,
     pub light_flux: f64,
     pub woodiness: f64,
+    /// Willow droop gene (genome.weep, [0,1]). Drives the per-leaf gravity-droop
+    /// scale + the canopy-normal lighting blend (dryad uWeep). 0 = no extra droop.
+    pub weep: f64,
 }
 
 /// Pure render-data pipeline from a genome + env — port of dryad `resolve`.
@@ -712,6 +715,7 @@ pub fn resolve(genome: &Genome, env: &Env) -> Resolved {
         rib_count,
         light_flux: env.light,
         woodiness: genome.woodiness,
+        weep: genome.weep,
     }
 }
 

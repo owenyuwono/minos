@@ -16,6 +16,11 @@ pub mod fft;
 pub mod sim;
 pub mod spectrum;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Instant;
+
 use bytemuck::{cast_slice, Pod, Zeroable};
 use enki_render::{
     frame::FrameUniforms, geometry::placeholder_sphere, material::ChunkPush,
@@ -120,10 +125,16 @@ fn shell_scale(base_radius: f64, sea_level_m: f64) -> f32 {
 const GRID_RES: u32 = 400;
 /// Half-extent of the wave patch in metres (covers the near field + horizon at low altitude).
 const PATCH_HALF: f32 = 4000.0;
-/// FFT resolution (CPU cost ∝ N²·logN per frame).
-const FFT_N: usize = 128;
+/// FFT resolution per cascade (power of two) — matches poseidon's N=256.
+/// Affordable at 3 cascades thanks to the rustfft backend.
+const FFT_N: usize = 256;
+/// Number of FFT cascades (disjoint wavenumber bands → no visible tiling).
+const N_CASCADES: usize = 3;
+/// Per-cascade world tile sizes (m) — poseidon's [250,17,5] for cm-scale ripple
+/// detail; tiling is broken by the domain warp + world-anchored amplitude field.
+const LENGTH_SCALES: [f32; 3] = [250.0, 17.0, 5.0];
 
-/// GPU mirror of `ocean_surface.wgsl`'s `Ocean` uniform (std140, all vec4 → 192 B).
+/// GPU mirror of `ocean_surface.wgsl`'s `Ocean` uniform (std140, all vec4).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct OceanParamsGpu {
@@ -131,7 +142,10 @@ struct OceanParamsGpu {
     north:         [f32; 4],
     up:            [f32; 4],
     sub_point_rel: [f32; 4], // xyz + sea_radius
-    cfg:           [f32; 4], // length_scale, patch_half, fft_n, fade_start
+    cfg:           [f32; 4], // patch_half, fft_n, fade_start, cascade_count
+    scales:        [f32; 4], // per-cascade tile sizes (x,y,z = 3 cascades)
+    amp:           [f32; 4], // noise_freq, amp_lo, amp_hi, debug_intensity
+    depth_params:  [f32; 4], // near, far, extinction, deep_darkness
     deep_color:    [f32; 4],
     scatter_color: [f32; 4],
     foam_color:    [f32; 4],
@@ -140,6 +154,7 @@ struct OceanParamsGpu {
     sun_color:     [f32; 4],
     shading:       [f32; 4], // sss, foam_threshold, foam_scale, alpha
     screen:        [f32; 4], // width, height, refract_strength, deep_tint
+    shell_model:   [[f32; 4]; 4], // vs_shell camera-relative + sea scale
 }
 
 /// Per-frame-in-flight GPU resources for the wave surface.
@@ -150,16 +165,35 @@ struct WaveFrame {
     set:       vk::DescriptorSet,
 }
 
-/// Camera-anchored FFT wave surface.
+/// Unified refractive ocean: a smooth sea-level shell sphere (far/orbit) + the
+/// camera-anchored FFT wave patch (near), both sharing refraction + depth color.
 pub struct WaveSurface {
-    pipeline:  PipelineHandle,
+    pipeline:  PipelineHandle,        // wave patch (vs_main)
+    shell_pipeline: PipelineHandle,   // shell sphere (vs_shell)
     layout:    vk::PipelineLayout,
     grid_pos:  BufferHandle,
     grid_idx:  BufferHandle,
     idx_count: u32,
-    sim: OceanSim,
-    /// Live-tunable wave params (GUI).
+    shell_pos: BufferHandle,
+    shell_nrm: BufferHandle,
+    shell_idx: BufferHandle,
+    shell_count: u32,
+    // ── Background FFT worker (keeps the heavy N=256×3 sim off the render thread) ──
+    /// Latest completed field, written by the worker, copied to the GPU each frame.
+    latest:        Arc<Mutex<Vec<OceanTexel>>>,
+    /// Live params handed to the worker.
+    shared_params: Arc<Mutex<WaveParams>>,
+    /// Whether the worker should be stepping (false → it idles near the surface only).
+    active:        Arc<AtomicBool>,
+    /// Worker run flag (cleared on drop to join it).
+    running:       Arc<AtomicBool>,
+    worker:        Option<JoinHandle<()>>,
+    length_scales: Vec<f32>,
+    cascade_count: usize,
+    /// Live-tunable wave params (GUI); pushed to the worker each frame.
     pub params: WaveParams,
+    /// Debug view: heat-map the spatial wave intensity instead of shading water.
+    pub debug_intensity: bool,
     frames: Vec<WaveFrame>,
     base_radius: f64,
 }
@@ -185,49 +219,110 @@ impl WaveSurface {
             BindingDesc { binding: 2, ty: vk::DescriptorType::UNIFORM_BUFFER, stages },
             BindingDesc { binding: 3, ty: vk::DescriptorType::SAMPLED_IMAGE, stages: frag },
             BindingDesc { binding: 4, ty: vk::DescriptorType::SAMPLER, stages: frag },
+            BindingDesc { binding: 5, ty: vk::DescriptorType::SAMPLED_IMAGE, stages: frag },
         ])?;
         let sampler = rhi.create_sampler()?;
 
         let shader = rhi.create_shader_module(OCEAN_SURFACE_WGSL)?;
-        // The water draws into the TAA 1× `current` target (the refraction split), so
-        // it is single-sample and OPAQUE (refraction carries the see-through).
-        let pipeline = rhi.create_graphics_pipeline(&GraphicsPipelineDesc {
+        // Draws into the TAA 1× `current` target (the refraction split): single-sample,
+        // blend ON so depth-write is OFF (the shell must not occlude wave troughs; the
+        // shader outputs alpha 1 → opaque). Wave (vs_main) over shell (vs_shell).
+        let desc = |vs: &'static str| GraphicsPipelineDesc {
             shader,
-            vs_entry:           "vs_main",
+            vs_entry:           vs,
             fs_entry:           "fs_main",
             push_constant_size: 0,
             set0_layout:        layout_handle,
             color_format,
             depth_format:       vk::Format::D32_SFLOAT,
             samples:            vk::SampleCountFlags::TYPE_1,
-            blend:              false,
+            blend:              true,
             fill:               true,
-        })?;
+        };
+        let pipeline = rhi.create_graphics_pipeline(&desc("vs_main"))?;
+        let shell_pipeline = rhi.create_graphics_pipeline(&desc("vs_shell"))?;
         rhi.destroy_shader_module(shader);
         let layout = rhi.pipeline_layout(pipeline)?;
 
-        // ── Spectral sim (single cascade for now) ────────────────────────────────
-        let cascade = CascadeParams {
-            n: FFT_N,
-            length_scale: 250.0,
-            cutoff_low: 1e-4,
-            cutoff_high: 9999.0,
-            g: 9.81,
-            depth: 500.0,
-            local: Spectrum {
-                scale: 1.0, wind_speed: 16.0, wind_dir_rad: 45f32.to_radians(),
-                fetch: 100_000.0, spread_blend: 1.0, swell: 0.2, gamma: 3.3, short_waves_fade: 0.02,
-            },
-            swell: Spectrum {
-                scale: 0.8, wind_speed: 2.0, wind_dir_rad: 70f32.to_radians(),
-                fetch: 300_000.0, spread_blend: 1.0, swell: 1.0, gamma: 3.3, short_waves_fade: 0.01,
-            },
+        // ── Shell sphere (smooth sea-level surface) ──────────────────────────────
+        let shell_mesh = placeholder_sphere(base_radius as f32, 96);
+        let mut shell_indices = shell_mesh.indices.clone();
+        for tri in shell_indices.chunks_exact_mut(3) { tri.swap(0, 2); } // near hemisphere faces camera
+        let shell_pos = rhi.create_vertex_buffer(cast_slice(&shell_mesh.positions))?;
+        let shell_nrm = rhi.create_vertex_buffer(cast_slice(&shell_mesh.normals))?;
+        let shell_idx = rhi.create_index_buffer(&shell_indices)?;
+        let shell_count = shell_indices.len() as u32;
+
+        // ── Spectral sim: 3 cascades over disjoint wavenumber bands ──────────────
+        // Each cascade carries one band (boundary = 2π/L · factor); overlaid at
+        // different world tile sizes they hide the single-tile repetition.
+        let boundary_factor = 6.0;
+        let boundary = |i: usize| (2.0 * std::f32::consts::PI / LENGTH_SCALES[i]) * boundary_factor;
+        let cascades: Vec<CascadeParams> = (0..N_CASCADES)
+            .map(|i| {
+                let cutoff_low = if i == 0 { 1e-4 } else { boundary(i) };
+                let cutoff_high = if i + 1 < N_CASCADES { boundary(i + 1) } else { 9999.0 };
+                CascadeParams {
+                    n: FFT_N,
+                    length_scale: LENGTH_SCALES[i],
+                    cutoff_low,
+                    cutoff_high,
+                    g: 9.81,
+                    depth: 500.0,
+                    local: Spectrum {
+                        scale: 1.0, wind_speed: 16.0, wind_dir_rad: 45f32.to_radians(),
+                        fetch: 100_000.0, spread_blend: 1.0, swell: 0.2, gamma: 3.3, short_waves_fade: 0.02,
+                    },
+                    swell: Spectrum {
+                        scale: 0.8, wind_speed: 2.0, wind_dir_rad: 70f32.to_radians(),
+                        fetch: 300_000.0, spread_blend: 1.0, swell: 1.0, gamma: 3.3, short_waves_fade: 0.01,
+                    },
+                }
+            })
+            .collect();
+        let sim = OceanSim::new(&cascades, 1337);
+        let length_scales = sim.length_scales();
+        let cascade_count = sim.cascade_count();
+
+        // ── Background sim worker ────────────────────────────────────────────────
+        // N=256 × 3 cascades is too heavy for the render thread (esp. debug builds),
+        // so the FFT runs here and double-buffers its result into `latest`.
+        let latest = Arc::new(Mutex::new(vec![OceanTexel::zeroed(); FFT_N * FFT_N * N_CASCADES]));
+        let shared_params = Arc::new(Mutex::new(WaveParams::default()));
+        let active = Arc::new(AtomicBool::new(false));
+        let running = Arc::new(AtomicBool::new(true));
+        let worker = {
+            let (latest, shared_params, active, running) =
+                (Arc::clone(&latest), Arc::clone(&shared_params), Arc::clone(&active), Arc::clone(&running));
+            let mut sim = sim;
+            std::thread::Builder::new()
+                .name("ocean-fft".into())
+                .spawn(move || {
+                    let start = Instant::now();
+                    let mut last = start;
+                    while running.load(Ordering::Relaxed) {
+                        if !active.load(Ordering::Relaxed) {
+                            std::thread::sleep(std::time::Duration::from_millis(40));
+                            last = Instant::now();
+                            continue;
+                        }
+                        let now = Instant::now();
+                        let t = now.duration_since(start).as_secs_f32();
+                        let dt = now.duration_since(last).as_secs_f32().min(0.1);
+                        last = now;
+                        let wp = *shared_params.lock().unwrap();
+                        let field = sim.step(t, dt, &wp);
+                        if let Ok(mut slot) = latest.lock() {
+                            slot.copy_from_slice(field);
+                        }
+                    }
+                })
+                .expect("spawn ocean-fft worker")
         };
-        let sim = OceanSim::new(&[cascade], 1337);
 
         // ── Per-frame-in-flight buffers + descriptor sets ────────────────────────
         let fif = rhi.frames_in_flight();
-        let field_size = (FFT_N * FFT_N * std::mem::size_of::<OceanTexel>()) as u64;
+        let field_size = (FFT_N * FFT_N * N_CASCADES * std::mem::size_of::<OceanTexel>()) as u64;
         let mut frames = Vec::with_capacity(fif);
         for _ in 0..fif {
             let frame_ubo = rhi.create_gpu_buffer(
@@ -247,72 +342,107 @@ impl WaveSurface {
         }
 
         Ok(Self {
-            pipeline, layout, grid_pos, grid_idx, idx_count: indices.len() as u32,
-            sim, params: WaveParams::default(), frames, base_radius,
+            pipeline, shell_pipeline, layout, grid_pos, grid_idx, idx_count: indices.len() as u32,
+            shell_pos, shell_nrm, shell_idx, shell_count,
+            latest, shared_params, active, running, worker: Some(worker),
+            length_scales, cascade_count,
+            params: WaveParams::default(), debug_intensity: false, frames, base_radius,
         })
     }
 
-    /// Step the spectral sim + upload + draw the wave patch. Call after all opaque
-    /// geometry, inside the open rendering instance.
+    /// Draw the refractive ocean: the shell sphere always, plus the FFT wave patch
+    /// when `draw_waves` (near the surface). Call after `begin_water_pass`, inside the
+    /// reopened 1× instance, sampling the resolved opaque `scene_view` + `scene_depth`.
     #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
-        rhi:         &mut Rhi,
-        fi:          u32,
-        fu:          &FrameUniforms,
-        camera_pos:  DVec3,
-        sea_level_m: f64,
-        time:        f32,
-        dt:          f32,
-        scene_view:  vk::ImageView,
-        extent:      (u32, u32),
+        rhi:          &mut Rhi,
+        fi:           u32,
+        fu:           &FrameUniforms,
+        camera_pos:   DVec3,
+        sea_level_m:  f64,
+        scene_view:   vk::ImageView,
+        scene_depth:  vk::ImageView,
+        extent:       (u32, u32),
+        draw_waves:   bool,
     ) -> Result<(), RhiError> {
+        // Drive the background worker: hand it the live params + whether to step.
+        *self.shared_params.lock().unwrap() = self.params;
+        self.active.store(draw_waves, Ordering::Relaxed);
+
         let f = &self.frames[fi as usize];
+        let read = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
 
-        // Point the refraction binding at this frame's resolved opaque scene.
-        rhi.write_sampled_image_binding(f.set, 3, scene_view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        // Point the refraction bindings at this frame's resolved opaque scene.
+        rhi.write_sampled_image_binding(f.set, 3, scene_view, read);
+        rhi.write_sampled_image_binding(f.set, 5, scene_depth, read);
 
-        // 1. CPU spectral step → upload field.
-        let field = self.sim.step(time, dt, &self.params);
-        rhi.write_storage_bytes(f.field_buf, cast_slice(field))?;
-
-        // 2. Frame uniforms (view_proj + sun) — copy verbatim.
+        // Upload the worker's latest field (only when the waves are drawn).
+        if draw_waves {
+            let slot = self.latest.lock().unwrap();
+            rhi.write_storage_bytes(f.field_buf, cast_slice(&slot))?;
+        }
         rhi.write_storage_bytes(f.frame_ubo, bytemuck::bytes_of(fu))?;
 
-        // 3. Ocean params: tangent frame at the sub-camera point (camera-relative).
+        // Tangent frame at the sub-camera point + the shell's camera-relative model.
         let sea_radius = self.base_radius + sea_level_m;
         let up = camera_pos.normalize();
-        let sub_point = up * sea_radius;
-        let sub_rel = (sub_point - camera_pos).as_vec3();
+        let sub_rel = (up * sea_radius - camera_pos).as_vec3();
         let ref_axis = if up.y.abs() < 0.99 { DVec3::Y } else { DVec3::X };
         let east = ref_axis.cross(up).normalize().as_vec3();
         let north = up.cross(east.as_dvec3()).normalize().as_vec3();
         let up = up.as_vec3();
+        let shell_scale = (sea_radius / self.base_radius) as f32;
+        let shell_model =
+            ChunkPush::camera_relative(DVec3::ZERO, camera_pos, Mat4::from_scale(Vec3::splat(shell_scale)), 0).model;
 
+        let s = &self.length_scales;
         let params = OceanParamsGpu {
             east:          [east.x, east.y, east.z, 0.0],
             north:         [north.x, north.y, north.z, 0.0],
             up:            [up.x, up.y, up.z, 0.0],
             sub_point_rel: [sub_rel.x, sub_rel.y, sub_rel.z, sea_radius as f32],
-            cfg:           [self.sim.length_scale(), PATCH_HALF, FFT_N as f32, 0.75],
-            deep_color:    srgb_lin(0x07, 0x1a, 0x26),
-            scatter_color: srgb_lin(0x2e, 0x8f, 0x8f),
+            cfg:           [PATCH_HALF, FFT_N as f32, 0.75, self.cascade_count as f32],
+            scales:        [s[0], s.get(1).copied().unwrap_or(0.0), s.get(2).copied().unwrap_or(0.0), 0.0],
+            amp:           [9.0, 0.25, 1.6, if self.debug_intensity { 1.0 } else { 0.0 }],
+            // near, far (globe camera), extinction (1/m), clarity (seabed visibility).
+            depth_params:  [0.5, 750_000.0, 0.003, 0.6],
+            deep_color:    srgb_lin(0x12, 0x44, 0x66), // deep ocean blue (not black)
+            scatter_color: srgb_lin(0x36, 0xa6, 0x9c), // shallow teal
             foam_color:    srgb_lin(0xdc, 0xe7, 0xea),
             sky_horizon:   srgb_lin(0x9f, 0xb8, 0xcc),
             sky_zenith:    srgb_lin(0x2a, 0x5b, 0x9c),
             sun_color:     srgb_lin(0xff, 0xf1, 0xdc),
             shading:       [1.0, self.params.foam_threshold, 2.5, 0.92],
             screen:        [extent.0 as f32, extent.1 as f32, 0.05, 0.55],
+            shell_model,
         };
         rhi.write_storage_bytes(f.ocean_ubo, bytemuck::bytes_of(&params))?;
 
-        // 4. Draw — custom set 0 (no rhi ring), reuse the 4×vec3 layout (grid in all).
-        rhi.cmd_bind_pipeline(fi, vk::PipelineBindPoint::GRAPHICS, self.pipeline)?;
         rhi.cmd_bind_descriptor_set(fi, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, f.set);
-        rhi.bind_vertex_buffers(fi, &[self.grid_pos, self.grid_pos, self.grid_pos, self.grid_pos])?;
-        rhi.bind_index_buffer(fi, self.grid_idx)?;
-        rhi.draw_indexed(fi, self.idx_count);
+
+        // Shell first (fills the ocean disk at sea level), then waves over the patch.
+        rhi.cmd_bind_pipeline(fi, vk::PipelineBindPoint::GRAPHICS, self.shell_pipeline)?;
+        rhi.bind_vertex_buffers(fi, &[self.shell_pos, self.shell_nrm, self.shell_nrm, self.shell_nrm])?;
+        rhi.bind_index_buffer(fi, self.shell_idx)?;
+        rhi.draw_indexed(fi, self.shell_count);
+
+        if draw_waves {
+            rhi.cmd_bind_pipeline(fi, vk::PipelineBindPoint::GRAPHICS, self.pipeline)?;
+            rhi.bind_vertex_buffers(fi, &[self.grid_pos, self.grid_pos, self.grid_pos, self.grid_pos])?;
+            rhi.bind_index_buffer(fi, self.grid_idx)?;
+            rhi.draw_indexed(fi, self.idx_count);
+        }
         Ok(())
+    }
+}
+
+impl Drop for WaveSurface {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -375,7 +505,7 @@ mod tests {
 
     #[test]
     fn ocean_params_is_std140_sized() {
-        // 13 × vec4 = 208 bytes (std140-friendly).
-        assert_eq!(std::mem::size_of::<OceanParamsGpu>(), 208);
+        // 16 × vec4 + mat4 (4 vec4) = 320 bytes (std140-friendly).
+        assert_eq!(std::mem::size_of::<OceanParamsGpu>(), 320);
     }
 }

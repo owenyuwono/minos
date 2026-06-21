@@ -88,6 +88,8 @@ pub enum FloraPipeline {
     Ground,
     Sky,
     Shadow,
+    /// Wind-direction debug gizmo (unlit solid-color arrow). Uses `ArrowPush`.
+    Arrow,
     BranchDepth,
     LeafDepth,
 }
@@ -258,6 +260,7 @@ pub struct FloraRenderer {
     ground: OwnedPipeline,
     sky: OwnedPipeline,
     shadow: OwnedPipeline,
+    arrow: OwnedPipeline,
     branch_depth: OwnedPipeline,
     leaf_depth: OwnedPipeline,
 
@@ -425,6 +428,12 @@ impl FloraRenderer {
         // Shadow disc is alpha-blended (blend:true → depth-write OFF), same as the
         // old staging shadow pipeline.
         let shadow = mk(staging_module, "vs_shadow", "fs_shadow", true, true, true)?;
+        // ARROW gizmo: unlit, OPAQUE (writes depth), CULL-NONE so the thin shaft
+        // box reads from any orbit angle. Depth-tested against ground+tree.
+        let arrow = build_pipeline_culled(
+            &device, pipeline_layout, staging_module, "vs_arrow", "fs_arrow",
+            color_format, samples, false, true, true, vk::CullModeFlags::NONE,
+        )?;
 
         // ── DEPTH CASTER pipelines: depth-only (no color attachment), single
         //    sample (the shadow map is 1×), reversed-Z GREATER depth-write ON.
@@ -638,6 +647,7 @@ impl FloraRenderer {
             ground,
             sky,
             shadow,
+            arrow,
             branch_depth,
             leaf_depth,
             pool,
@@ -1533,6 +1543,7 @@ impl FloraRenderer {
             FloraPipeline::Ground => &self.ground,
             FloraPipeline::Sky => &self.sky,
             FloraPipeline::Shadow => &self.shadow,
+            FloraPipeline::Arrow => &self.arrow,
             FloraPipeline::BranchDepth => &self.branch_depth,
             FloraPipeline::LeafDepth => &self.leaf_depth,
         }
@@ -1552,6 +1563,7 @@ impl FloraRenderer {
                 &self.ground,
                 &self.sky,
                 &self.shadow,
+                &self.arrow,
                 &self.branch_depth,
                 &self.leaf_depth,
             ] {

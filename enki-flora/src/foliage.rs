@@ -110,6 +110,14 @@ pub struct FoliageSoA {
     pub exposure: Vec<f32>,  // count
     pub bone_index: Vec<f32>, // count (always 0 — no nodeToBone in resolve)
     pub shape: f32,          // = appendageBreadth
+    // --- Render-side metadata (NOT part of resolve()/golden comparison) ---
+    // These carry the source-node identity for each anchor so the viewer can
+    // restrict leaves to fine twigs and re-seat the leaf base on the wood
+    // surface. They add no rng draws and do not affect count/position/scale/
+    // rotation/shape, so `golden_vector_matches_dryad` is unaffected.
+    pub source_radius: Vec<f32>,       // count — mid_radius (wood surface radius) at the anchor
+    pub source_branch_level: Vec<f32>, // count — node.branch_level
+    pub source_is_terminal: Vec<f32>,  // count — 1.0 if source node is_terminal else 0.0
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +230,10 @@ pub fn generate_foliage(graph: &Graph, genome: &Genome) -> FoliageSoA {
     let mut age_color: Vec<f32> = Vec::new();
     let mut exposure: Vec<f32> = Vec::new();
     let mut bone_index: Vec<f32> = Vec::new();
+    // Render-side metadata (see FoliageSoA docs) — not compared by golden.
+    let mut source_radius: Vec<f32> = Vec::new();
+    let mut source_branch_level: Vec<f32> = Vec::new();
+    let mut source_is_terminal: Vec<f32> = Vec::new();
 
     // --- Genome genes ---
     let appendage_density = genome.appendage_density;
@@ -325,6 +337,10 @@ pub fn generate_foliage(graph: &Graph, genome: &Genome) -> FoliageSoA {
         age_color: &mut Vec<f32>,
         exposure: &mut Vec<f32>,
         bone_index: &mut Vec<f32>,
+        // Render-side metadata out (not compared by golden).
+        source_radius: &mut Vec<f32>,
+        source_branch_level: &mut Vec<f32>,
+        source_is_terminal: &mut Vec<f32>,
         count: &mut usize,
         rng: &mut Mulberry32,
         // params
@@ -334,6 +350,7 @@ pub fn generate_foliage(graph: &Graph, genome: &Genome) -> FoliageSoA {
         seg_len: f64,
         mid_radius: f64,
         node_branch_level: i32,
+        node_is_terminal: bool,
         t: f64,
         az_base: f64,
         k: usize,
@@ -448,6 +465,11 @@ pub fn generate_foliage(graph: &Graph, genome: &Genome) -> FoliageSoA {
         age_color.push(leaf_age as f32);
         exposure.push(exp_val as f32);
         bone_index.push(0.0); // no nodeToBone in resolve
+        // Render-side metadata: carry the wood-surface radius + source-node
+        // identity so the viewer can keep leaves on twigs and seat the base.
+        source_radius.push(mid_radius as f32);
+        source_branch_level.push(node_branch_level as f32);
+        source_is_terminal.push(if node_is_terminal { 1.0 } else { 0.0 });
         *count += 1;
     }
 
@@ -545,6 +567,9 @@ pub fn generate_foliage(graph: &Graph, genome: &Genome) -> FoliageSoA {
                 &mut age_color,
                 &mut exposure,
                 &mut bone_index,
+                &mut source_radius,
+                &mut source_branch_level,
+                &mut source_is_terminal,
                 &mut count,
                 &mut rng,
                 p_pos,
@@ -553,6 +578,7 @@ pub fn generate_foliage(graph: &Graph, genome: &Genome) -> FoliageSoA {
                 seg_len,
                 mid_radius,
                 node_branch_level,
+                node_is_terminal,
                 t_values[k],
                 az_base,
                 k,
@@ -625,6 +651,9 @@ pub fn generate_foliage(graph: &Graph, genome: &Genome) -> FoliageSoA {
                 &mut age_color,
                 &mut exposure,
                 &mut bone_index,
+                &mut source_radius,
+                &mut source_branch_level,
+                &mut source_is_terminal,
                 &mut count,
                 &mut rng,
                 p_pos,
@@ -633,6 +662,7 @@ pub fn generate_foliage(graph: &Graph, genome: &Genome) -> FoliageSoA {
                 seg_len,
                 mid_radius,
                 node_branch_level,
+                true, // apical pass runs only for terminal segments
                 t,
                 az_base,
                 idx,
@@ -686,6 +716,9 @@ pub fn generate_foliage(graph: &Graph, genome: &Genome) -> FoliageSoA {
             let parent_idx = s.parent_idx;
             let node_idx = s.node_idx;
             let node_branch_level = nodes[node_idx].branch_level;
+            let node_is_terminal = nodes[node_idx].is_terminal;
+            let spine_mid_radius =
+                (nodes[parent_idx].radius + nodes[node_idx].radius) * 0.5;
 
             let p_pos = nodes[parent_idx].pos;
             let n_pos = nodes[node_idx].pos;
@@ -754,6 +787,9 @@ pub fn generate_foliage(graph: &Graph, genome: &Genome) -> FoliageSoA {
                 age_color.push((node_branch_level as f64 / max_branch_level as f64) as f32);
                 exposure.push(exp_val as f32);
                 bone_index.push(0.0);
+                source_radius.push(spine_mid_radius as f32);
+                source_branch_level.push(node_branch_level as f32);
+                source_is_terminal.push(if node_is_terminal { 1.0 } else { 0.0 });
                 count += 1;
             }
         }
@@ -770,5 +806,8 @@ pub fn generate_foliage(graph: &Graph, genome: &Genome) -> FoliageSoA {
         exposure,
         bone_index,
         shape: appendage_breadth as f32,
+        source_radius,
+        source_branch_level,
+        source_is_terminal,
     }
 }

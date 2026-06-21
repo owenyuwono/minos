@@ -408,9 +408,9 @@ fn vs_branch(v: BranchVsIn) -> BranchVsOut {
 const BARK_FISSURE_FREQ_SCALE : f32 = 0.42;
 const BARK_FISSURE_WEIGHT     : f32 = 0.55;
 const BARK_RIDGE_FREQ_SCALE   : f32 = 0.5;
-const BARK_PLATE_FREQ         : f32 = 1.4;
-const BARK_CRACK_WIDTH        : f32 = 6.0;
-const BARK_PLATE_ASPECT       : f32 = 0.30;
+const BARK_PLATE_FREQ         : f32 = 2.6;
+const BARK_CRACK_WIDTH        : f32 = 21.0;
+const BARK_PLATE_ASPECT       : f32 = 0.45;
 const BARK_WARP_Y_DAMP        : f32 = 0.30;
 const BARK_ORIENT_DEFAULT     : f32 = 0.70;
 const BARK_ANISO_SPREAD       : f32 = 1.20;
@@ -418,7 +418,7 @@ const BARK_SHED_FREQ          : f32 = 0.6;
 const BARK_SHED_LIFT          : f32 = 0.35;
 const BARK_Y_STRETCH          : f32 = 3.0;
 const BARK_BUMP_MIN           : f32 = 0.18;
-const BARK_BUMP_MAX           : f32 = 0.55;
+const BARK_BUMP_MAX           : f32 = 0.80;
 
 // GLSL mod(x,y) for the hsl2rgb hue wrap (WGSL % differs for negatives).
 fn bark_mod6(x: vec3<f32>) -> vec3<f32> {
@@ -482,7 +482,7 @@ fn ridgedFBM(pw: vec3<f32>, freq_in: f32, fw: f32) -> f32 {
     var freq  = freq_in;
     for (var oct = 0; oct < 8; oct = oct + 1) {
         let octFw  = fw * freq;
-        let aaFade = 1.0 - smoothstep(0.4, 1.0, octFw);
+        let aaFade = 1.0 - smoothstep(0.35, 1.3, octFw);
         total = total + ridgeOctave(pw * freq) * amp * aaFade;
         norm  = norm + amp;
         freq  = freq * 2.13;   // irrational lacunarity
@@ -600,7 +600,7 @@ fn barkLenticel(p_grain: vec3<f32>, prominence: f32) -> f32 {
 // lichen, blotch, micro-variation are independent colour features.
 fn barkAlbedo(p_grain: vec3<f32>, h: f32, worldY: f32,
               barkHue: f32, barkLightness: f32, barkLenticels: f32) -> vec3<f32> {
-    let bL = mix(0.10, 0.92, barkLightness);
+    let bL = mix(0.10, 0.92, barkLightness);   // dryad barkMaterial.js:359 (verbatim)
     let bS = barkHue * 0.55;
     let bH = mix(0.09, 0.02, barkHue);
 
@@ -610,9 +610,17 @@ fn barkAlbedo(p_grain: vec3<f32>, h: f32, worldY: f32,
     let paletteBlotchWarm = hsl2rgb(clamp(bH - 0.015, 0.0, 1.0), bS,       clamp(bL - 0.05, 0.0, 1.0));
     let paletteBlotchCool = hsl2rgb(clamp(bH + 0.05, 0.0, 1.0),  bS * 0.7, clamp(bL - 0.07, 0.0, 1.0));
 
-    let baseSat = bS * 0.50;
-    let baseHue = mix(bH, 0.07, 0.40);
+    let baseSat = bS * 0.58;
+    let baseHue = mix(bH, 0.065, 0.35);   // dryad barkMaterial.js:378 (verbatim)
     var baseCol = hsl2rgb(baseHue, baseSat, bL);
+
+    // ponytail: height-coupled furrow tone (dryad barkMaterial.js:380-387). This was
+    // missing — without it our flat base read as a single pale tan with no ridge↔furrow
+    // colour contrast, so the lit trunk washed to cream. Blend toward a darker, slightly
+    // warmer furrow tone as h falls (h = ridge height, low = furrow).
+    let furrowT  = clamp((0.45 - h) * 2.0, 0.0, 1.0);
+    let furrowCol = hsl2rgb(clamp(bH - 0.005, 0.0, 1.0), bS * 0.72, clamp(bL - 0.20, 0.0, 1.0));
+    baseCol = mix(baseCol, furrowCol, furrowT * 0.55);
 
     // Lichen: deep crevices, biased to the trunk base.
     let lichenCrevice = clamp((0.22 - h) * 6.0, 0.0, 1.0);
@@ -624,14 +632,42 @@ fn barkAlbedo(p_grain: vec3<f32>, h: f32, worldY: f32,
     let blotch = barkNoise(p_grain * 0.18 + vec3<f32>(5.5, 1.3, 3.7)) * 0.5 + 0.5;
     baseCol = mix(baseCol, mix(paletteBlotchCool, paletteBlotchWarm, blotch), 0.22);
 
+    // ponytail: oxidation / rust weathering patches (dryad barkMaterial.js:404-410). Was
+    // missing — adds scattered warm, saturated brown zones so the bark reads earthy rather
+    // than uniform tan.
+    var oxide = barkNoise(p_grain * 0.22 + vec3<f32>(9.2, 0.8, 6.4)) * 0.5 + 0.5;
+    oxide = smoothstep(0.40, 0.78, oxide);
+    let oxideCol = hsl2rgb(clamp(bH - 0.01, 0.0, 1.0), clamp(bS * 1.4, 0.0, 1.0), clamp(bL - 0.05, 0.0, 1.0));
+    baseCol = mix(baseCol, oxideCol, oxide * 0.40);
+
     // Lenticels (independent axis).
     let lenticelMask = barkLenticel(p_grain, clamp(barkLenticels * 1.2, 0.0, 1.0));
     let lenticelCol  = mix(paletteRidge, paletteFurrow * 0.55, 0.75);
     baseCol = mix(baseCol, lenticelCol, lenticelMask);
 
+    // ponytail: cavity darkening (dryad barkMaterial.js:420-424). THE key missing
+    // darkener — deep furrows accumulate shadow/dirt → darker intrinsic albedo. Ramps
+    // from 1.0 at ridge crests down to 0.62 in deep furrows. Mean ~0.84x over the trunk;
+    // this is what pulls the lit bark off pale cream and onto dryad's warm mid-brown
+    // WITHOUT touching the global exposure (ground/leaves untouched).
+    let cavity = mix(0.62, 1.0, clamp(h * 1.7, 0.0, 1.0));
+    baseCol = baseCol * cavity;
+
     // Micro variation.
-    baseCol = clamp(baseCol + vec3<f32>(barkNoise(p_grain * 8.3 + vec3<f32>(1.1, 4.4, 2.2)) * 0.04),
+    baseCol = clamp(baseCol + vec3<f32>(barkNoise(p_grain * 8.3 + vec3<f32>(1.1, 4.4, 2.2)) * 0.06),
                     vec3<f32>(0.0), vec3<f32>(1.0));
+
+    // ponytail: final WARM-BROWN darkening tint. The lit trunk read as pale cream/pink:
+    // not a hue error (in linear light the bark already sits at a correct ~26deg brown) but
+    // a BRIGHTNESS one — the intensity-3.0 sun + IBL drove the matte bark deep into the ACES
+    // shoulder, where output is near-flat vs input: a brown there reads as washed salmon, and
+    // gentle (~0.6x) albedo cuts barely moved the displayed pixel. Scaling base+features
+    // individually also fought the blotch/oxide/lichen mixes (they re-lift toward their own
+    // lightness). So darken the FINAL albedo once and HARD enough to clear the shoulder, with
+    // a touch more cut on G/B than R to keep it warm. The strong factor is the price of NOT
+    // touching the (correct) global exposure — ground + leaves use other shaders, unchanged.
+    // Parametric: applies uniformly so every bark gene still drives the result.
+    baseCol = baseCol * vec3<f32>(0.27, 0.23, 0.19);
     return baseCol;
 }
 
@@ -651,7 +687,7 @@ fn barkReliefHeight(p_grain: vec3<f32>, featureScale: f32, fw: f32,
 // Perturb the world normal by the relief gradient (finite differences).
 fn barkPerturbNormal(p_grain: vec3<f32>, worldNormal: vec3<f32>, featureScale: f32, fw: f32,
                      barkScale: f32, barkRelief: f32, barkPlates: f32, barkShed: f32) -> vec3<f32> {
-    let eps = clamp(featureScale * 0.04, 0.003, 0.04);
+    let eps = clamp(featureScale * 0.012, 0.0025, 0.04);
     let h0 = barkReliefHeight(p_grain,                              featureScale, fw, barkScale, barkRelief, barkPlates, barkShed);
     let hx = barkReliefHeight(p_grain + vec3<f32>(eps, 0.0, 0.0),   featureScale, fw, barkScale, barkRelief, barkPlates, barkShed);
     let hy = barkReliefHeight(p_grain + vec3<f32>(0.0, eps, 0.0),   featureScale, fw, barkScale, barkRelief, barkPlates, barkShed);
@@ -793,13 +829,25 @@ struct LeafVsOut {
 }
 
 // Leaf wind displacement in TREE-LOCAL space: bone-FOLLOW the nearest branch
-// bone (so the leaf rides its twig's hierarchical sway) + a high-freq per-leaf
-// flutter. Same frame as the shadow depth pass → matched silhouette. The follow
-// delta is computed on the (rotated) tree-local anchor `local`, then added to it.
-// `seed` is attr.z (per-leaf flutter-phase decorrelation); `boneIdx` is uv.z.
-// strength==0 → follow delta is vec3(0) AND flutter amplitude is 0 → exact rest.
-fn leaf_local_displaced(position: vec3<f32>, seed: f32, boneIdx: f32, m3: mat3x3<f32>, wind: vec4<f32>) -> vec3<f32> {
-    let t   = wind.x;
+// bone (so the leaf rides its twig's hierarchical sway) + a SHARED directional
+// gust that oscillates ALONG windDir (wind.zw). Same frame as the shadow depth
+// pass → matched silhouette. The follow delta is computed on the (rotated)
+// tree-local anchor `local`, then added to it.
+//
+// COHERENCE: the gust is `windDir * strength * GUST * sin(t*F + small per-leaf
+// phase)`, so the WHOLE canopy ripples in ONE direction (the same windDir the
+// branch solver leans about), not an isotropic per-leaf tumble. `seed` (attr.z)
+// only staggers the gust phase slightly so the canopy isn't a rigid sheet — it
+// no longer drives an independent high-freq XYZ flutter. There is NO
+// perpendicular / cross term: motion is purely along windDir.
+// strength==0 → follow delta is vec3(0) AND gust amplitude is 0 → exact rest.
+//
+// WIND-FROM-BASE: the directional gust is graduated by `t` (0 at the base on the
+// twig → 1 at the tip), so the BASE stays anchored (pivot) and the TIP sways most
+// — dryad's flutter ∝ position.y (leafMesh.js:321-322). The bone-follow is NOT
+// graduated (the whole leaf rides its twig's sway as a rigid anchor offset). The
+// bend/droop are baked into the CPU strip geometry (shape, present at strength 0).
+fn leaf_local_displaced(position: vec3<f32>, seed: f32, boneIdx: f32, t: f32, m3: mat3x3<f32>, wind: vec4<f32>) -> vec3<f32> {
     let s   = wind.y;
     // Bone-follow in BONE space (the rest anchor), then rotate the delta into the
     // surface frame — the bone matrices are tree-local/un-rotated like the branch
@@ -807,13 +855,23 @@ fn leaf_local_displaced(position: vec3<f32>, seed: f32, boneIdx: f32, m3: mat3x3
     let follow_obj = windBoneFollowDelta(position, boneIdx, s);
     let local  = m3 * position;                // rotated, NO translation
     let follow = m3 * follow_obj;
-    let ph    = seed * 6.2831853;
-    let fl    = s * 0.06;
-    let flutter = vec3<f32>(
-        sin(t * 8.0  + ph)        * fl,
-        sin(t * 11.3 + ph * 1.7)  * fl * 0.5,
-        cos(t * 9.1  + ph * 0.6)  * fl);
-    return local + follow + flutter;
+
+    // Shared directional gust ALONG windDir. wind.zw is the horizontal wind dir;
+    // normalize_or-style guard via length check keeps it naga-safe & finite.
+    let wd_len = max(length(vec2<f32>(wind.z, wind.w)), 1e-4);
+    let wd = vec3<f32>(wind.z, 0.0, wind.w) / wd_len;
+    // Low frequency (matches the branch gust F1≈1.2) so leaves & twigs move
+    // together; a SMALL per-leaf phase (seed) gives natural life without decohering.
+    let ph    = seed * 1.7;
+    // Amplitudes modestly raised (0.05→0.09, 0.02→0.035) so 'leaves follow the
+    // set wind direction' reads clearly. Both terms scale by s, so strength==0
+    // is exactly static (deterministic) and the gust always lies ALONG windDir.
+    let gust  = s * 0.09 * sin(wind.x * 1.2 + ph)
+              + s * 0.035 * sin(wind.x * 2.73 + ph * 2.17 + 1.3);
+    // Graduate the gust by the strip parameter t (base=0 pinned, tip=1 sways most),
+    // so the leaf pivots at its base on the twig. clamp keeps it finite/naga-safe.
+    let tip = clamp(t, 0.0, 1.0);
+    return local + follow + wd * (gust * tip);
 }
 
 @vertex
@@ -827,7 +885,8 @@ fn vs_leaf(v: LeafVsIn) -> LeafVsOut {
 
     // ── WIND in tree-local space (see leaf_local_displaced). Final
     // camera-relative world pos adds back the model translation. ──
-    let local = leaf_local_displaced(v.position, v.attr.z, v.uv.z, m3, leaf_pc.wind);
+    // v.uv.y = strip parameter t (0 base → 1 tip) drives the wind-from-base graduation.
+    let local = leaf_local_displaced(v.position, v.attr.z, v.uv.z, v.uv.y, m3, leaf_pc.wind);
     let world_pos = vec4<f32>(local + leaf_pc.model[3].xyz, 1.0);
     out.clip_pos = frame.view_proj * world_pos;
 
@@ -1151,7 +1210,10 @@ fn vs_leaf_depth(v: LeafVsIn) -> LeafDepthVsOut {
     let rotated = quat_rotate(leaf_depth_pc.rot, v.position);
     let follow  = quat_rotate(leaf_depth_pc.rot, follow_obj);
     let ph    = v.attr.z * 6.2831853;
-    let fl    = s * 0.06;
+    // Graduate the flutter by the strip parameter t (uv.y): base pinned, tip sways,
+    // so the cast shadow silhouette pivots at the base in lockstep with the lit leaf.
+    let tip   = clamp(v.uv.y, 0.0, 1.0);
+    let fl    = s * 0.06 * tip;
     let flutter = vec3<f32>(
         sin(t * 8.0  + ph)        * fl,
         sin(t * 11.3 + ph * 1.7)  * fl * 0.5,

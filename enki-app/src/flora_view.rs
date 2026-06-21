@@ -359,7 +359,17 @@ impl FloraView {
             }
         };
         let leaf_count = foliage_ref.count as u32;
-        let leaf = build_leaf_mesh(rhi, foliage_ref, &bm.bones_wind)?;
+        // ponytail: thread the leaf mode + width/length genes so the card aspect
+        // matches dryad (square at default genes) instead of a fixed blade shape.
+        let leaf = build_leaf_mesh(
+            rhi,
+            foliage_ref,
+            &bm.bones_wind,
+            leaf_mode,
+            resolved.leaf_width,
+            resolved.leaf_length,
+            resolved.weep,
+        )?;
 
         // ── Per-tree leaf appearance: pigment base color + shape genes. ──
         // Leaf pigment uses the same hue-wheel ramp as wood, but undiluted by
@@ -748,6 +758,21 @@ const LEAF_FAN_SALT: u32 = 0x1EAF_0FA2; // dryad foliage.js:60
 const LEAF_FAN_SCALE: f32 = 0.58; // dryad LEAF_SCALE (foliage.js:950)
 const LEAF_FAN_SPLAY: f32 = 0.55; // dryad SPLAY (foliage.js:951)
 
+// ── Twigs-only leaf gate (render-side; does NOT touch resolve()/golden) ──────
+// "Twigs = fine terminal branches." dryad/generate_foliage already excludes the
+// trunk (branch_level 0) and roots, but still places sparse clusters on thick
+// structural branches (branch_level 1–2). We render leaves ONLY where the
+// source node is a real twig:
+//   keep iff  (is_terminal OR branch_level >= TWIG_MIN_LEVEL)
+//             AND source_radius <= TWIG_RADIUS_FRAC * max_anchor_radius
+// branch_level / is_terminal are scale-independent structural classifications
+// (stable across trees), so they are the primary gate; the relative radius cap
+// (fraction of the THICKEST anchor's wood radius on THIS tree) is a per-tree
+// belt-and-suspenders that drops anchors sitting on chunky wood even if they
+// were tagged terminal on a stubby specimen.
+const TWIG_MIN_LEVEL: f32 = 3.0; // OUTER_LEVEL_THRESHOLD (foliage.js:139)
+const TWIG_RADIUS_FRAC: f32 = 0.40; // keep anchors on wood ≤ 40% of the thickest anchor radius
+
 #[inline]
 fn v_norm(v: [f32; 3]) -> [f32; 3] {
     let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
@@ -813,6 +838,11 @@ fn expand_clumps_to_leaves(
     let mut age_color = Vec::with_capacity(out_n);
     let mut exposure = Vec::with_capacity(out_n);
     let mut bone_index = Vec::with_capacity(out_n);
+    // Carry source-node metadata through the fan 1:1 so the twig filter still
+    // works post-expansion.
+    let mut source_radius = Vec::with_capacity(out_n);
+    let mut source_branch_level = Vec::with_capacity(out_n);
+    let mut source_is_terminal = Vec::with_capacity(out_n);
 
     for c in 0..f.count {
         let c3 = c * 3;
@@ -823,6 +853,9 @@ fn expand_clumps_to_leaves(
         let age = f.age_color[c];
         let exp = f.exposure[c];
         let bone = f.bone_index[c];
+        let src_r = f.source_radius[c];
+        let src_bl = f.source_branch_level[c];
+        let src_term = f.source_is_terminal[c];
         let roll0 = f.rotation[c];
         let x = v_norm(v_cross(t, nf)); // clump "right" axis
 
@@ -852,6 +885,9 @@ fn expand_clumps_to_leaves(
             age_color.push(age);
             exposure.push(exp);
             bone_index.push(bone);
+            source_radius.push(src_r);
+            source_branch_level.push(src_bl);
+            source_is_terminal.push(src_term);
         }
     }
 
@@ -866,6 +902,9 @@ fn expand_clumps_to_leaves(
         exposure,
         bone_index,
         shape: f.shape,
+        source_radius,
+        source_branch_level,
+        source_is_terminal,
     }
 }
 
@@ -873,6 +912,14 @@ fn build_leaf_mesh(
     rhi: &mut Rhi,
     foliage: &enki_flora::foliage::FoliageSoA,
     bones_wind: &[WindBone],
+    // ponytail: leaf mode + width/length genes drive the card aspect (dryad
+    // leafMesh.js buildInstanceMatrix scales the card by gene-derived factors).
+    leaf_mode: LeafMode,
+    leaf_width: f64,
+    leaf_length: f64,
+    // ponytail: willow weep gene scales the per-leaf gravity DROOP (dryad uWeep
+    // drives the willow hang). 0 → just the default gentle bend/droop.
+    weep: f64,
 ) -> Result<Option<GpuMesh>, RhiError> {
     let n = foliage.count;
     if n == 0 {
@@ -919,21 +966,63 @@ fn build_leaf_mesh(
     }
     let center = (lo + hi) * 0.5;
 
-    let mut pos = Vec::with_capacity(n * 4 * 3);
-    let mut nrm = Vec::with_capacity(n * 4 * 3);
-    let mut uv = Vec::with_capacity(n * 4 * 3);
-    let mut attr = Vec::with_capacity(n * 4 * 3);
-    let mut idx = Vec::with_capacity(n * 6);
+    // ── Twigs-only gate: per-tree thickest anchor radius for the RELATIVE cap. ──
+    let mut max_src_radius = 0.0f32;
+    for i in 0..n {
+        let r = foliage.source_radius[i];
+        if r > max_src_radius {
+            max_src_radius = r;
+        }
+    }
+    let twig_radius_max = if max_src_radius > 0.0 {
+        max_src_radius * TWIG_RADIUS_FRAC
+    } else {
+        f32::INFINITY // no metadata → keep all (graceful fallback)
+    };
+    // A leaf anchor is a "twig" iff it is structurally fine AND on thin wood.
+    let is_twig = |i: usize| -> bool {
+        let terminal = foliage.source_is_terminal[i] >= 0.5;
+        let level = foliage.source_branch_level[i];
+        let radius = foliage.source_radius[i];
+        (terminal || level >= TWIG_MIN_LEVEL) && radius <= twig_radius_max
+    };
 
-    // Quad corners in (tangent, bitangent) space: 0:(-1,-1) 1:(1,-1) 2:(-1,1) 3:(1,1).
-    const CORNERS: [(f32, f32); 4] = [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)];
+    // ── Base-anchored CURVED STRIP (dryad leafMesh.js). Each leaf is a 2-wide ×
+    // (SEG+1)-row grid: base row sits AT the foliage anchor (on the twig), the
+    // strip extends up the leaf tangent to the tip, BENDS along the face normal
+    // (LEAF_BEND) and DROOPS toward gravity (×t², scaled by the weep gene). Per
+    // vertex t = row/SEG ∈ [0,1] (base→tip) is carried in uv.y, so the FS samples
+    // the sprite base→tip AND the VS graduates the wind gust by t (tip sways, base
+    // pinned). dryad subdivides a PlaneGeometry in the GPU; enki CPU-expands.
+    const SEG: usize = 6; // LEAF_LENGTH_SEGMENTS (leafMesh.js:77) → 7 rows, 14 verts, 12 tris
+    const ROWS: usize = SEG + 1;
+    let mut pos = Vec::with_capacity(n * ROWS * 2 * 3);
+    let mut nrm = Vec::with_capacity(n * ROWS * 2 * 3);
+    let mut uv = Vec::with_capacity(n * ROWS * 2 * 3);
+    let mut attr = Vec::with_capacity(n * ROWS * 2 * 3);
+    let mut idx = Vec::with_capacity(n * SEG * 6);
+
     // dryad canopyBlend = 0.8 (uWeep=0): shading normal is 80% canopy-sphere
     // normal, 20% card face normal — a soft volume, but the card keeps a little
-    // of its own facing so flat-on leaves don't read perfectly spherical.
-    const CANOPY_BLEND: f32 = 0.8;
+    // of its own facing so flat-on leaves don't read perfectly spherical. The weep
+    // gene shifts the blend toward the geometric (sky-facing) normal so willow
+    // leaves under a hanging canopy catch overhead light (dryad leafMesh.js:457:
+    // canopyBlend = 0.8 * (1 - uWeep)).
+    let weep_f = (weep as f32).clamp(0.0, 1.0);
+    let canopy_blend: f32 = 0.8 * (1.0 - weep_f);
+    // Gravity bend/droop: tip droops by this fraction of leaf length, quadratic in
+    // t (dryad LEAF_BEND_DEFAULT = 0.45, leafMesh.js:67,379). The weep gene
+    // increases the droop for willows; default (weep≈0) keeps the gentle 0.45 bend.
+    const LEAF_BEND_DEFAULT: f32 = 0.45;
+    let leaf_bend = LEAF_BEND_DEFAULT * (1.0 + weep_f * 1.5);
 
     for i in 0..n {
-        let p = Vec3::new(
+        // ── Twigs only: skip anchors that sit on the trunk / thick structural
+        // branches. Leaves render ONLY on fine terminal twigs. ──
+        if !is_twig(i) {
+            continue;
+        }
+        let anchor = Vec3::new(
             foliage.position[3 * i],
             foliage.position[3 * i + 1],
             foliage.position[3 * i + 2],
@@ -963,10 +1052,37 @@ fn build_leaf_mesh(
         let t_r = t * cs + b * sn;
         let b_r = b * cs - t * sn;
 
+        // ── Seat the leaf BASE on the twig WOOD SURFACE. ──
+        // The generation anchor for body/apical clusters is already pushed out
+        // from the branch axis by mid_radius (foliage.rs cluster_base), so it
+        // sits on the bark. To GUARANTEE the base touches — and never sinks
+        // into — the twig wood regardless of the generation path (the spine
+        // pass anchors on the centerline), explicitly seat the base a
+        // source_radius (the wood radius at this anchor) outward along the
+        // leaf's outward direction. The outward direction is the radial
+        // component of the leaf tangent (the blade leans out from the twig);
+        // fall back to canopy-outward if the tangent is ~vertical.
+        let radius = foliage.source_radius[i];
+        let canopy_out = (anchor - center).normalize_or(Vec3::Y);
+        // Radial = leaf tangent with its along-canopy-up component removed, i.e.
+        // the horizontal lean away from the twig; blended toward canopy-outward
+        // for stability.
+        let tan_out = t_r - canopy_out * t_r.dot(canopy_out);
+        let outward = (canopy_out + tan_out)
+            .normalize_or(canopy_out)
+            .normalize_or(Vec3::Y);
+        // The anchor already carries mid_radius for body/apical clusters, so a
+        // FULL extra radius would float them. Seat to the surface using a small
+        // fraction that closes the gap for centerline (spine) anchors and hugs
+        // thin twigs without lifting surface-seated clusters off (radius is tiny
+        // on twigs by construction). // ponytail: one mul-add, no extra alloc.
+        const SEAT_FRAC: f32 = 0.5;
+        let p = anchor + outward * (radius * SEAT_FRAC);
+
         // Canopy sphere-normal: outward from the AABB center (dryad:837-849).
-        // Fallback to +Y exactly at the center. Blend 80% canopy / 20% card.
+        // Fallback to +Y exactly at the center. Blend (1-weep)*0.8 canopy / rest
+        // card — weep leans willow leaves on their geometric normal.
         let cn = (p - center).normalize_or(Vec3::Y);
-        let lit_n = (cn * CANOPY_BLEND + nn * (1.0 - CANOPY_BLEND)).normalize_or(cn);
 
         // Per-leaf variation seed in [0,1): a stable hash of the leaf position.
         // (No Math.random; deterministic on reseed, like dryad's index LCGs.)
@@ -975,29 +1091,75 @@ fn build_leaf_mesh(
         // into uv.z so the leaf VS bone-follows its twig's hierarchical sway.
         let bone_idx = nearest_bone(p);
 
-        // Leaf card size on the (tangent, bitangent) basis. Kept at dryad's
-        // 0.5 wide × 0.65 tall: with the now-binary alpha cutout (flora.wgsl
-        // fs_leaf, alphaTest 0.5) overlapping leaves occlude opaquely, so this
-        // size reads as many distinct leaf SILHOUETTES rather than a few large
-        // overlapping pale blobs (bigger cards merged the sunlit crown into one
-        // glassy mass — the opposite of "visible leaf silhouettes"). // ponytail.
-        let half_w = scale * 0.5;
-        let half_h = scale * 0.65;
+        // Leaf card size on the (tangent, bitangent) basis. dryad scales the card
+        // by gene-derived width/length factors on an EQUAL 0.5 base, so default
+        // genes give a SQUARE card (a broad ovate), not a fixed 0.5×0.65 blade.
+        // (Old fixed 0.65-tall card read as a thin spike for the single sprite.)
+        // With the binary alpha cutout (flora.wgsl fs_leaf, alphaTest 0.5)
+        // overlapping leaves still occlude opaquely → distinct silhouettes.
+        // ponytail: dryad leafWidthFactor/leafLengthFactor (leafTexture.js:478-484).
+        let (wf, lf) = match leaf_mode {
+            LeafMode::Single => (
+                0.4 + leaf_width as f32 * 1.2,  // [0.4,1.6], 1.0 at width 0.5
+                0.55 + leaf_length as f32 * 1.0, // [0.55,1.55], ~1.0 at length 0.45
+            ),
+            LeafMode::Cluster => (1.0, 1.0), // xScale baked into the cluster sprite; card stays square
+        };
+        let half_w = scale * 0.5 * wf;
+        // Base-anchored strip: full leaf LENGTH up the tangent (dryad leafLen =
+        // s*lengthFactor). Was half_h=scale*0.5*lf for the CENTERED quad; the
+        // base-anchored strip extends the full `length` from the anchor to the tip.
+        let length = scale * lf;
+        // Card face normal (the geometric leaf facing) = t_r × b_r ≈ nn.
+        let face_n = t_r.cross(b_r).normalize_or(nn);
+        // Gravity DOWN in tree-local space. The tree stands with local +Y = surface
+        // normal (model() aligns local +Y to the up at the origin), so local -Y is
+        // gravity. The model rotation is applied in the VS; for the upright single
+        // specimen this is ≈ world-down (matches dryad's view-space −Y droop).
+        let down = Vec3::NEG_Y;
         let base = (pos.len() / 3) as u32;
 
-        for &(cx, cy) in &CORNERS {
-            let offset = t_r * (cx * half_w) + b_r * (cy * half_h);
-            let corner = p + offset;
-            pos.extend_from_slice(&[corner.x, corner.y, corner.z]);
-            // slot1 = canopy-blended lighting normal (the dryad volume trick).
-            nrm.extend_from_slice(&[lit_n.x, lit_n.y, lit_n.z]);
-            // UV in [0,1]² from the [-1,1] corner; .z = wind boneIndex.
-            uv.extend_from_slice(&[cx * 0.5 + 0.5, cy * 0.5 + 0.5, bone_idx]);
-            // attr = (age, exposure, per-leaf variation seed).
-            attr.extend_from_slice(&[age, exposure, seed]);
+        // Emit ROWS rows (base→tip), 2 cross columns each. Per row r: t = r/SEG.
+        for r in 0..ROWS {
+            let t = r as f32 / SEG as f32;
+            // BEND: curl the blade OUT of its plane along the face normal, quadratic
+            // in t (so the tip bows). Amount ∝ leaf length × leaf_bend.
+            let bend = face_n * (t * t * length * leaf_bend * 0.5);
+            // DROOP: pull the blade toward gravity, quadratic in t, scaled by the
+            // weep gene (dryad's gravity term). Present at wind strength 0 (it's
+            // SHAPE, not wind). Default weep≈0 → a gentle droop from leaf_bend.
+            let droop = down * (t * t * length * leaf_bend);
+            let up_off = b_r * (t * length); // base (t=0) at anchor, tip (t=1) up-tangent
+            for &cx in &[-1.0f32, 1.0f32] {
+                let corner = p + t_r * (cx * half_w) + up_off + bend + droop;
+                pos.extend_from_slice(&[corner.x, corner.y, corner.z]);
+                // ── Recompute the bent-strip face normal for lighting (dryad keeps
+                // the card normal flat but the curl SHOULD catch light). The up-
+                // tangent tilts as the blade curls/droops: d(up_off+bend+droop)/dt.
+                // The recomputed card normal then blends with the canopy sphere
+                // normal (weep-scaled) into slot1 — sphere-dominant like dryad.
+                let d_up = b_r * length
+                    + face_n * (t * length * leaf_bend) // d(bend)/dt = 2t·…·0.5
+                    + down * (2.0 * t * length * leaf_bend); // d(droop)/dt
+                let up_tan = d_up.normalize_or(b_r);
+                let card_n = up_tan.cross(t_r).normalize_or(face_n);
+                let lit_n = (cn * canopy_blend + card_n * (1.0 - canopy_blend))
+                    .normalize_or(cn);
+                nrm.extend_from_slice(&[lit_n.x, lit_n.y, lit_n.z]);
+                // UV: .x = cross [0,1], .y = t (base→tip, sprite mapped once up the
+                // strip — dryad's continuous V across the subdivided plane); .z =
+                // wind boneIndex. uv.y IS the per-vertex t the VS reads for the
+                // base-anchored wind graduation (tip sways, base pinned).
+                uv.extend_from_slice(&[cx * 0.5 + 0.5, t, bone_idx]);
+                // attr = (age, exposure, per-leaf variation seed).
+                attr.extend_from_slice(&[age, exposure, seed]);
+            }
         }
-        // Two CCW triangles: [0,1,2, 2,1,3].
-        idx.extend_from_slice(&[base, base + 1, base + 2, base + 2, base + 1, base + 3]);
+        // SEG segments, 2 CCW tris each. Row r: a=2r,b=2r+1,c=2r+2,d=2r+3.
+        for r in 0..SEG as u32 {
+            let a = base + 2 * r;
+            idx.extend_from_slice(&[a, a + 1, a + 2, a + 2, a + 1, a + 3]);
+        }
     }
 
     Ok(Some(GpuMesh {

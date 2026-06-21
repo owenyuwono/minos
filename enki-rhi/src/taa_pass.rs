@@ -26,6 +26,10 @@ pub(crate) struct TaaImages {
     pub current: AllocatedImage,
     /// 1× resolved depth (sampled by the resolve for reprojection).
     pub resolved_depth: AllocatedImage,
+    /// 1× copy of the opaque depth, sampled by the water pass for depth-based
+    /// darkening (the deeper the water column, the darker). Filled by a copy in
+    /// `begin_water_pass` so `resolved_depth` stays the live depth attachment.
+    pub refract_depth: AllocatedImage,
     /// Ping-pong history: the resolve writes one and reads the other.
     pub history: [AllocatedImage; 2],
 }
@@ -57,8 +61,14 @@ impl TaaImages {
         )?;
         let resolved_depth = AllocatedImage::new_render_target(
             device, allocator, extent, vk::Format::D32_SFLOAT, one,
-            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED
+                | vk::ImageUsageFlags::TRANSFER_SRC,
             depth, "taa_depth",
+        )?;
+        let refract_depth = AllocatedImage::new_render_target(
+            device, allocator, extent, vk::Format::D32_SFLOAT, one,
+            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            depth, "taa_refract_depth",
         )?;
         let h0 = AllocatedImage::new_render_target(
             device, allocator, extent, color_format, one, history_usage, color, "taa_history0",
@@ -67,13 +77,14 @@ impl TaaImages {
             device, allocator, extent, color_format, one, history_usage, color, "taa_history1",
         )?;
 
-        Ok(Self { hdr_msaa, current, resolved_depth, history: [h0, h1] })
+        Ok(Self { hdr_msaa, current, resolved_depth, refract_depth, history: [h0, h1] })
     }
 
     pub fn destroy(self, device: &ash::Device, allocator: &mut Allocator) {
         self.hdr_msaa.destroy(device, allocator);
         self.current.destroy(device, allocator);
         self.resolved_depth.destroy(device, allocator);
+        self.refract_depth.destroy(device, allocator);
         let [h0, h1] = self.history;
         h0.destroy(device, allocator);
         h1.destroy(device, allocator);

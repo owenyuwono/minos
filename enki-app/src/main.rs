@@ -12,17 +12,19 @@
 //     Stress:  begin_frame() → streaming_upload*() → begin_rendering() →
 //              StressHarness::record_frame() → EguiState::render() → end_frame()
 //
-// # Navigation mode cycle (Tab: Globe → Placement → FirstPerson → Globe)
+// # Navigation mode cycle (Tab: Globe → Placement → Surface → Globe)
 //   Globe       — orbit camera; LMB drag rotates, scroll zooms.
-//   Placement   — shows orbit view; click to ray-cast spawn point on planet.
-//   FirstPerson — WASD + mouse-look on the surface.
-//   Escape      — return from FirstPerson → Globe at any time.
+//   Placement   — shows orbit view; click to ray-cast a spawn point on the planet.
+//   Surface     — third-person character: camera-relative WASD, mouse orbits the
+//                 chase cam, scroll zooms the boom, V toggles first-person.
+//   Escape      — return from Surface → Globe at any time.
 //
 // # View hot-swap keys (not consumed by egui)
 //   M    — cycle view_mode (0–10; skips Nanite-only 3–5 on the classic path)
 //   W    — toggle wireframe (Globe/Placement modes)
+//   V    — toggle 1st/3rd-person camera (Surface mode)
 //   Tab  — advance nav mode
-//   Esc  — exit first-person to Globe
+//   Esc  — exit the surface walker to Globe
 //
 // # Event routing
 //   WindowEvent → egui FIRST.  If egui consumed it (wants_pointer / wants_keyboard),
@@ -34,6 +36,7 @@
 //   they must happen in `build_frame`, outside begin_rendering/end_frame.
 //   Egui draw commands (`cmd_draw`) must be inside begin_rendering, before end_frame.
 
+mod character;
 mod controls;
 mod gui;
 mod hud;
@@ -61,10 +64,12 @@ use winit::{
     window::{CursorGrabMode, Window, WindowAttributes, WindowId},
 };
 
+use character::Character;
 use controls::{
-    first_person::{FirstPersonController, MoveInput},
+    first_person::MoveInput,
     globe::GlobeControls,
     nav_mode::{NavMode, NavState},
+    third_person::ThirdPersonController,
     surface_picker,
     PLANET_RADIUS,
 };
@@ -109,6 +114,9 @@ struct App {
     wave:         Option<WaveSurface>,
     scene:        Option<Scene>,
     stress:       Option<StressHarness>,
+    /// CPU-skinned humanoid drawn in third-person surface mode (built at startup
+    /// in Planet mode; only drawn while walking the surface in third-person view).
+    character:    Option<Character>,
     #[cfg(feature = "nanite")]
     nanite:       Option<enki_nanite::render::NaniteRenderer>,
     // Flora lives only in the dedicated `flora_viewer` bin (the showcase + 1:1
@@ -146,7 +154,11 @@ struct App {
     // ── Navigation ────────────────────────────────────────────────────────
     nav:          NavState,
     globe:        GlobeControls,
-    first_person: Option<FirstPersonController>,
+    /// Surface walker + chase camera (1st/3rd-person view toggle). Spawned by a
+    /// placement click; `None` while orbiting.
+    surface:      Option<ThirdPersonController>,
+    /// Ground speed (m/s) the surface walker reported this frame; drives the gait.
+    surface_speed: f32,
     /// Last cursor NDC (x right, y up, -1..1) for Placement ray-cast.
     cursor_ndc:   (f32, f32),
     /// Shared terrain height source (clone of the loader's) so the FPS controller
@@ -178,8 +190,6 @@ struct App {
     wave_foam:         f32,
     /// Sea level as a metre offset from the terrain's `e = 0` datum (= PLANET_RADIUS).
     sea_level_m:       f64,
-    /// Elapsed seconds driving the ocean wave animation.
-    ocean_time:        f32,
 
     // ── Raw input state ───────────────────────────────────────────────────
     /// Accumulated mouse-motion delta between frames (pixels, CursorMoved).
@@ -194,11 +204,8 @@ struct App {
     cursor_pos_prev: Option<(f64, f64)>,
     /// Scroll wheel delta accumulated this frame.
     scroll:        f32,
-    /// WASD + Shift held state for FirstPerson movement.
+    /// WASD + Shift held state for surface-walk movement.
     move_keys:     MoveInput,
-
-    // ── Frame stats ───────────────────────────────────────────────────────
-    last_dt: f32,
 
     // ── Soak-terrain state ────────────────────────────────────────────────
     /// Monotonic elapsed time since the soak started (seconds).  Drives the
@@ -227,6 +234,7 @@ impl App {
             wave:          None,
             scene:         None,
             stress:        None,
+            character:     None,
             #[cfg(feature = "nanite")]
             nanite:        None,
             #[cfg(feature = "nanite")]
@@ -248,7 +256,8 @@ impl App {
             frame_counter: 0,
             nav:           NavState::new(),
             globe:         GlobeControls::new(100_000.0),
-            first_person:  None,
+            surface:       None,
+            surface_speed: 0.0,
             cursor_ndc:    (0.0, 0.0),
             height_field:  None,
             terrain_height_scale: 0.0,
@@ -263,7 +272,6 @@ impl App {
             wave_choppiness:   1.3,
             wave_foam:         0.4,
             sea_level_m:       0.0,
-            ocean_time:        0.0,
             mouse_delta:   (0.0, 0.0),
             lmb_held:      false,
             lmb_click:     false,
@@ -271,7 +279,6 @@ impl App {
             cursor_pos_prev:   None,
             scroll:        0.0,
             move_keys:     MoveInput::default(),
-            last_dt:       0.016,
             soak_elapsed:           0.0,
             soak_start:             Instant::now(),
             soak_frames_since_log:  0,
@@ -285,10 +292,10 @@ impl App {
     fn active_camera(&self) -> Camera {
         match self.nav.mode() {
             NavMode::Globe | NavMode::Placement => self.globe.camera(),
-            NavMode::FirstPerson => self
-                .first_person
+            NavMode::Surface => self
+                .surface
                 .as_ref()
-                .map(|fp| fp.camera())
+                .map(|tpc| tpc.camera())
                 .unwrap_or_else(|| self.globe.camera()),
         }
     }
@@ -296,30 +303,30 @@ impl App {
     fn altitude_m(&self) -> f64 {
         match self.nav.mode() {
             NavMode::Globe | NavMode::Placement => self.globe.altitude(),
-            NavMode::FirstPerson => self
-                .first_person
+            NavMode::Surface => self
+                .surface
                 .as_ref()
-                .map(|fp| fp.eye_position().length() - PLANET_RADIUS)
+                .map(|tpc| tpc.feet_position().length() - PLANET_RADIUS)
                 .unwrap_or_else(|| self.globe.altitude()),
         }
     }
 
     // ── Navigation mode transitions ───────────────────────────────────────
 
-    /// Tab: Globe→Placement, Placement→Globe (cancel), FirstPerson→Globe.
+    /// Tab: Globe→Placement, Placement→Globe (cancel), Surface→Globe.
     fn cycle_nav_mode(&mut self) {
         match self.nav.mode() {
             NavMode::Globe => {
                 self.nav.begin_placement(&self.globe.camera());
-                log::info!("Nav: Globe → Placement (click to place first-person spawn)");
+                log::info!("Nav: Globe → Placement (click to drop the character)");
             }
             NavMode::Placement => {
                 // Cancel placement: reset state machine to Globe.
                 self.nav = NavState::new();
                 log::info!("Nav: Placement cancelled → Globe");
             }
-            NavMode::FirstPerson => {
-                self.exit_first_person("Tab");
+            NavMode::Surface => {
+                self.exit_surface("Tab");
             }
         }
     }
@@ -348,19 +355,20 @@ impl App {
         }
     }
 
-    /// Common exit-first-person logic.
-    fn exit_first_person(&mut self, reason: &str) {
-        if let Some(restored) = self.nav.exit_first_person() {
+    /// Common exit-surface logic: drop the walker, restore the orbit camera.
+    fn exit_surface(&mut self, reason: &str) {
+        if let Some(restored) = self.nav.exit_surface() {
             let alt = (restored.position.length() - PLANET_RADIUS).max(0.0);
             self.globe = GlobeControls::new(alt);
         }
-        self.first_person = None;
+        self.surface = None;
+        self.surface_speed = 0.0;
         self.release_cursor();
-        log::info!("Nav: FirstPerson → Globe ({})", reason);
+        log::info!("Nav: Surface → Globe ({})", reason);
     }
 
-    /// Placement mode: ray-cast and spawn a first-person controller.
-    fn try_place_first_person(&mut self) {
+    /// Placement mode: ray-cast and spawn the surface (third-person) controller.
+    fn try_place_surface(&mut self) {
         // Compute aspect ratio from window size.
         let aspect = self
             .window
@@ -377,7 +385,7 @@ impl App {
 
         if let Some(hit) = surface_picker::pick(origin, dir, DVec3::ZERO, PLANET_RADIUS) {
             log::info!(
-                "Nav: surface pick ({:.0}, {:.0}, {:.0}) — spawning first-person",
+                "Nav: surface pick ({:.0}, {:.0}, {:.0}) — spawning character",
                 hit.point.x, hit.point.y, hit.point.z
             );
             let cam_fwd  = (camera.orientation * glam::Vec3::NEG_Z).as_dvec3();
@@ -390,19 +398,20 @@ impl App {
             };
 
             let Some(hf) = self.height_field.clone() else {
-                log::warn!("Nav: terrain not loaded yet — cannot place first-person");
+                log::warn!("Nav: terrain not loaded yet — cannot place character");
                 return;
             };
-            self.first_person = Some(FirstPersonController::new(
+            self.surface = Some(ThirdPersonController::new(
                 hit.point,
                 hf,
                 PLANET_RADIUS,
                 self.terrain_height_scale,
                 heading,
             ));
+            self.surface_speed = 0.0;
             self.nav.point_picked();
             self.grab_cursor();
-            log::info!("Nav: Placement → FirstPerson");
+            log::info!("Nav: Placement → Surface (third-person; V toggles first-person)");
         } else {
             log::info!("Nav: placement click missed the planet");
         }
@@ -498,16 +507,20 @@ impl App {
 
                 // Placement: left-click fires a ray-cast.
                 if self.nav.mode() == NavMode::Placement && self.lmb_click {
-                    self.try_place_first_person();
+                    self.try_place_surface();
                 }
             }
-            NavMode::FirstPerson => {
-                if let Some(fp) = self.first_person.as_mut() {
-                    // Mouse motion → mouse look (applied raw, not just on LMB).
+            NavMode::Surface => {
+                if let Some(tpc) = self.surface.as_mut() {
+                    // Raw mouse motion orbits the chase camera.
                     if dx.abs() > 0.01 || dy.abs() > 0.01 {
-                        fp.on_mouse_look(dx, dy);
+                        tpc.on_orbit(dx, dy);
                     }
-                    fp.on_move(self.move_keys, dt);
+                    if self.scroll.abs() > 0.01 {
+                        tpc.on_zoom(self.scroll);
+                    }
+                    // Camera-relative WASD; remember the speed for the gait.
+                    self.surface_speed = tpc.on_move(self.move_keys, dt);
                 }
             }
         }
@@ -637,6 +650,11 @@ impl ApplicationHandler for App {
                 match WaveSurface::new(&mut rhi, color_format, samples, PLANET_RADIUS) {
                     Ok(w)  => self.wave = Some(w),
                     Err(e) => log::error!("WaveSurface::new failed: {e}"),
+                }
+                // Third-person character (drawn only while walking the surface).
+                match Character::new(&mut rhi, color_format, samples) {
+                    Ok(c)  => self.character = Some(c),
+                    Err(e) => log::error!("Character::new failed: {e}"),
                 }
 
                 let cfg = PlanetConfig {
@@ -813,10 +831,10 @@ impl ApplicationHandler for App {
     /// Raw device events — mouse motion lives here in winit 0.30.
     ///
     /// Globe/Placement drag now sources from `WindowEvent::CursorMoved` (reliable
-    /// on WSLg/Xwayland).  This path is kept alive for `NavMode::FirstPerson`
-    /// mouse-look, which uses locked-cursor raw deltas that don't emit CursorMoved.
+    /// on WSLg/Xwayland).  This path is kept alive for `NavMode::Surface`
+    /// chase-cam orbit, which uses locked-cursor raw deltas that don't emit CursorMoved.
     ///
-    /// NOTE: FirstPerson raw-input may have the same WSLg reliability issue —
+    /// NOTE: Surface raw-input may have the same WSLg reliability issue —
     /// tracked as a separate follow-up.
     fn device_event(
         &mut self,
@@ -825,7 +843,7 @@ impl ApplicationHandler for App {
         event:       DeviceEvent,
     ) {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
-            if self.nav.mode() == NavMode::FirstPerson {
+            if self.nav.mode() == NavMode::Surface {
                 self.mouse_delta.0 += dx as f32;
                 self.mouse_delta.1 += dy as f32;
             }
@@ -904,10 +922,17 @@ impl App {
                         self.cycle_nav_mode();
                     }
 
-                    // ── Exit first-person ─────────────────────────────────────
+                    // ── Exit surface walker ───────────────────────────────────
                     KeyCode::Escape if pressed => {
-                        if self.nav.mode() == NavMode::FirstPerson {
-                            self.exit_first_person("Escape");
+                        if self.nav.mode() == NavMode::Surface {
+                            self.exit_surface("Escape");
+                        }
+                    }
+
+                    // ── Toggle 1st/3rd-person camera on the surface walker ─────
+                    KeyCode::KeyV if pressed && self.nav.mode() == NavMode::Surface => {
+                        if let Some(tpc) = self.surface.as_mut() {
+                            tpc.toggle_view();
                         }
                     }
 
@@ -918,7 +943,8 @@ impl App {
                         #[cfg(not(feature = "nanite"))]
                         let nanite_on = false;
                         loop {
-                            self.view_mode = (self.view_mode + 1) % 11;
+                            // 0–10 View/Planet, 11–12 Ocean (Surface/Intensity).
+                            self.view_mode = (self.view_mode + 1) % 13;
                             // Skip the Nanite-only geometry views (3–5) on the classic path.
                             if nanite_on || !(3..=5).contains(&self.view_mode) {
                                 break;
@@ -928,14 +954,14 @@ impl App {
                     }
 
                     // ── Wireframe toggle ──────────────────────────────────────
-                    // Use W in Globe/Placement mode for wireframe; in FirstPerson
+                    // Use W in Globe/Placement mode for wireframe; on the surface
                     // W is forward movement.
-                    KeyCode::KeyW if pressed && self.nav.mode() != NavMode::FirstPerson => {
+                    KeyCode::KeyW if pressed && self.nav.mode() != NavMode::Surface => {
                         self.wireframe = !self.wireframe;
                         log::info!("Wireframe → {}", self.wireframe);
                     }
 
-                    // ── FirstPerson WASD ──────────────────────────────────────
+                    // ── Surface-walk WASD ─────────────────────────────────────
                     KeyCode::KeyW => { self.move_keys.forward  = pressed; }
                     KeyCode::KeyA => { self.move_keys.left     = pressed; }
                     KeyCode::KeyS => { self.move_keys.backward = pressed; }
@@ -998,8 +1024,6 @@ impl App {
         let now = Instant::now();
         let dt  = now.duration_since(self.last_tick).as_secs_f32().min(0.1);
         self.last_tick = now;
-        self.last_dt   = dt;
-        self.ocean_time += dt.min(0.1); // clamp hitches so waves don't jump
 
         // ── Async loading: show a progress bar until the worker finishes ──
         if self.loader.is_some() {
@@ -1075,6 +1099,8 @@ impl App {
         };
         let nav_mode      = self.nav.mode();
         let view_mode     = self.view_mode;
+        // Ocean view modes (11–12) don't recolor the terrain — show it lit.
+        let terrain_view  = if view_mode >= 11 { 0 } else { view_mode };
         let wireframe     = self.wireframe;
         let taa_on        = self.taa_enabled;
         // This frame's sub-pixel jitter (for rasterization); advance() rolls it
@@ -1141,8 +1167,8 @@ impl App {
             if out.cycle_nav {
                 self.cycle_nav_mode();
             }
-            if out.exit_first_person && self.nav.mode() == NavMode::FirstPerson {
-                self.exit_first_person("UI button");
+            if out.exit_surface && self.nav.mode() == NavMode::Surface {
+                self.exit_surface("UI button");
             }
             if out.dismiss_load_stats {
                 self.show_load_stats = false;
@@ -1289,10 +1315,23 @@ impl App {
                         // resolves the per-frame stipple into a smooth blend).
                         let _ = n.update(
                             rhi, fi, camera_world_pos, &fu, screen_h_px,
-                            camera.fov_y_radians, self.nanite_tau, self.view_mode,
+                            camera.fov_y_radians, self.nanite_tau, terrain_view,
                             self.taa_enabled, self.frame_counter as u32,
                         );
                         let _ = n.record_cull(rhi, fi);
+                    }
+                }
+
+                // Third-person character: advance the gait + skin + upload this
+                // frame's verts (host-visible memcpy, fine outside the instance).
+                // Drawn only while walking the surface in third-person view.
+                let draw_character = nav_mode == NavMode::Surface
+                    && self.surface.as_ref().is_some_and(|t| t.show_character());
+                if draw_character {
+                    if let Some(ch) = self.character.as_mut() {
+                        if let Err(e) = ch.update(rhi, fi, self.surface_speed, dt) {
+                            log::error!("Character::update error: {e}");
+                        }
                     }
                 }
 
@@ -1301,7 +1340,7 @@ impl App {
                 rhi.set_viewport_scissor_full(fi);
                 if !nanite_active {
                     if let Some(pv) = self.planet_view.as_mut() {
-                        if let Err(e) = pv.record(rhi, fi, &fu, camera_world_pos, view_mode, wireframe) {
+                        if let Err(e) = pv.record(rhi, fi, &fu, camera_world_pos, terrain_view, wireframe) {
                             log::error!("PlanetView::record error: {e}");
                         }
                     }
@@ -1315,46 +1354,47 @@ impl App {
                     }
                 }
 
-
-                // Ocean: translucent sea-level shell (far / orbit), drawn after opaque.
-                if self.ocean_enabled {
-                    if let Some(o) = self.ocean.as_ref() {
-                        if let Err(e) =
-                            o.record(rhi, fi, &fu, camera_world_pos, self.sea_level_m)
-                        {
-                            log::error!("Ocean::record error: {e}");
+                // Character (after terrain/Nanite, before the translucent ocean).
+                if draw_character {
+                    if let (Some(ch), Some(tpc)) =
+                        (self.character.as_mut(), self.surface.as_ref())
+                    {
+                        let feet = tpc.feet_position();
+                        let facing = tpc.facing();
+                        if let Err(e) = ch.draw(rhi, fi, &fu, &camera, feet, facing) {
+                            log::error!("Character::draw error: {e}");
                         }
                     }
                 }
 
-                // FFT wave surface (near detail) with screen-space refraction.
-                // begin_water_pass splits the 3D pass (TAA path only): it resolves the
-                // opaque scene to a sampled image, then reopens a 1× instance the water
-                // draws into, sampling that image for refraction.
-                let sea = self.sea_level_m;
-                let otime = self.ocean_time;
-                let odt = self.last_dt;
-                // Waves only matter near the surface; below ~20 km the patch fills
-                // the view, above it the smooth shell suffices (and we skip the
-                // pass-split cost). Refraction needs the TAA path.
-                let show_waves = self.wave_enabled && self.wave.is_some() && altitude < 20_000.0;
-                if show_waves {
-                    match rhi.begin_water_pass(fi) {
-                        Ok(true) => {
-                            let scene_view = rhi.refraction_src_view();
-                            let ext = rhi.extent();
-                            let w = self.wave.as_mut().unwrap();
-                            w.params.choppiness = self.wave_choppiness;
-                            w.params.foam_threshold = self.wave_foam;
-                            if let Err(e) = w.record(
-                                rhi, fi, &fu, camera_world_pos, sea, otime, odt,
-                                scene_view, (ext.width, ext.height),
-                            ) {
-                                log::error!("WaveSurface::record error: {e}");
-                            }
+                // Ocean. With TAA on, begin_water_pass splits the 3D pass and the
+                // shell + FFT waves render in one refractive 1× pass (matching colour,
+                // depth-darkening, and refraction). Without TAA, fall back to the
+                // simple alpha-blended shell in the MSAA pass.
+                if self.ocean_enabled {
+                    let sea = self.sea_level_m;
+                    // The expensive FFT patch is drawn only near the surface; the shell
+                    // covers the rest. begin_water_pass returns false when TAA is off.
+                    let draw_waves = self.wave_enabled && altitude < 20_000.0;
+                    let split = self.wave.is_some() && rhi.begin_water_pass(fi).unwrap_or(false);
+                    if split {
+                        let scene_view = rhi.refraction_src_view();
+                        let scene_depth = rhi.refraction_depth_view();
+                        let ext = rhi.extent();
+                        let w = self.wave.as_mut().unwrap();
+                        w.params.choppiness = self.wave_choppiness;
+                        w.params.foam_threshold = self.wave_foam;
+                        w.debug_intensity = view_mode == 12; // Ocean: Intensity
+                        if let Err(e) = w.record(
+                            rhi, fi, &fu, camera_world_pos, sea,
+                            scene_view, scene_depth, (ext.width, ext.height), draw_waves,
+                        ) {
+                            log::error!("WaveSurface::record error: {e}");
                         }
-                        Ok(false) => {} // TAA off → no refraction split, no waves
-                        Err(e) => log::error!("begin_water_pass error: {e}"),
+                    } else if let Some(o) = self.ocean.as_ref() {
+                        if let Err(e) = o.record(rhi, fi, &fu, camera_world_pos, sea) {
+                            log::error!("Ocean::record error: {e}");
+                        }
                     }
                 }
             }
@@ -1409,7 +1449,7 @@ impl App {
                 rhi.begin_rendering(fi);
                 rhi.set_viewport_scissor_full(fi);
                 if let Some(pv) = self.planet_view.as_mut() {
-                    if let Err(e) = pv.record(rhi, fi, &fu, camera_world_pos, view_mode, wireframe) {
+                    if let Err(e) = pv.record(rhi, fi, &fu, camera_world_pos, terrain_view, wireframe) {
                         log::error!("PlanetView::record error (soak): {e}");
                     }
                 }

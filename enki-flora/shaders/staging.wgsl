@@ -479,3 +479,43 @@ fn fs_shadow(in: ShadowVsOut) -> @location(0) vec4<f32> {
     // Dark, slightly warm contact color (not pure black — reads as soft AO).
     return vec4<f32>(vec3<f32>(0.02, 0.018, 0.014), alpha);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (4) ARROW — flora-owned WIND-DIRECTION DEBUG GIZMO (unlit, solid color).
+//
+// ponytail: the cheapest possible direction indicator — a CPU-built shaft+head
+// mesh (4×vec3 layout, like the ground/shadow quads) drawn UNLIT with one solid
+// color. The viewer rotates/scales it via `arrow_pc.model` (camera-relative · a
+// yaw aligning local +X to windDir, length scaled by strength) and passes the
+// strength-mapped color (green→red) in `arrow_pc.color`. Opaque, depth-tested,
+// CULL-NONE (a thin box reads from any orbit angle). It lives in the SAME scene
+// HDR pass as the tree, so it composites/depth-tests against ground+tree. The
+// raw Preetham/ground go through ACES once in the OutputPass, so we emit a LINEAR
+// HDR color here too (the push color is already in a pleasant linear range).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// 80-byte push: camera-relative model + a solid RGBA color. Under the 128-byte
+// shared flora push range. Mirrors `ArrowPush` in staging.rs.
+struct ArrowPush {
+    model : mat4x4<f32>,
+    color : vec4<f32>,
+}
+var<immediate> arrow_pc: ArrowPush;
+
+struct ArrowVsOut {
+    @builtin(position) clip_pos : vec4<f32>,
+}
+
+@vertex
+fn vs_arrow(v: StageVsIn) -> ArrowVsOut {
+    var out: ArrowVsOut;
+    let world_pos = arrow_pc.model * vec4<f32>(v.position, 1.0);
+    out.clip_pos = frame.view_proj * world_pos;
+    return out;
+}
+
+@fragment
+fn fs_arrow(in: ArrowVsOut) -> @location(0) vec4<f32> {
+    // LINEAR HDR out — the flora OutputPass applies ACES ONCE on scene+bloom.
+    return arrow_pc.color;
+}

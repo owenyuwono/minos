@@ -6,7 +6,7 @@
 //! a swell spectrum. Computed once on the CPU; the per-frame sim ([`super::sim`])
 //! evolves it in time and inverse-FFTs it.
 
-use super::fft::Cx;
+use super::fft::{Cx, CZERO};
 
 /// One directional spectrum (a wind-sea or a swell component).
 #[derive(Clone, Copy, Debug)]
@@ -150,7 +150,7 @@ pub fn build_cascade(p: &CascadeParams, noise: &[Cx]) -> CascadeInit {
     let delta_k = 2.0 * std::f32::consts::PI / p.length_scale;
     let half = (n / 2) as i32;
 
-    let mut h0k = vec![Cx::ZERO; n * n];
+    let mut h0k = vec![CZERO; n * n];
     let mut wave = vec![Wave::default(); n * n];
 
     for y in 0..n {
@@ -181,8 +181,8 @@ pub fn build_cascade(p: &CascadeParams, noise: &[Cx]) -> CascadeInit {
     }
 
     // Conjugate pack: h0_conj[id] = conj( h0k[ (N-x)%N, (N-y)%N ] ).
-    let mut h0 = vec![Cx::ZERO; n * n];
-    let mut h0_conj = vec![Cx::ZERO; n * n];
+    let mut h0 = vec![CZERO; n * n];
+    let mut h0_conj = vec![CZERO; n * n];
     for y in 0..n {
         for x in 0..n {
             let id = y * n + x;

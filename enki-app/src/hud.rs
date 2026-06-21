@@ -59,7 +59,7 @@ impl Hud {
         let mode_str = match nav_mode {
             NavMode::Globe       => "Globe",
             NavMode::Placement   => "Placement",
-            NavMode::FirstPerson => "FP",
+            NavMode::Surface     => "Surface",
         };
 
         let alt_str = if altitude_m >= 1_000.0 {

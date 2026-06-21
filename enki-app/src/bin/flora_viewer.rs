@@ -2,9 +2,9 @@
 //
 // ponytail: the smallest host that lets us LOOK at one tree, reseed, AND DRIVE
 // the morphospace live. It owns its own winit window + Rhi + swapchain + frame
-// loop, builds ONE FloraView at the world origin, and auto-orbits a camera
-// framed to the branch-mesh AABB. NO planet / nanite / TAA / nav — just the
-// 6-call frame loop from the bootstrap recon, plus an egui panel.
+// loop, builds ONE FloraView at the world origin, and drives an interactive
+// orbit/zoom/pan camera framed to the branch-mesh AABB. NO planet / nanite /
+// TAA — just the 6-call frame loop from the bootstrap recon, plus an egui panel.
 //
 // The egui panel is a SCHEMA-DRIVEN copy of enki's EguiState plumbing
 // (gui.rs new/on_window_event/render are copy-identical; only build_frame is
@@ -17,6 +17,9 @@
 // Keys (all // ponytail: debug shortcuts):
 //   Esc        quit
 //   Space / N  next tree (random_genome with seed+1)
+//   LMB drag   orbit (yaw/pitch)
+//   wheel      zoom (distance)
+//   RMB / MMB  pan (move look-at target in the camera plane)
 
 use std::time::Instant;
 
@@ -34,7 +37,7 @@ use glam::{DVec3, Mat4, Quat, Vec3};
 use winit::{
     application::ApplicationHandler,
     dpi::LogicalSize,
-    event::{ElementState, KeyEvent, WindowEvent},
+    event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowAttributes, WindowId},
@@ -224,9 +227,110 @@ struct PanelOut {
     mode_changed: bool,
 }
 
+// ── dryad-look egui theme ────────────────────────────────────────────────────
+// Approximate dryad's HTML/CSS CAS panel (C:\Work\Prototype\dryad\index.html) in
+// egui 0.33. dryad mapping (hex = flattened from the CSS rgba, since egui has no
+// per-panel `backdrop-filter: blur` + translucency, so fills are OPAQUE approx):
+//   panel/window bg   rgba(8,10,14,0.88) #080A0E  → #0A0D12 (nudged up so it
+//                                                    doesn't read pure-black w/o blur)
+//   panel border      rgba(80,120,160,.35)        → #3A526B
+//   body text         #9ab                        → #99AABB
+//   strong/heading    #cde                        → #CCDDEE
+//   dim caption       rgba(120,160,200,~.7)       → #6E8CA8
+//   accent (sel/slider/active-tab) #5af           → #55AAFF
+//   accent2 (active text / hovered)#8cf           → #88CCFF
+//   slider track / input bg rgba(20,30,40,.9)     → #141E28  (extreme_bg_color)
+//   button bg         rgba(20,40,60,.9)           → #14283C  (widgets.inactive)
+//   hover bg          rgba(30,60,100,.9)          → #1E3C64  (widgets.hovered)
+//   active/sel bg     rgba(20,50,90,.85)          → #14325A  (widgets.active)
+//   radius: panels 6px, buttons/inputs 3px; font: body 11px, heading 13px.
+// APPROXIMATIONS (egui can't match CSS exactly): no blur/translucency (opaque
+// fills); no 2px bottom-border active-tab underline (egui `selectable_value`
+// fills the selected pill with the accent instead — closest available); no
+// per-side padding or uppercase letter-spacing on section labels.
+fn apply_dryad_style(ctx: &egui::Context) {
+    use egui::{Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle, Vec2};
+
+    let panel = Color32::from_rgb(0x0A, 0x0D, 0x12); // dryad #080A0E (nudged up)
+    let border = Color32::from_rgb(0x3A, 0x52, 0x6B); // rgba(80,120,160,.35)
+    let text = Color32::from_rgb(0x99, 0xAA, 0xBB); // #9ab body
+    let dim = Color32::from_rgb(0x6E, 0x8C, 0xA8); // rgba(120,160,200,~.7) caption
+    let accent = Color32::from_rgb(0x55, 0xAA, 0xFF); // #5af  selection / slider / tab
+    let accent2 = Color32::from_rgb(0x88, 0xCC, 0xFF); // #8cf  active text / hovered
+    let track = Color32::from_rgb(0x14, 0x1E, 0x28); // input + slider-track bg
+    let widget = Color32::from_rgb(0x14, 0x28, 0x3C); // button bg rgba(20,40,60)
+    let hovered = Color32::from_rgb(0x1E, 0x3C, 0x64); // hover bg rgba(30,60,100)
+    let active = Color32::from_rgb(0x14, 0x32, 0x5A); // selected/active rgba(20,50,90)
+
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = panel; // SidePanel  (= dryad #ui)
+    v.window_fill = panel; // Stats / View windows (= #stats-panel)
+    v.window_stroke = Stroke::new(1.0, border);
+    v.window_corner_radius = CornerRadius::same(6); // dryad 6px panels
+    v.faint_bg_color = Color32::from_rgb(0x10, 0x18, 0x22); // alt-row / faint fill
+    v.extreme_bg_color = track; // SLIDER TRACK + text-edit bg
+    v.selection.bg_fill = accent; // slider filled portion + selected text (#5af)
+    v.selection.stroke = Stroke::new(1.0, accent2);
+    v.hyperlink_color = accent2;
+    v.override_text_color = Some(text); // global #9ab; ui.strong()/colored for #cde/#8cf
+
+    let r = CornerRadius::same(3); // dryad button/input 3px
+
+    v.widgets.noninteractive.bg_fill = panel;
+    v.widgets.noninteractive.weak_bg_fill = panel;
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, dim); // separators/captions
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, border);
+
+    v.widgets.inactive.bg_fill = widget; // button rest #14283C
+    v.widgets.inactive.weak_bg_fill = widget;
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0, accent2); // button label #8cf
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0x35, 0x55, 0x70));
+    v.widgets.inactive.corner_radius = r;
+
+    v.widgets.hovered.bg_fill = hovered; // #1E3C64
+    v.widgets.hovered.weak_bg_fill = hovered;
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::from_rgb(0xAA, 0xDD, 0xFF)); // #adf
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, accent2);
+    v.widgets.hovered.corner_radius = r;
+
+    v.widgets.active.bg_fill = active; // pressed/selected #14325A
+    v.widgets.active.weak_bg_fill = active;
+    v.widgets.active.fg_stroke = Stroke::new(1.0, accent2);
+    v.widgets.active.bg_stroke = Stroke::new(1.0, accent);
+    v.widgets.active.corner_radius = r;
+
+    // `open` (combo popups, expanded menus) — keep them on-theme too.
+    v.widgets.open.bg_fill = active;
+    v.widgets.open.weak_bg_fill = active;
+    v.widgets.open.fg_stroke = Stroke::new(1.0, accent2);
+    v.widgets.open.bg_stroke = Stroke::new(1.0, accent);
+    v.widgets.open.corner_radius = r;
+
+    ctx.set_visuals(v);
+
+    // Spacing / sizing — dryad is compact: 11px font, ~6px gaps, 4px button pad.
+    ctx.style_mut(|s| {
+        s.spacing.item_spacing = Vec2::new(6.0, 6.0); // dryad gap:6 / margin-top:6
+        s.spacing.button_padding = Vec2::new(8.0, 4.0); // dryad padding 4px 10px
+        s.spacing.slider_width = 180.0; // fills the 320px panel
+        s.spacing.interact_size.y = 20.0; // tighter rows
+        s.visuals.clip_rect_margin = 3.0;
+        // Font sizes ≈ dryad: body 11px, heading 13px (egui pt ≈ px here).
+        s.text_styles
+            .insert(TextStyle::Heading, FontId::new(13.0, FontFamily::Proportional));
+        s.text_styles
+            .insert(TextStyle::Body, FontId::new(11.0, FontFamily::Proportional));
+        s.text_styles
+            .insert(TextStyle::Button, FontId::new(11.0, FontFamily::Proportional));
+        s.text_styles
+            .insert(TextStyle::Monospace, FontId::new(11.0, FontFamily::Monospace));
+    });
+}
+
 impl FloraGui {
     fn new(rhi: &Rhi, window: &Window) -> Self {
         let ctx = egui::Context::default();
+        apply_dryad_style(&ctx);
         let winit = egui_winit::State::new(
             ctx.clone(),
             egui::ViewportId::ROOT,
@@ -266,6 +370,11 @@ impl FloraGui {
         self.ctx.wants_keyboard_input()
     }
 
+    /// True when the pointer is over an egui panel (so nav must not steal it).
+    fn wants_pointer(&self) -> bool {
+        self.ctx.wants_pointer_input() || self.ctx.is_pointer_over_area()
+    }
+
     /// Build the flora CAS panel. Binds sliders to the live `genome`/`env`, so
     /// the panel always reflects on-screen state; returns the actions the viewer
     /// applies (rebuild / generate). Must run OUTSIDE the rendering instance
@@ -278,11 +387,13 @@ impl FloraGui {
         genome: &mut Genome,
         env: &mut Env,
         mode: &mut RenderMode,
+        leaf_mode: &mut LeafMode,
         seed: &mut u32,
         tab: &mut Tab,
         wind_on: &mut bool,
         wind_strength: &mut f32,
         wind_dir: &mut Vec3,
+        gizmo_on: &mut bool,
         bloom_on: &mut bool,
         bloom_strength: &mut f32,
         stats: &Stats,
@@ -300,7 +411,11 @@ impl FloraGui {
                 .resizable(true)
                 .default_width(LEFT_PANEL_W)
                 .show(ctx, |ui| {
-                    ui.heading("flora · CAS");
+                    // dryad <h1> is 13px/500 #cde (heading TextStyle = 13px above).
+                    ui.heading(
+                        egui::RichText::new("flora · CAS")
+                            .color(egui::Color32::from_rgb(0xCC, 0xDD, 0xEE)),
+                    );
 
                     // Header: Preset dropdown + Generate / Reroll.
                     ui.horizontal_wrapped(|ui| {
@@ -338,10 +453,37 @@ impl FloraGui {
 
                     ui.separator();
 
-                    // Tab strip — direct analog of dryad's `.tab-btn` row.
+                    // Tab strip — dryad's `.tab-btn` row: transparent text that is
+                    // dim (#9ab-ish) when inactive and accent (#8cf) with a 2px #5af
+                    // bottom-border when active. egui has no CSS underline, so we
+                    // hand-roll `selectable_label`s (transparent, not the accent pill)
+                    // + paint an accent hline under the active one (closest match).
+                    let accent = egui::Color32::from_rgb(0x55, 0xAA, 0xFF); // #5af
+                    let accent2 = egui::Color32::from_rgb(0x88, 0xCC, 0xFF); // #8cf
+                    let tab_dim = egui::Color32::from_rgb(0x6E, 0x8C, 0xA8);
                     ui.horizontal_wrapped(|ui| {
                         for (t, label) in TABS {
-                            ui.selectable_value(tab, t, label);
+                            let on = *tab == t;
+                            let txt = egui::RichText::new(label)
+                                .color(if on { accent2 } else { tab_dim });
+                            // Transparent button (override the accent selection pill)
+                            // so only the text colour + underline read as "active".
+                            let resp = ui.add(
+                                egui::Button::new(txt)
+                                    .fill(egui::Color32::TRANSPARENT)
+                                    .stroke(egui::Stroke::NONE),
+                            );
+                            if on {
+                                let r = resp.rect;
+                                ui.painter().hline(
+                                    r.x_range(),
+                                    r.bottom() - 1.0,
+                                    egui::Stroke::new(2.0, accent), // dryad 2px #5af
+                                );
+                            }
+                            if resp.clicked() {
+                                *tab = t;
+                            }
                         }
                     });
 
@@ -417,6 +559,21 @@ impl FloraGui {
                 .resizable(false)
                 .collapsible(false)
                 .show(ctx, |ui| {
+                    // dryad stat row: dim label LEFT, monospace #8cf value RIGHT.
+                    let dim = egui::Color32::from_rgb(0x6E, 0x8C, 0xA8);
+                    let val_col = egui::Color32::from_rgb(0x88, 0xCC, 0xFF); // #8cf
+                    // One dryad-style row: label (dim) left, mono value (color) right.
+                    let row = |ui: &mut egui::Ui, label: &str, value: String, col: egui::Color32| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(label).color(dim));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.monospace(egui::RichText::new(value).color(col));
+                                },
+                            );
+                        });
+                    };
                     // FPS color-coded per dryad (≥50 good, ≥30 ok, else bad).
                     let fps_color = if stats.fps >= 50.0 {
                         egui::Color32::from_rgb(0x4c, 0xd9, 0x64)
@@ -425,15 +582,12 @@ impl FloraGui {
                     } else {
                         egui::Color32::from_rgb(0xe0, 0x5c, 0x5c)
                     };
-                    ui.horizontal(|ui| {
-                        ui.label("FPS:");
-                        ui.colored_label(fps_color, format!("{:.0}  ({:.2} ms)", stats.fps, stats.frame_ms));
-                    });
-                    ui.label(format!("Triangles: {}", stats.triangles));
-                    ui.label(format!("Draw calls: {}", stats.draw_calls));
-                    ui.label(format!("Leaf clusters: {}", stats.leaves));
-                    ui.label(format!("Bones: {}", stats.bones));
-                    ui.label(format!("Resolution: {}x{}", stats.resolution.0, stats.resolution.1));
+                    row(ui, "FPS", format!("{:.0}  ({:.2} ms)", stats.fps, stats.frame_ms), fps_color);
+                    row(ui, "Triangles", format!("{}", stats.triangles), val_col);
+                    row(ui, "Draw calls", format!("{}", stats.draw_calls), val_col);
+                    row(ui, "Leaf clusters", format!("{}", stats.leaves), val_col);
+                    row(ui, "Bones", format!("{}", stats.bones), val_col);
+                    row(ui, "Resolution", format!("{}x{}", stats.resolution.0, stats.resolution.1), val_col);
                 });
 
             // ── (C) View window: render-mode buttons + Wind + Bloom. Placed just
@@ -455,6 +609,23 @@ impl FloraGui {
                         }
                     });
                     ui.separator();
+                    // Leaf mode: Cluster (one card per cluster, fan sprite) vs
+                    // Single (each cluster fanned into its individual leaves, each
+                    // a one-leaf sprite). Flipping it changes BOTH the mesh
+                    // (expansion) and the baked sprite, so it forces a full rebuild.
+                    ui.label("Leaf mode:");
+                    ui.horizontal_wrapped(|ui| {
+                        let mut c = ui
+                            .selectable_value(leaf_mode, LeafMode::Cluster, "Cluster")
+                            .changed();
+                        c |= ui
+                            .selectable_value(leaf_mode, LeafMode::Single, "Single")
+                            .changed();
+                        if c {
+                            out.rebuild = true;
+                        }
+                    });
+                    ui.separator();
                     // Wind (animation only — NOT a rebuild; read live in render()).
                     // `env.wind` (Climate tab) is the MORPHOLOGY gene; this is the
                     // procedural global-field sway.
@@ -462,6 +633,8 @@ impl FloraGui {
                     ui.add(egui::Slider::new(wind_strength, 0.0..=1.5).text("strength"));
                     ui.add(egui::Slider::new(&mut wind_dir.x, -1.0..=1.0).text("dir x"));
                     ui.add(egui::Slider::new(&mut wind_dir.z, -1.0..=1.0).text("dir z"));
+                    // Wind-direction debug arrow gizmo (flora-owned, scene pass).
+                    ui.checkbox(gizmo_on, "Wind gizmo");
                     ui.separator();
                     // Bloom (UnrealBloom POST — animation only, NOT a rebuild).
                     ui.checkbox(bloom_on, "Bloom");
@@ -540,6 +713,130 @@ impl Fit {
         let radius = (mx - center).length().max(0.5);
         let distance = (radius / (fov_y * 0.5).sin()) * 1.4;
         Fit { center, distance }
+    }
+}
+
+/// Interactive orbit/zoom/pan camera (replaces the time-driven auto-spin).
+///
+/// State is the usual turntable quartet: a `target` look-at point (starts at the
+/// auto-fit tree center), an eye `distance` from it (starts at the fit distance),
+/// and `yaw`/`pitch` spherical angles. The eye sits at
+/// `target + dir(yaw,pitch) * distance`, looking at `target`, +Y up — the same
+/// quaternion convention the old `camera()` used (`look_to_rh(ZERO, fwd, +Y)`
+/// inverted), so framing/lighting are unchanged at the initial pose.
+///
+/// Mappings (driven from `window_event`, only when egui didn't grab the pointer):
+///   - LMB drag  → `yaw -= dx*ORBIT_SENS`, `pitch += dy*ORBIT_SENS` (clamped ±~89°)
+///   - wheel     → `distance *= (1 - scroll*ZOOM_RATE)`, clamped to [min,max]
+///   - RMB/MMB   → pan `target` in the camera's right/up plane, scaled by distance
+#[derive(Clone, Copy)]
+struct OrbitCamera {
+    target: Vec3,
+    distance: f32,
+    yaw: f32,
+    pitch: f32,
+}
+
+/// Drag sensitivity (radians per pixel) for orbit yaw/pitch.
+const ORBIT_SENS: f32 = 0.005;
+/// Geometric zoom step per wheel notch (fraction of current distance).
+const ZOOM_RATE: f32 = 0.1;
+/// Pitch clamp (~±89°) so the camera never flips through the pole.
+const PITCH_LIMIT: f32 = 1.55;
+/// Pan speed: world units per pixel, per unit of distance.
+const PAN_RATE: f32 = 0.0015;
+
+impl OrbitCamera {
+    /// Frame from the auto-fit AABB. Initial yaw 0 / pitch 18° reproduces the old
+    /// auto-spin's starting elevation, so the first frame matches the prior view.
+    fn from_fit(fit: Fit) -> Self {
+        OrbitCamera {
+            target: fit.center,
+            distance: fit.distance.max(0.05),
+            yaw: 0.0,
+            pitch: 18_f32.to_radians(),
+        }
+    }
+
+    fn orbit(&mut self, dx: f32, dy: f32) {
+        self.yaw -= dx * ORBIT_SENS;
+        self.pitch = (self.pitch + dy * ORBIT_SENS).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+    }
+
+    /// `scroll` > 0 zooms IN (wheel up). Distance stays in a sane range so the
+    /// tree can't be lost behind the near plane or shrunk to a dot.
+    fn zoom(&mut self, scroll: f32) {
+        self.distance = (self.distance * (1.0 - scroll * ZOOM_RATE)).clamp(0.05, 10_000.0);
+    }
+
+    /// Pan the look-at target in the camera's right/up plane (RMB/MMB drag). Drag
+    /// magnitude scales with distance so the world tracks the cursor at any zoom.
+    fn pan(&mut self, dx: f32, dy: f32) {
+        let (right, up, _) = self.basis();
+        let k = self.distance * PAN_RATE;
+        self.target += right * (-dx * k) + up * (dy * k);
+    }
+
+    /// Orthonormal camera basis (right, up, forward). `forward` points from the
+    /// eye TOWARD the target. Pole-safe via `normalize_or`.
+    fn basis(&self) -> (Vec3, Vec3, Vec3) {
+        let (sy, cy) = self.yaw.sin_cos();
+        let (sp, cp) = self.pitch.sin_cos();
+        // dir = eye-from-target direction; forward (eye→target) is its negation.
+        let dir = Vec3::new(cy * cp, sp, sy * cp);
+        let forward = (-dir).normalize_or(Vec3::NEG_Z);
+        let right = forward.cross(Vec3::Y).normalize_or(Vec3::X);
+        let up = right.cross(forward);
+        (right, up, forward)
+    }
+
+    fn camera(&self) -> Camera {
+        let (_, _, forward) = self.basis();
+        let eye = self.target - forward * self.distance;
+        let orientation =
+            Quat::from_mat4(&Mat4::look_to_rh(Vec3::ZERO, forward, Vec3::Y)).inverse();
+        Camera {
+            position: eye.as_dvec3(),
+            orientation,
+            fov_y_radians: 60_f32.to_radians(),
+            near: 0.1,
+            far: 10_000.0,
+        }
+    }
+}
+
+/// Parse the optional `FLORA_CAM=yaw,pitch,dist` env var (degrees, degrees, world
+/// units) for headless capture framing. Returns `None` if unset/malformed so the
+/// default auto-fit pose is used (existing FLORA_SCREENSHOT captures unchanged).
+fn cam_override() -> Option<(f32, f32, f32)> {
+    let raw = std::env::var("FLORA_CAM").ok()?;
+    let parts: Vec<f32> = raw
+        .split(',')
+        .filter_map(|s| s.trim().parse::<f32>().ok())
+        .collect();
+    if parts.len() == 3 {
+        Some((parts[0], parts[1], parts[2]))
+    } else {
+        None
+    }
+}
+
+/// Parse the optional `FLORA_WIND=strength,dirx,dirz[,time]` env var for headless
+/// capture. Forces wind ON at the given strength/direction and (4th value, else a
+/// non-zero default) seeds the wind clock so a STILL shows the canopy displaced
+/// along the wind vector. Returns `(strength, dir_x, dir_z, time)` or `None` when
+/// unset/malformed (existing captures keep the panel defaults).
+fn wind_override() -> Option<(f32, f32, f32, f32)> {
+    let raw = std::env::var("FLORA_WIND").ok()?;
+    let parts: Vec<f32> = raw
+        .split(',')
+        .filter_map(|s| s.trim().parse::<f32>().ok())
+        .collect();
+    match parts.len() {
+        // Default to a non-zero phase so a single frame is mid-gust, not at rest.
+        3 => Some((parts[0], parts[1], parts[2], 2.0)),
+        4 => Some((parts[0], parts[1], parts[2], parts[3])),
+        _ => None,
     }
 }
 
@@ -631,15 +928,39 @@ struct App {
     staging: Option<Staging>,
     egui: Option<FloraGui>,
     fit: Fit,
+    /// Interactive orbit/zoom/pan camera (replaces the auto-spin). Re-framed from
+    /// `fit` on every build/reseed. The screenshot path uses `fit` directly so
+    /// captures keep the deterministic auto-fit framing.
+    orbit: OrbitCamera,
+    /// Mouse drag state for the orbit controller. `last_cursor` is the previous
+    /// CursorMoved position (for deltas); the button flags select orbit vs pan.
+    lmb_down: bool,
+    rmb_down: bool,
+    mmb_down: bool,
+    last_cursor: Option<(f32, f32)>,
+    /// Wind-gizmo interaction state. `gizmo_hover` is set each mouse-move when the
+    /// cursor's ground-plane (y=0) point lands on the arrow footprint and egui
+    /// isn't using the pointer (drives the highlight). `gizmo_grabbed` is latched
+    /// on LMB-down over the arrow: while true, the orbit camera is SUPPRESSED
+    /// (its dispatch keys off `lmb_down`, which we leave false during a grab) and
+    /// CursorMoved instead ray-casts to y=0 and rewrites `wind_dir`.
+    gizmo_hover: bool,
+    gizmo_grabbed: bool,
+    /// Last known cursor position regardless of button state — needed so a hover
+    /// hit-test (and the grab decision at press time) has a position even when no
+    /// drag is in flight. `last_cursor` is reset between drags, so it can't serve.
+    cursor_pos: Option<(f32, f32)>,
     seed: u32,
     /// The single source of truth for what's on screen — reseed and edits both
     /// flow through this genome, so the panel always reflects the live tree.
     genome: Genome,
     env: Env,
     mode: RenderMode,
+    /// Leaf rendering mode (Cluster = one card/cluster, Single = one card/leaf).
+    /// Flipping it forces a tree rebuild (mesh expansion + sprite re-bake).
+    leaf_mode: LeafMode,
     /// Active left-panel CAS tab (Climate / Trunk / Branches / Leaves / Root).
     tab: Tab,
-    start: Instant,
     last_frame: Instant,
     minimized: bool,
     /// Triangle/leaf/bone/draw-call counts from the last rebuild (cheap to cache).
@@ -652,6 +973,11 @@ struct App {
     wind_strength: f32,
     wind_dir: Vec3, // xz used as the horizontal wind direction
     wind_clock: f32,
+    /// Wind-direction debug GIZMO toggle (default ON): a flora-owned unlit arrow
+    /// at the tree base pointing along `wind_dir`, length/color scaled by strength.
+    /// Updates LIVE as the dir x/z + strength sliders move. Independent of
+    /// `wind_on` — it's a direction indicator, drawn whenever the toggle is set.
+    gizmo_on: bool,
     /// UnrealBloom POST controls (dryad: strength 0.15). `bloom_on` gates the
     /// effect; the effective strength fed to `run_bloom` is 0 when off, so OFF or
     /// strength 0 is byte-identical to the offscreen-stage parity image.
@@ -675,8 +1001,8 @@ struct App {
 }
 
 /// ponytail: warm-up frames before the capture (per the brief: ~45) — enough for
-/// the swapchain/pipelines to be warm and the auto-orbit camera at its initial
-/// framing (t≈0.7s of orbit, still essentially front-on).
+/// the swapchain/pipelines to be warm. The camera is the fixed auto-fit orbit pose
+/// (no input fed in headless mode), so framing is deterministic front-on.
 const SCREENSHOT_WARMUP_FRAMES: u32 = 45;
 
 impl App {
@@ -734,20 +1060,42 @@ impl App {
             staging: None,
             egui: None,
             fit: Fit { center: Vec3::ZERO, distance: 30.0 },
+            // Real framing is set by the first build_tree(); this is a placeholder.
+            orbit: OrbitCamera {
+                target: Vec3::ZERO,
+                distance: 30.0,
+                yaw: 0.0,
+                pitch: 18_f32.to_radians(),
+            },
+            lmb_down: false,
+            rmb_down: false,
+            mmb_down: false,
+            last_cursor: None,
+            gizmo_hover: false,
+            gizmo_grabbed: false,
+            cursor_pos: None,
             seed,
             genome,
             env,
             mode,
+            // Initial leaf mode from FLORA_LEAFMODE (default Cluster), so a
+            // headless screenshot can capture the Single fan without the panel.
+            leaf_mode: LeafMode::from_env(),
             tab: Tab::Climate,
-            start: Instant::now(),
             last_frame: Instant::now(),
             minimized: false,
             last_stats: (0, 0, 0, 0),
             // Wind ON by default at a gentle strength (strength 0 = exact static).
+            // FLORA_WIND=strength,dirx,dirz[,time] overrides for headless capture.
             wind_on: true,
-            wind_strength: 0.6,
-            wind_dir: Vec3::new(1.0, 0.0, 0.0),
-            wind_clock: 0.0,
+            wind_strength: wind_override().map(|w| w.0).unwrap_or(0.6),
+            wind_dir: wind_override()
+                .map(|w| Vec3::new(w.1, 0.0, w.2))
+                .unwrap_or(Vec3::new(1.0, 0.0, 0.0)),
+            wind_clock: wind_override().map(|w| w.3).unwrap_or(0.0),
+            // Wind-direction gizmo ON by default (per the brief) so the set wind
+            // direction is always visible; the FLORA_WIND capture shows it too.
+            gizmo_on: true,
             // Bloom ON at dryad's default strength (0 / OFF = exact parity).
             bloom_on: true,
             bloom_strength: 0.15,
@@ -794,6 +1142,15 @@ impl App {
                 let fov_y = 60_f32.to_radians();
                 let (min, max) = f.local_bounds();
                 self.fit = Fit::from_bounds(min, max, fov_y);
+                // Re-frame the orbit camera on each build/reseed (simplest: reset
+                // to the auto-fit pose). An optional FLORA_CAM=yaw,pitch,dist (degs
+                // + world units) overrides the starting pose for headless capture.
+                self.orbit = OrbitCamera::from_fit(self.fit);
+                if let Some((yaw, pitch, dist)) = cam_override() {
+                    self.orbit.yaw = yaw.to_radians();
+                    self.orbit.pitch = (pitch.to_radians()).clamp(-PITCH_LIMIT, PITCH_LIMIT);
+                    self.orbit.distance = dist.max(0.05);
+                }
                 // Draw calls: the tree's branch+leaf passes plus the 2 Staging
                 // draws (sky + ground) the viewer always records.
                 self.last_stats = (
@@ -882,23 +1239,103 @@ impl App {
         self.egui = None;
     }
 
+    /// The view camera. Interactive runs use the orbit controller (LMB orbit,
+    /// wheel zoom, RMB/MMB pan — all driven from `window_event`). Headless
+    /// screenshot mode renders the orbit pose too, but since `build_tree` resets
+    /// it to the auto-fit pose (optionally `FLORA_CAM`-overridden) and no input is
+    /// fed, captures keep the deterministic auto-fit framing.
     fn camera(&self) -> Camera {
-        let t = self.start.elapsed().as_secs_f32();
-        let yaw = t * 0.35;
-        let elev = 18_f32.to_radians();
-        let (sy, cy) = yaw.sin_cos();
-        let dir = Vec3::new(cy * elev.cos(), elev.sin(), sy * elev.cos());
-        let eye = self.fit.center + dir * self.fit.distance;
-        let forward = (self.fit.center - eye).normalize_or(Vec3::NEG_Z);
-        let orientation =
-            Quat::from_mat4(&glam::Mat4::look_to_rh(Vec3::ZERO, forward, Vec3::Y)).inverse();
-        Camera {
-            position: eye.as_dvec3(),
-            orientation,
-            fov_y_radians: 60_f32.to_radians(),
-            near: 0.1,
-            far: 10_000.0,
+        self.orbit.camera()
+    }
+
+    /// Current viewport size in pixels (0,0 if the RHI isn't up yet).
+    fn viewport(&self) -> (f32, f32) {
+        self.rhi
+            .as_ref()
+            .map(|r| {
+                let e = r.extent();
+                (e.width as f32, e.height as f32)
+            })
+            .unwrap_or((0.0, 0.0))
+    }
+
+    /// Cast a ray from the orbit eye through the cursor pixel `(px, py)` onto the
+    /// ground plane y=0 (tree base = world origin). Returns the world hit (x,_,z)
+    /// or None if the viewport is degenerate or the ray is parallel/behind.
+    ///
+    /// Convention-free (Option B from recon): builds the ray straight from the
+    /// orbit camera BASIS + fov, so it sidesteps the reversed-Z projection that
+    /// would trip up a generic unproject. `forward` = eye→target, +Y up.
+    fn cursor_ground_hit(&self, px: f32, py: f32) -> Option<Vec3> {
+        let (w, h) = self.viewport();
+        if w <= 0.0 || h <= 0.0 {
+            return None;
         }
+        let (right, up, forward) = self.orbit.basis();
+        let cam = self.orbit.camera();
+        let eye = cam.position.as_vec3();
+        // Pixel → NDC (winit y is top-down; flip so screen-up maps to +up).
+        let ndc_x = 2.0 * px / w - 1.0;
+        let ndc_y = 1.0 - 2.0 * py / h;
+        let ty = (cam.fov_y_radians * 0.5).tan();
+        let tx = ty * (w / h);
+        let dir = (forward + right * (ndc_x * tx) + up * (ndc_y * ty)).normalize_or(forward);
+        if dir.y.abs() < 1e-6 {
+            return None;
+        }
+        let t = -eye.y / dir.y;
+        if t <= 0.0 {
+            return None;
+        }
+        Some(eye + dir * t)
+    }
+
+    /// True if the ground point under cursor pixel `(px,py)` lands on the arrow's
+    /// flat footprint (a fattened segment from the origin along `wind_dir`). Uses
+    /// the SAME constants the arrow mesh is built from (staging.rs) plus a small
+    /// grab margin. Robust at any zoom/angle (no screen-space projection).
+    fn gizmo_hit(&self, px: f32, py: f32) -> bool {
+        let Some(hit) = self.cursor_ground_hit(px, py) else {
+            return false;
+        };
+        let dir = Vec3::new(self.wind_dir.x, 0.0, self.wind_dir.z).normalize_or(Vec3::X);
+        let dir2 = glam::Vec2::new(dir.x, dir.z);
+        // World arrow length = (shaft + head) * per-frame strength scale.
+        let len_scale = 0.35 + self.wind_strength.clamp(0.0, 1.5);
+        let l = enki_app::staging::ARROW_TOTAL_LEN * len_scale;
+        let p = glam::Vec2::new(hit.x, hit.z);
+        let along = p.dot(dir2);
+        let perp = (p - dir2 * along).length();
+        along >= -0.5 && along <= l + 0.5 && perp <= enki_app::staging::ARROW_GRAB_HALF
+    }
+
+    /// Drive the wind direction from a gizmo drag: ray-cast the cursor to y=0 and
+    /// set `wind_dir = normalize((groundHit - base).xz)` (base = origin), so the
+    /// arrow points from the tree base toward the cursor's ground point. Because
+    /// the panel's "dir x"/"dir z" sliders bind directly to `wind_dir.x/.z` and are
+    /// re-read every frame, they stay synced automatically (no extra plumbing).
+    ///
+    /// Optional secondary mapping (direction stays primary): the cursor's DISTANCE
+    /// from the base scales strength, clamped to the slider's 0..=1.5 range — so
+    /// dragging the arrow further out also strengthens the wind. strength=0 is only
+    /// reachable when the cursor is at the base, keeping a hard-static tree possible.
+    fn apply_gizmo_drag(&mut self, px: f32, py: f32) {
+        let Some(hit) = self.cursor_ground_hit(px, py) else {
+            return;
+        };
+        let xz = Vec3::new(hit.x, 0.0, hit.z);
+        // DIRECTION (primary): normalize toward the ground point; keep the old dir
+        // if the cursor is right on the base (degenerate), so the arrow never snaps.
+        let dir = xz.normalize_or(Vec3::new(self.wind_dir.x, 0.0, self.wind_dir.z));
+        if dir.length_squared() > 0.0 {
+            self.wind_dir = Vec3::new(dir.x, 0.0, dir.z);
+        }
+        // STRENGTH (secondary): map ground distance → strength. The full arrow
+        // length at strength 1.0 is ARROW_TOTAL_LEN; use it as the unit scale so a
+        // drag of ~one arrow-length ≈ strength 1.0. Clamped to the slider range.
+        let dist = xz.length();
+        self.wind_strength =
+            (dist / enki_app::staging::ARROW_TOTAL_LEN).clamp(0.0, 1.5);
     }
 
     fn render(&mut self) {
@@ -952,11 +1389,13 @@ impl App {
                 &mut self.genome,
                 &mut self.env,
                 &mut self.mode,
+                &mut self.leaf_mode,
                 &mut self.seed,
                 &mut self.tab,
                 &mut self.wind_on,
                 &mut self.wind_strength,
                 &mut self.wind_dir,
+                &mut self.gizmo_on,
                 &mut self.bloom_on,
                 &mut self.bloom_strength,
                 &stats,
@@ -1191,6 +1630,32 @@ impl App {
                 log::error!("FloraView::record error: {e}");
             }
         }
+        // ── WIND GIZMO: a flora-owned unlit arrow at the tree base pointing along
+        //    `wind_dir`, length/color scaled by the wind strength. Drawn AFTER the
+        //    tree so it depth-tests against ground+tree; gated on the panel toggle
+        //    (default ON). It reads the SAME `wind_dir` the solver/vertex push use,
+        //    so the arrow always points where the canopy leans, and updates live as
+        //    the dir x/z + strength sliders move. Uses the panel strength (not the
+        //    `wind_on`-gated `wind_strength`) so the arrow still shows direction
+        //    when Wind is toggled off. ──
+        if self.gizmo_on {
+            if let (Some(renderer), Some(staging)) =
+                (self.flora_renderer.as_ref(), self.staging.as_mut())
+            {
+                if let Err(e) = staging.record_arrow(
+                    rhi,
+                    renderer,
+                    fi,
+                    camera_world_pos,
+                    self.wind_dir,
+                    self.wind_strength,
+                    self.gizmo_hover || self.gizmo_grabbed,
+                ) {
+                    log::error!("Staging::record_arrow error: {e}");
+                }
+            }
+        }
+
         // Effective bloom strength: 0 when toggled OFF (composite zeros out →
         // output == scene, the offscreen-stage parity image).
         let bloom_strength = if self.bloom_on { self.bloom_strength } else { 0.0 };
@@ -1360,6 +1825,9 @@ impl ApplicationHandler for App {
             _ => false,
         };
         let wants_kb = self.egui.as_ref().map(|e| e.wants_keyboard()).unwrap_or(false);
+        // egui pointer gate for nav: true when the cursor is over a panel. Used
+        // for the orbit mouse arms so dragging on a panel never moves the camera.
+        let wants_ptr = self.egui.as_ref().map(|e| e.wants_pointer()).unwrap_or(false);
 
         match event {
             WindowEvent::CloseRequested => {
@@ -1392,6 +1860,112 @@ impl ApplicationHandler for App {
                 }
                 _ => {}
             },
+            // ── Orbit controller mouse input (only when egui isn't using the
+            //    pointer). Button-down latches drag state; CursorMoved applies the
+            //    delta (LMB→orbit, RMB/MMB→pan); wheel zooms. egui consumes pointer
+            //    events first (event-first philosophy), so panels stay interactive.
+            WindowEvent::MouseInput { state, button, .. } => {
+                let down = state == ElementState::Pressed;
+                // Only START a drag when egui isn't using the pointer (so a click
+                // on a panel doesn't grab the camera). ALWAYS honor a release,
+                // even over a panel, so a button can't stay latched down.
+                if down && (egui_consumed || wants_ptr) {
+                    // press swallowed by egui — ignore for nav
+                } else {
+                    match button {
+                        MouseButton::Left => {
+                            if down {
+                                // GIZMO PRIORITY: decide a grab BEFORE orbit latches.
+                                // If the LMB press lands on the arrow footprint, grab
+                                // the gizmo and DON'T set `lmb_down` — that structurally
+                                // suppresses orbit (its CursorMoved dispatch keys off
+                                // `lmb_down`). Otherwise fall through to a normal orbit.
+                                let over = self.gizmo_on
+                                    && self
+                                        .cursor_pos
+                                        .map(|(x, y)| self.gizmo_hit(x, y))
+                                        .unwrap_or(false);
+                                if over {
+                                    self.gizmo_grabbed = true;
+                                    // Apply the direction immediately on press so a
+                                    // click (no move) still snaps toward the cursor.
+                                    if let Some((x, y)) = self.cursor_pos {
+                                        self.apply_gizmo_drag(x, y);
+                                    }
+                                } else {
+                                    self.lmb_down = true;
+                                }
+                            } else {
+                                // Release ALWAYS clears both, so neither can stick.
+                                self.lmb_down = false;
+                                self.gizmo_grabbed = false;
+                            }
+                        }
+                        MouseButton::Right => self.rmb_down = down,
+                        MouseButton::Middle => self.mmb_down = down,
+                        _ => {}
+                    }
+                }
+                if !self.lmb_down && !self.rmb_down && !self.mmb_down && !self.gizmo_grabbed {
+                    self.last_cursor = None;
+                }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            // Cursor motion: (a) GRABBED gizmo → ray-cast to y=0 and steer wind_dir;
+            // (b) a latched button → orbit/pan as before; (c) no button → just track
+            // position + update the hover highlight. The gizmo branch comes FIRST so
+            // a grab beats orbit; orbit can't fire during a grab anyway since the
+            // grab leaves `lmb_down` false.
+            WindowEvent::CursorMoved { position, .. } => {
+                let p = (position.x as f32, position.y as f32);
+                self.cursor_pos = Some(p);
+                if self.gizmo_grabbed {
+                    // Live re-orient: arrow + sliders + canopy all follow this.
+                    self.apply_gizmo_drag(p.0, p.1);
+                    self.last_cursor = Some(p);
+                    if let Some(w) = &self.window {
+                        w.request_redraw();
+                    }
+                } else if self.lmb_down || self.rmb_down || self.mmb_down {
+                    if let Some((lx, ly)) = self.last_cursor {
+                        let (dx, dy) = (p.0 - lx, p.1 - ly);
+                        if self.lmb_down {
+                            self.orbit.orbit(dx, dy);
+                        } else if self.rmb_down || self.mmb_down {
+                            self.orbit.pan(dx, dy);
+                        }
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                    self.last_cursor = Some(p);
+                } else {
+                    // No drag: refresh the hover highlight (only when egui isn't
+                    // using the pointer, so hovering a panel doesn't light the arrow).
+                    let hover = self.gizmo_on
+                        && !wants_ptr
+                        && !egui_consumed
+                        && self.gizmo_hit(p.0, p.1);
+                    if hover != self.gizmo_hover {
+                        self.gizmo_hover = hover;
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } if !egui_consumed && !wants_ptr => {
+                let s = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.01,
+                };
+                self.orbit.zoom(s);
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
             WindowEvent::RedrawRequested => self.render(),
             _ => {}
         }

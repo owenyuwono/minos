@@ -24,7 +24,7 @@
 // // come from rhi.msaa_samples()), so edges are already resolved.
 
 use enki_rhi::{BufferHandle, Rhi, RhiError};
-use glam::{DVec3, Mat4};
+use glam::{DVec3, Mat4, Quat, Vec3};
 
 use crate::flora_render::{FloraPipeline, FloraRenderer};
 
@@ -43,6 +43,37 @@ const SHADOW_LIFT: f32 = 0.02;
 struct StagePush {
     model: [[f32; 4]; 4],
 }
+
+/// 80-byte push for the wind-gizmo arrow: a camera-relative model matrix + a
+/// solid RGBA color. Under the shared 128-byte flora push range. Mirrors
+/// `ArrowPush` in staging.wgsl.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ArrowPush {
+    model: [[f32; 4]; 4],
+    color: [f32; 4],
+}
+
+/// Local length of the arrow shaft (metres) at strength 1.0 before the per-frame
+/// strength scale. The head sits beyond this. Sized to read against a ~30 m tree.
+const ARROW_LEN: f32 = 4.0;
+/// Half-width of the square shaft cross-section (metres).
+const ARROW_SHAFT_HALF: f32 = 0.18;
+/// Half-width of the arrowhead base (metres); the head tapers to a point.
+const ARROW_HEAD_HALF: f32 = 0.55;
+/// Length of the arrowhead cone (metres), appended past the shaft.
+const ARROW_HEAD_LEN: f32 = 1.2;
+/// Lift the arrow this far above y=0 so it sits ON the ground, not z-fighting it.
+const ARROW_LIFT: f32 = 0.05;
+
+/// Total local length of the arrow (shaft + head) at strength 1.0, before the
+/// per-frame strength scale. Exposed so the interactive picker (flora_viewer)
+/// can hit-test the cursor against the arrow's ground footprint using the exact
+/// geometry the mesh is built from.
+pub const ARROW_TOTAL_LEN: f32 = ARROW_LEN + ARROW_HEAD_LEN;
+/// Half-width of the arrow's grab footprint: the widest part (head base) plus a
+/// small margin so the gizmo is comfortable to grab. Exposed for the picker.
+pub const ARROW_GRAB_HALF: f32 = ARROW_HEAD_HALF + 0.3;
 
 /// One uploaded indexed mesh in the 4×vec3 layout (pos/nrm/uv/attr).
 struct GpuMesh {
@@ -64,6 +95,10 @@ pub struct Staging {
     sky: GpuMesh,
     ground: GpuMesh,
     shadow: GpuMesh,
+    /// Wind-direction debug gizmo: a unit-length shaft+head along local +X, built
+    /// ONCE; the per-frame model matrix rotates it to windDir and scales its length
+    /// by strength. Drawn only when the viewer's `gizmo_on` toggle is set.
+    arrow: GpuMesh,
 }
 
 impl Staging {
@@ -95,10 +130,15 @@ impl Staging {
         let r = shadow_radius.max(1.0);
         let shadow = plane_mesh(rhi, r, SHADOW_LIFT)?;
 
-        // ── Pipelines live in the flora-owned FloraRenderer (sky/ground/shadow),
-        //    built once at viewer startup. Staging only holds the 3 meshes. ──
+        // ARROW: the wind-direction gizmo mesh — a thin square-section shaft + a
+        // pyramid head, both along local +X, base at the local origin (y lifted in
+        // the model matrix). Built once; per-frame rotated/scaled to windDir.
+        let arrow = arrow_mesh(rhi)?;
 
-        Ok(Self { sky, ground, shadow })
+        // ── Pipelines live in the flora-owned FloraRenderer (sky/ground/shadow/
+        //    arrow), built once at viewer startup. Staging only holds the meshes. ──
+
+        Ok(Self { sky, ground, shadow, arrow })
     }
 
     /// Record sky → ground → contact shadow through the flora-OWNED `renderer`'s
@@ -146,6 +186,64 @@ impl Staging {
         Ok(())
     }
 
+    /// Record the WIND-DIRECTION debug gizmo: an unlit arrow at the tree base
+    /// (world origin, y≈0) pointing along the horizontal wind direction `wind_dir`
+    /// (its xz are used; need not be normalized), with length scaled by `strength`
+    /// and color lerped green→red by `strength`. Call INSIDE the scene pass AFTER
+    /// the tree (so it depth-tests against ground+tree). The caller gates this on
+    /// the `Wind gizmo` toggle, so it isn't recorded when the toggle is off.
+    ///
+    /// The arrow mesh is built once along local +X; here we just compose the model
+    /// matrix = camera-relative translation (tree base = world origin) · rotation
+    /// (local +X → windDir) · length-scale-by-strength, so it updates LIVE as the
+    /// dir x/z + strength sliders change — exactly the same windDir the solver and
+    /// the vertex push consume.
+    pub fn record_arrow(
+        &mut self,
+        rhi: &mut Rhi,
+        renderer: &FloraRenderer,
+        fi: u32,
+        camera_world_pos: DVec3,
+        wind_dir: Vec3,
+        strength: f32,
+        highlight: bool,
+    ) -> Result<(), RhiError> {
+        // Horizontal wind direction in XZ; fall back to +X if degenerate.
+        let dir = Vec3::new(wind_dir.x, 0.0, wind_dir.z).normalize_or(Vec3::X);
+        // Rotate the local +X arrow to point along windDir (yaw about +Y).
+        let rot = Quat::from_rotation_arc(Vec3::X, dir);
+        // Length grows with strength so a stronger breeze reads as a longer arrow;
+        // floor it so the gizmo stays visible even at very low strength.
+        let len_scale = 0.35 + strength.clamp(0.0, 1.5);
+        let scale = Vec3::new(len_scale, 1.0, 1.0);
+        // Camera-relative: tree base == world origin → translation = (-camera),
+        // lifted just above the ground plane.
+        let rel = (DVec3::ZERO - camera_world_pos).as_vec3();
+        let translation = Vec3::new(rel.x, rel.y + ARROW_LIFT, rel.z);
+        let model = Mat4::from_scale_rotation_translation(scale, rot, translation);
+
+        // Color green (calm) → red (strong) by strength. LINEAR HDR (ACES later).
+        let t = (strength / 1.5).clamp(0.0, 1.0);
+        let color = if highlight {
+            // Hover/grab: a bright warm-yellow so the arrow reads as grabbable.
+            // Boosted above 1.0 in linear HDR so it visibly pops after ACES.
+            [1.6, 1.4, 0.2, 1.0]
+        } else {
+            [0.05 + 0.85 * t, 0.85 - 0.7 * t, 0.05, 1.0]
+        };
+
+        renderer.bind(rhi, fi, FloraPipeline::Arrow);
+        let push = ArrowPush { model: model.to_cols_array_2d(), color };
+        rhi.bind_vertex_buffers(
+            fi,
+            &[self.arrow.pos, self.arrow.nrm, self.arrow.uv, self.arrow.attr],
+        )?;
+        rhi.bind_index_buffer(fi, self.arrow.idx)?;
+        renderer.push(rhi, fi, bytemuck::bytes_of(&push));
+        rhi.draw_indexed(fi, self.arrow.index_count);
+        Ok(())
+    }
+
     /// Camera-relative model for a world-space y-plane: pure translation of
     /// (world_origin - camera) = (-camera) since the plane is centred at world
     /// origin, with the plane lifted by `lift` in world +Y.
@@ -175,6 +273,78 @@ fn quad_mesh(rhi: &mut Rhi, corners: &[[f32; 3]; 4]) -> Result<GpuMesh, RhiError
     ];
     let attr: Vec<f32> = vec![0.0; 12];
     let idx: [u32; 6] = [0, 1, 2, 2, 1, 3];
+    Ok(GpuMesh {
+        pos: rhi.create_vertex_buffer(bytemuck::cast_slice(&pos))?,
+        nrm: rhi.create_vertex_buffer(bytemuck::cast_slice(&nrm))?,
+        uv: rhi.create_vertex_buffer(bytemuck::cast_slice(&uv))?,
+        attr: rhi.create_vertex_buffer(bytemuck::cast_slice(&attr))?,
+        idx: rhi.create_index_buffer(&idx)?,
+        index_count: idx.len() as u32,
+    })
+}
+
+/// Build the wind-gizmo arrow mesh: a thin square-section SHAFT box + a pyramid
+/// HEAD, both along local +X, base at the local origin. The viewer's per-frame
+/// model matrix rotates it to windDir and scales its length by strength.
+///
+/// ponytail: positions only carry geometry; the nrm/uv/attr streams exist solely
+/// because the shared 4×vec3 layout binds 4 buffers (the unlit arrow FS reads a
+/// solid push color, so it never samples them). Cull-NONE pipeline → winding is
+/// irrelevant, so the index list is just the obvious two-tris-per-quad fan.
+fn arrow_mesh(rhi: &mut Rhi) -> Result<GpuMesh, RhiError> {
+    let s = ARROW_SHAFT_HALF;
+    let l = ARROW_LEN;
+    let hh = ARROW_HEAD_HALF;
+    let tip = l + ARROW_HEAD_LEN;
+
+    // ── SHAFT: a box from x=0..l, square cross-section ±s in y and z. 8 corners. ──
+    // Index by (x_end, y_sign, z_sign): 0..3 = near face (x=0), 4..7 = far (x=l).
+    let shaft: [[f32; 3]; 8] = [
+        [0.0, -s, -s], // 0
+        [0.0, s, -s],  // 1
+        [0.0, s, s],   // 2
+        [0.0, -s, s],  // 3
+        [l, -s, -s],   // 4
+        [l, s, -s],    // 5
+        [l, s, s],     // 6
+        [l, -s, s],    // 7
+    ];
+    // 6 box faces × 2 tris (CCW-ish; cull NONE so winding doesn't matter).
+    let mut idx: Vec<u32> = vec![
+        0, 1, 2, 0, 2, 3, // near (x=0)
+        4, 6, 5, 4, 7, 6, // far  (x=l)
+        0, 4, 5, 0, 5, 1, // -z side
+        3, 2, 6, 3, 6, 7, // +z side
+        1, 5, 6, 1, 6, 2, // +y side
+        0, 3, 7, 0, 7, 4, // -y side
+    ];
+
+    // ── HEAD: a pyramid from a square base at x=l (±hh) to a tip at x=tip. ──
+    let base = shaft.len() as u32; // 8
+    let head: [[f32; 3]; 5] = [
+        [l, -hh, -hh], // base+0
+        [l, hh, -hh],  // base+1
+        [l, hh, hh],   // base+2
+        [l, -hh, hh],  // base+3
+        [tip, 0.0, 0.0], // base+4 = apex
+    ];
+    // 4 side tris (base edge → apex) + 2 base tris.
+    idx.extend_from_slice(&[
+        base + 0, base + 1, base + 4,
+        base + 1, base + 2, base + 4,
+        base + 2, base + 3, base + 4,
+        base + 3, base + 0, base + 4,
+        base + 0, base + 2, base + 1,
+        base + 0, base + 3, base + 2,
+    ]);
+
+    let pos: Vec<f32> = shaft.iter().chain(head.iter()).flatten().copied().collect();
+    let vcount = pos.len() / 3;
+    // Dummy nrm/uv/attr streams (unused by the unlit arrow shader).
+    let nrm: Vec<f32> = vec![0.0; vcount * 3];
+    let uv: Vec<f32> = vec![0.0; vcount * 3];
+    let attr: Vec<f32> = vec![0.0; vcount * 3];
+
     Ok(GpuMesh {
         pos: rhi.create_vertex_buffer(bytemuck::cast_slice(&pos))?,
         nrm: rhi.create_vertex_buffer(bytemuck::cast_slice(&nrm))?,

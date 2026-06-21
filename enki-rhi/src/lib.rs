@@ -942,13 +942,16 @@ impl Rhi {
         let fi_idx = fi as usize;
         let cmd = self.commands.frames[fi_idx].buffer;
         let extent = self.swapchain.extent;
-        let (cur_img, cur_view, depth_view, scr_img, scr_old) = {
+        let (cur_img, cur_view, depth_view, rdepth_img, refr_depth_img, scr_img, scr_old) = {
             let taa = self.taa.as_ref().unwrap();
             let im = taa.images.as_ref().unwrap();
             let w = taa.write_index;
-            (im.current.image, im.current.view, im.resolved_depth.view, im.history[w].image, taa.history_layout[w])
+            (im.current.image, im.current.view, im.resolved_depth.view,
+             im.resolved_depth.image, im.refract_depth.image,
+             im.history[w].image, taa.history_layout[w])
         };
         let color = color_subresource_range();
+        let dr = depth_subresource_range();
         let read = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
         let device = &self.device.handle;
         unsafe {
@@ -998,6 +1001,43 @@ impl Rhi {
             );
             device.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&[b_scr2, b_cur2]));
 
+            // Copy opaque depth → refract_depth (sampled by the water pass for
+            // depth-based darkening). resolved_depth then returns to the depth
+            // attachment layout for the reopened instance's depth test.
+            let bd1 = img_barrier(
+                rdepth_img, vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS, vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_READ, dr,
+            );
+            let bd2 = img_barrier(
+                refr_depth_img, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE,
+                vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_WRITE, dr,
+            );
+            device.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&[bd1, bd2]));
+
+            let depth_sub = vk::ImageSubresourceLayers::default()
+                .aspect_mask(vk::ImageAspectFlags::DEPTH).mip_level(0).base_array_layer(0).layer_count(1);
+            let dcopy = vk::ImageCopy::default()
+                .src_subresource(depth_sub).dst_subresource(depth_sub)
+                .extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 });
+            device.cmd_copy_image(
+                cmd, rdepth_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                refr_depth_img, vk::ImageLayout::TRANSFER_DST_OPTIMAL, std::slice::from_ref(&dcopy),
+            );
+
+            let bd3 = img_barrier(
+                refr_depth_img, vk::ImageLayout::TRANSFER_DST_OPTIMAL, read,
+                vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_WRITE,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ, dr,
+            );
+            let bd4 = img_barrier(
+                rdepth_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_READ,
+                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS, vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ, dr,
+            );
+            device.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&[bd3, bd4]));
+
             // Reopen a 1× instance on current (+ depth), LOAD both (blend water over opaque).
             let color_att = vk::RenderingAttachmentInfo::default()
                 .image_view(cur_view)
@@ -1027,6 +1067,14 @@ impl Rhi {
         let taa = self.taa.as_ref().unwrap();
         let im = taa.images.as_ref().unwrap();
         im.history[taa.write_index].view
+    }
+
+    /// The opaque-scene depth this frame (for the water pass's depth-based
+    /// darkening). Valid only between `begin_water_pass` and `taa_resolve`.
+    pub fn refraction_depth_view(&self) -> vk::ImageView {
+        let taa = self.taa.as_ref().unwrap();
+        let im = taa.images.as_ref().unwrap();
+        im.refract_depth.view
     }
 
     // ── GPU-driven command recording (compute + indirect; generic) ──────────
