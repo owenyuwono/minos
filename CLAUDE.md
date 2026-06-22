@@ -12,7 +12,7 @@ $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 - Run: `cargo run -p enki-app`
 - Check/build: `cargo check -p enki-app` (use `check`, not `build`, while the app is running — the `.exe` is locked).
 - Classic engine (no Nanite): `cargo build -p enki-app --no-default-features`.
-- Flora (procedural tree) viewer: `cargo run -p enki-app --bin flora_viewer --features flora` — a standalone bin; the planet `enki` bin does NOT draw flora (see the Flora section).
+- Flora (procedural tree) viewer: `cargo run -p enki-app --bin flora_viewer --features flora` — the showcase bin. The planet `enki` bin scatters flora on the surface **only when built `--features flora`** (default build never references flora); see the Flora section.
 - Vendored C deps: `metis` builds clean on MSVC (no cmake/libclang needed).
 
 Both feature configs (default = `nanite` on, and `--no-default-features`) must always compile.
@@ -132,6 +132,8 @@ A **1:1 Rust/Vulkan port of the `../dryad` JS flora generator** (procedural tree
 **Determinism / golden contract:** `enki-flora/tests/golden.rs` (`golden_vector_matches_dryad`) byte-compares `resolve()`'s foliage (count/position/scale/rotation/shape) against a dryad-JS dump (`tools/dump_golden.mjs` imports the real `../dryad` JS → `tests/golden.json`). Bar: rng draws + genes EXACT (1e-12), geometry 1e-6 (cross-language trig ~1 ULP). **NEVER reorder genome rng draws (incl. the RESERVED no-ops) or edit `foliage.rs`/`skeleton.rs` placement math / `GOLDEN_ANGLE` without a flag-gated path** — it breaks golden. Mesh changes go through `seed_42_mesh*` determinism tests (NOT loosened). ALL render-side work (`flora_view::build_leaf_mesh`, the shaders, `LeafTuning`, the twig taper) is golden-free. naga + a spv-out emit test validate every WGSL in `cargo test`. NOTE: dryad `resolve(genome, {})` yields NaN (no `gravity` default) — always pass an explicit neutral `Env::default()`.
 
 **Phyllotaxis:** the leaf-cluster azimuth is a 1:1 port — `az_step = (1-radialOrder)·π + radialOrder·GOLDEN_ANGLE` (`GOLDEN_ANGLE = π(3−√5) ≈ 137.5°`). Gene-gated by `radialOrder`; the default broadleaf (`≈0.25`) blends toward alternating (180°), so set `radialOrder=1.0` for the visible golden-angle spiral.
+
+**On the planet (`--features flora`):** `flora_scatter` places instances on the surface; each tree draws at its **own distance-driven leaf LOD** (`leaf_lod_at` → `record_at(..., lod)` thins cards / fades with distance), and far trees fall back to **alpha-blended impostor billboards** (`record_impostor_at`, `impostor_blend` > 0) that face the camera — so a grove scales without per-tree geometry. Drawn in the opaque pass after the character, before the ocean.
 
 **Visual correctness is USER-verified** (headless agents can't see pixels). For render work: capture a PNG via `FLORA_SCREENSHOT` and LOOK at it — compile/naga/Vulkan-validation green ≠ visually correct (the first 1:1 build rendered a black void with a bloom-blown canopy and still passed every gate).
 

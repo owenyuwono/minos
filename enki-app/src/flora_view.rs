@@ -850,10 +850,17 @@ impl FloraView {
     /// any species size; tuned so the viewer's default auto-fit framing sits in
     /// the full-quality NEAR band (toggle is a no-op there — look preserved).
     pub fn leaf_lod(&self, camera_world_pos: DVec3, enabled: bool) -> LeafLod {
+        self.leaf_lod_at(self.origin, camera_world_pos, enabled)
+    }
+
+    /// As [`leaf_lod`] but for an explicit world `origin`. The scatter path uses
+    /// this to LOD each instance by ITS own distance — instances share one mesh,
+    /// so `self.origin` is meaningless for them.
+    pub fn leaf_lod_at(&self, origin: DVec3, camera_world_pos: DVec3, enabled: bool) -> LeafLod {
         if !enabled {
             return LeafLod::FULL;
         }
-        let dist = (self.origin - camera_world_pos).length() as f32;
+        let dist = (origin - camera_world_pos).length() as f32;
         let d = dist / self.bounding_radius().max(1e-3); // distance in tree-radii
         const NEAR: f32 = 5.0; // full detail within this many radii
         const MID: f32 = 10.0; // leaf shadows drop beyond this
@@ -965,11 +972,10 @@ impl FloraView {
         fi: u32,
         model: Mat4,
         wind: [f32; 4],
+        lod: LeafLod,
     ) -> Result<(), RhiError> {
         self.draw_branch(rhi, renderer, fi, model, wind)?;
-        // Scatter path: full-quality leaves for now (per-instance LOD is a forest
-        // concern handled by the scatter, not the single-tree toggle).
-        self.draw_leaves(rhi, renderer, fi, model, wind, LeafLod::FULL)
+        self.draw_leaves(rhi, renderer, fi, model, wind, lod)
     }
 
     /// Branch draw at a given camera-relative `model` (shared by `record_branch`
@@ -1144,12 +1150,12 @@ impl FloraView {
     /// `LeafLod::impostor_blend` crossfade). A no-op at `blend <= 0`. `cam_right` /
     /// `cam_up` are the camera basis vectors (the billboard faces the camera). Must
     /// be recorded INSIDE the scene pass, AFTER the tree (it's alpha-blended).
-    pub fn record_impostor(
+    pub fn record_impostor_at(
         &self,
         rhi: &mut Rhi,
         renderer: &FloraRenderer,
         fi: u32,
-        camera_world_pos: DVec3,
+        model: Mat4,
         cam_right: Vec3,
         cam_up: Vec3,
         blend: f32,
@@ -1157,14 +1163,14 @@ impl FloraView {
         if blend <= 0.0 {
             return Ok(());
         }
-        // Canopy centre from the local AABB, biased up into the crown; transform to
-        // camera-relative via the same model() the tree uses.
+        // Canopy centre from the local AABB, biased up into the crown; transformed
+        // to camera-relative by the caller's `model` (per-instance for the scatter).
         let (mn, mx) = self.bounds;
         let cx = 0.5 * (mn[0] + mx[0]);
         let cz = 0.5 * (mn[2] + mx[2]);
         let dy = mx[1] - mn[1];
         let local_center = Vec3::new(cx, mn[1] + 0.62 * dy, cz);
-        let center = self.model(camera_world_pos).transform_point3(local_center);
+        let center = model.transform_point3(local_center);
         // Blob radius: cover the crown (a bit under the full half-height), floored
         // by the bounding radius so squat crowns still read.
         let radius = (0.55 * dy).max(0.6 * self.bounding_radius());
@@ -1198,6 +1204,22 @@ impl FloraView {
         renderer.push(rhi, fi, bytemuck::bytes_of(&push));
         rhi.draw_indexed(fi, self.impostor_quad.index_count);
         Ok(())
+    }
+
+    /// Single-tree impostor (viewer path): [`record_impostor_at`] at this tree's
+    /// own surface-placed model.
+    pub fn record_impostor(
+        &self,
+        rhi: &mut Rhi,
+        renderer: &FloraRenderer,
+        fi: u32,
+        camera_world_pos: DVec3,
+        cam_right: Vec3,
+        cam_up: Vec3,
+        blend: f32,
+    ) -> Result<(), RhiError> {
+        let model = self.model(camera_world_pos);
+        self.record_impostor_at(rhi, renderer, fi, model, cam_right, cam_up, blend)
     }
 
     /// Camera-relative model matrix: rotation aligning local +Y to the surface
@@ -1520,14 +1542,10 @@ fn build_leaf_mesh(
     // density-LOD prefix draw is a spatially-uniform subset of the canopy.
     let mut card_bases: Vec<u32> = Vec::with_capacity(n);
 
-    // dryad canopyBlend = 0.8 (uWeep=0): shading normal is 80% canopy-sphere
-    // normal, 20% card face normal — a soft volume, but the card keeps a little
-    // of its own facing so flat-on leaves don't read perfectly spherical. The weep
-    // gene shifts the blend toward the geometric (sky-facing) normal so willow
-    // leaves under a hanging canopy catch overhead light (dryad leafMesh.js:457:
-    // canopyBlend = 0.8 * (1 - uWeep)).
+    // Canopy sphere-normal blend REMOVED (user request) — leaves shade by their own
+    // geometric card normal (see `lit_n` below), so `weep_f` no longer feeds a
+    // canopy blend; it's kept only for the gravity droop.
     let weep_f = (weep as f32).clamp(0.0, 1.0);
-    let canopy_blend: f32 = 0.8 * (1.0 - weep_f);
     // Gravity bend/droop: tip droops by this fraction of leaf length, quadratic in
     // t (dryad LEAF_BEND_DEFAULT = 0.45, leafMesh.js:67,379). The weep gene
     // increases the droop for willows; default (weep≈0) keeps the gentle 0.45 bend.
@@ -1654,10 +1672,8 @@ fn build_leaf_mesh(
             b_r = axis.cross(t_r).normalize_or(b_r);
         }
 
-        // Canopy sphere-normal: outward from the AABB center (dryad:837-849).
-        // Fallback to +Y exactly at the center. Blend (1-weep)*0.8 canopy / rest
-        // card — weep leans willow leaves on their geometric normal.
-        let cn = (p - center).normalize_or(Vec3::Y);
+        // (Canopy sphere-normal removed — leaves shade by their geometric card
+        // normal now; see `lit_n`. `center` is still used for the inward leaf seat.)
 
         // Per-leaf variation seed in [0,1): a stable hash of the leaf position.
         // (No Math.random; deterministic on reseed, like dryad's index LCGs.)
@@ -1739,9 +1755,13 @@ fn build_leaf_mesh(
                     + down * (2.0 * t * length * leaf_bend); // d(droop)/dt
                 let up_tan = d_up.normalize_or(t_r);
                 // card_n = length × width = up_tan × b_r ≈ nn (the lit face normal).
+                // CANOPY SPHERE-NORMAL REMOVED (user request): the shading normal is
+                // now the leaf's own geometric face normal, NOT blended toward the
+                // outward-from-crown-centre sphere normal. That blend was the
+                // volume-shading that made lower leaves face down → darker. Now each
+                // leaf shades by its true orientation (double-sided in fs_leaf).
                 let card_n = up_tan.cross(b_r).normalize_or(face_n);
-                let lit_n = (cn * canopy_blend + card_n * (1.0 - canopy_blend))
-                    .normalize_or(cn);
+                let lit_n = card_n;
                 nrm.extend_from_slice(&[lit_n.x, lit_n.y, lit_n.z]);
                 // UV: .x = cross [0,1], .y = t (base→tip, sprite mapped once up the
                 // strip — dryad's continuous V across the subdivided plane); .z =

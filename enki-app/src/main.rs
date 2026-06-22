@@ -74,7 +74,7 @@ use character::Character;
 #[cfg(feature = "flora")]
 use enki_app::{
     flora_render::{FloraRenderer, ShadowUniforms},
-    flora_view::{FloraView, LeafMode},
+    flora_view::{FloraView, LeafMode, TreeSpec},
 };
 use controls::{
     first_person::MoveInput,
@@ -1564,9 +1564,9 @@ impl App {
                     nav_mode == NavMode::Surface && self.flora_enabled && self.flora_renderer.is_some();
                 #[cfg(feature = "flora")]
                 if draw_trees {
-                    // 1. Build the species mesh once from the CANONICAL TreeSpec —
-                    //    the SAME default the standalone flora_viewer starts from, so
-                    //    the planet tree and the viewer tree are identical. Drawn at
+                    // 1. Build the species mesh once from the canonical TreeSpec,
+                    //    overridden to SINGLE-leaf cards (the shared `default_specimen`
+                    //    is Cluster; the planet wants individual leaves). Drawn at
                     //    many models — its stored origin is unused.
                     if self.flora_tree.is_none() {
                         if let (Some(tpc), Some(hf)) =
@@ -1576,7 +1576,11 @@ impl App {
                             let r = controls::terrain_grid::ground_radius(
                                 hf.as_ref(), self.terrain_height_scale, dir,
                             );
-                            match FloraView::default_specimen(rhi, dir * r) {
+                            let spec = TreeSpec {
+                                leaf_mode: LeafMode::Single,
+                                ..TreeSpec::default_specimen()
+                            };
+                            match FloraView::from_spec(rhi, &spec, dir * r) {
                                 Ok(tree) => {
                                     let single = matches!(tree.leaf_mode(), LeafMode::Single);
                                     if let Some(rend) = self.flora_renderer.as_mut() {
@@ -1586,7 +1590,7 @@ impl App {
                                     }
                                     self.flora_tree = Some(tree);
                                 }
-                                Err(e) => log::error!("FloraView::default_single failed: {e}"),
+                                Err(e) => log::error!("FloraView::from_spec failed: {e}"),
                             }
                         }
                     }
@@ -1699,19 +1703,46 @@ impl App {
 
                 // Procedural trees: drawn inside the opaque pass, after the
                 // character, before the translucent ocean (shares reversed-Z depth).
-                // One shared species mesh, one draw pair per scattered instance.
+                // One shared species mesh drawn per scattered instance, each at its
+                // OWN distance-driven leaf LOD (far trees thin their cards / fade to
+                // a billboard) so the grove scales without per-tree geometry.
                 #[cfg(feature = "flora")]
                 if draw_trees {
                     if let (Some(rend), Some(tree)) =
                         (self.flora_renderer.as_ref(), self.flora_tree.as_ref())
                     {
                         let wind = [self.flora_clock, 0.6, 1.0, 0.0];
+                        // Opaque tree meshes, per-instance leaf LOD.
                         for inst in &self.flora_instances {
                             let model = flora_scatter::instance_model(
                                 inst.origin, inst.yaw, inst.scale, camera_world_pos,
                             );
-                            if let Err(e) = tree.record_at(rhi, rend, fi, model, wind) {
+                            let lod = tree.leaf_lod_at(inst.origin, camera_world_pos, true);
+                            if let Err(e) = tree.record_at(rhi, rend, fi, model, wind, lod) {
                                 log::error!("FloraView::record_at error: {e}");
+                                break;
+                            }
+                        }
+                        // Far-tree impostor billboards (alpha-blended) — a no-op
+                        // until an instance crosses the impostor distance, so this
+                        // pass is free for a close grove. Drawn AFTER all opaque
+                        // trees (blending) and faces the camera via its world basis.
+                        let inv = camera.view_matrix_rotation_only().inverse();
+                        let cam_right = inv.x_axis.truncate();
+                        let cam_up = inv.y_axis.truncate();
+                        for inst in &self.flora_instances {
+                            let blend =
+                                tree.leaf_lod_at(inst.origin, camera_world_pos, true).impostor_blend;
+                            if blend <= 0.0 {
+                                continue;
+                            }
+                            let model = flora_scatter::instance_model(
+                                inst.origin, inst.yaw, inst.scale, camera_world_pos,
+                            );
+                            if let Err(e) = tree
+                                .record_impostor_at(rhi, rend, fi, model, cam_right, cam_up, blend)
+                            {
+                                log::error!("FloraView::record_impostor_at error: {e}");
                                 break;
                             }
                         }

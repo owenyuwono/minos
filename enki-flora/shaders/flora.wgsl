@@ -1216,19 +1216,14 @@ fn fs_leaf(in: LeafVsOut, @builtin(front_facing) front: bool) -> @location(0) ve
     //    roughness 0.88 matte). The leaf normal map / exposure-AO are folded in
     //    as before; AO≈exposure attenuates the indirect IBL term only. ──
     let roughness = 0.88;
-    // dryad attenuates ONLY indirect by exposure/AO, never the direct sun. Fold
-    // BOTH the canopy-depth AO (exposure*0.5+0.5) AND the former whole-term
-    // interior-shadow factor (mix(0.45,1.0,exposure), was `shadowMul` below) into
-    // the single `ao` arg → pbr_shade restricts it to the indirect IBL term.
+    // CANOPY-DEPTH DARKENING REMOVED (user request): the height/level `exposure`
+    // term used to dim the indirect IBL for lower/interior leaves — the smooth
+    // bright-top → dark-bottom crown gradient. Dropped → indirect is uniform; leaves
+    // now vary only by the real sun direction + the PCF shadow map. (`in.exposure`
+    // is kept in the vertex stream for the AO debug view + the scatter, it just no
+    // longer darkens the lit canopy.)
     let dappled = shadow.params.w > 0.5;
-    let exp_leaf  = clamp(in.exposure, 0.0, 1.0);
-    // The exposure-darkening floor (the smooth bright→dark crown gradient) is the
-    // canopy-normal/exposure FAKE that masks fine dappling. DAPPLED: lift that
-    // floor (mix base 0.45→0.75) so the fake interior-shadow gradient softens and
-    // the REAL high-res PCF shadow becomes what darkens the interior. OFF → 0.45
-    // (byte-identical).
-    let exp_floor = select(0.45, 0.75, dappled);
-    let ao_leaf   = (exp_leaf * 0.5 + 0.5) * mix(exp_floor, 1.0, exp_leaf);
+    let ao_leaf = 1.0;
     let v = normalize(-in.view_pos);
     // SUN0 (key) is the shadow-caster: PCF-gate it. The leaf casts cutout shadows
     // (alpha-tested depth pass), so leaves shadow each other + the ground.
@@ -1269,7 +1264,11 @@ fn fs_leaf(in: LeafVsOut, @builtin(front_facing) front: bool) -> @location(0) ve
     // ponytail: halved the warm sunlift — at full strength it desaturated the
     // most sun-exposed canopy tips toward white; a gentler lift keeps the leaf
     // pigment reading as foliage while still warming the sunlit crown.
-    let sunlift = mix(vec3<f32>(0.0), vec3<f32>(0.03, 0.09, 0.04), exp_leaf * exp_leaf);
+    // Re-keyed from the (removed) height-exposure to the REAL sun term (ndl0): the
+    // warm sheen now follows ACTUAL sunlight on sun-facing leaves, not the crown
+    // height gradient — so it doesn't reintroduce the top-bright/bottom-dark look.
+    let sun_exp = clamp(ndl0, 0.0, 1.0);
+    let sunlift = mix(vec3<f32>(0.0), vec3<f32>(0.03, 0.09, 0.04), sun_exp * sun_exp);
 
     // ponytail: the canopy uses a soft SPHERE normal, so a whole cluster of leaves
     // faces the intensity-3.0 key sun at once → their direct+IBL linear HDR pinned
