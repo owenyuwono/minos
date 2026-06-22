@@ -34,7 +34,6 @@ pub struct BarkGenes {
     pub lenticels: f32,
     pub scale: f32,
     pub orient: f32,
-    pub plates: f32,
     pub shed: f32,
     pub under_hue: f32,
     pub woodiness: f32,
@@ -51,7 +50,6 @@ impl BarkGenes {
             lenticels: bark0[3],
             scale: bark1[0],
             orient: bark1[1],
-            plates: bark1[2],
             shed: bark1[3],
             under_hue: bark2[0],
             woodiness: bark2[1],
@@ -74,9 +72,6 @@ fn mix(a: f32, b: f32, t: f32) -> f32 {
 }
 fn mix3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     [mix(a[0], b[0], t), mix(a[1], b[1], t), mix(a[2], b[2], t)]
-}
-fn clamp(x: f32, lo: f32, hi: f32) -> f32 {
-    x.max(lo).min(hi)
 }
 fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     let t = clamp((x - e0) / (e1 - e0).max(1e-9), 0.0, 1.0);
@@ -378,7 +373,6 @@ mod tests {
             lenticels: 0.1,
             scale: 0.5,
             orient: 0.70,
-            plates: 0.4,
             shed: 0.1,
             under_hue: 0.4,
             woodiness: 0.9,

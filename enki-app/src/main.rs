@@ -2,15 +2,12 @@
 // material/view hot-swap, egui panel, and HUD.
 //
 // # Render loop overview
-//   resumed()  → create window → Rhi::new → Scene::new [default]
-//             OR StressHarness::new [stress]
-//             → EguiState::new → Hud::new
+//   resumed()  → create window → Rhi::new → terrain pipelines + overlays
+//             → async load (heightfield + Nanite bake) → EguiState::new
 //
 //   RedrawRequested:
-//     Default: begin_frame() → begin_rendering() → Scene::record_frame() →
-//              EguiState::render() → end_frame()
-//     Stress:  begin_frame() → streaming_upload*() → begin_rendering() →
-//              StressHarness::record_frame() → EguiState::render() → end_frame()
+//     begin_frame() → PlanetView/Nanite update → begin_rendering() →
+//     terrain + overlays draw → EguiState::render() → end_frame()
 //
 // # Navigation mode cycle (Tab: Globe → Placement → Surface → Globe)
 //   Globe       — orbit camera; LMB drag rotates, scroll zooms.
@@ -46,10 +43,9 @@ mod wind;
 mod atmosphere;
 mod clouds;
 mod markers;
+mod rivers;
 mod solar;
 mod planet_view;
-mod scene;
-mod stress;
 #[cfg(feature = "flora")]
 mod flora_scatter;
 
@@ -92,31 +88,20 @@ use wind::WindOverlay;
 use atmosphere::{Atmosphere, AtmoParams};
 use clouds::{Clouds, CloudParams};
 use markers::Markers;
+use rivers::Rivers;
 use solar::BodyRenderer;
 use controls::space::FreeCam;
-use planet_view::{PlanetConfig, PlanetView, PlanetViewStats, RhiUploaderDummy, planet_view_from_hf};
-use scene::Scene;
-use stress::StressHarness;
+use planet_view::{PlanetConfig, PlanetView, PlanetViewStats, planet_view_from_hf};
 
 /// Quads per cube-face side of the Nanite terrain bake. Single-sourced so the
 /// third-person character grounds against the *same* grid the renderer draws
 /// (see `controls::terrain_grid`). Must match the bake's `nanite_resolution`.
 const NANITE_BAKE_RES: u32 = 1024;
 
-// ── Render mode ───────────────────────────────────────────────────────────────
-
-enum RenderMode {
-    /// Default: live LOD planet rendered via `PlanetView`.
-    Planet,
-    /// `--markers`: the old depth-proof marker scene (precision regression test).
-    Markers,
-    /// `--stress-streaming`: streaming budget stress test.
-    Stress,
-    /// `--soak-terrain` / `ENKI_SOAK_TERRAIN=1`: scripted fly-through that validates
-    /// dynamic LOD + streaming under real motion (split/merge churn, hide-while-pending,
-    /// streaming graveyard lifecycle).
-    SoakTerrain,
-}
+/// Character shadow capsule (m): feet→head height and radius. The third-person
+/// character casts this onto the Nanite ground (see `nanite_draw.wgsl`).
+const CHAR_SHADOW_HEIGHT: f32 = 1.8;
+const CHAR_SHADOW_RADIUS: f32 = 0.5;
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
@@ -124,13 +109,13 @@ struct App {
     // Fields drop in declaration order.  Vulkan resources that hold device
     // handles MUST drop before `rhi` (which owns the VkDevice).  Order:
     //   egui  — holds pipeline/textures on the device; must free while device is alive.
-    //   planet_view / scene / stress — hold only opaque u64 BufferHandles freed by
-    //                    rhi's stores; their order relative to rhi is fine, but
-    //                    keeping them before rhi is clearest.
+    //   planet_view — holds only opaque u64 BufferHandles freed by rhi's stores;
+    //                    its order relative to rhi is fine, but keeping it before
+    //                    rhi is clearest.
     //   rhi   — LAST: wait_idle + destroys the VkDevice.
     window:       Option<Window>,
     egui:         Option<EguiState>,
-    planet_view:  Option<PlanetView<RhiUploaderDummy>>,
+    planet_view:  Option<PlanetView>,
     /// Translucent sea-level shell for the live Planet path (built once at startup).
     ocean:        Option<Ocean>,
     /// Solar clock: focused-planet spin → day/night + seasons.
@@ -151,8 +136,8 @@ struct App {
     clouds:       Option<Clouds>,
     /// Equator + pole reference markers.
     markers:      Option<Markers>,
-    scene:        Option<Scene>,
-    stress:       Option<StressHarness>,
+    /// Drainage-network river ribbons (traced from the erosion flow field).
+    rivers:       Option<Rivers>,
     /// CPU-skinned humanoid drawn in third-person surface mode (built at startup
     /// in Planet mode; only drawn while walking the surface in third-person view).
     character:    Option<Character>,
@@ -207,7 +192,6 @@ struct App {
     /// Show the one-time load-stats popup until the user dismisses it.
     show_load_stats: bool,
     fps:          FpsMeter,
-    mode:         RenderMode,
     last_tick:    Instant,
     minimized:    bool,
     /// Monotonic frame counter for LOD age tracking.
@@ -259,6 +243,8 @@ struct App {
     /// Reference marker toggles (pole spikes / equator ring).
     markers_poles:     bool,
     markers_equator:   bool,
+    /// Draw the traced river network.
+    rivers_enabled:    bool,
     /// Draw the FFT spectral wave surface (camera-anchored detail).
     wave_enabled:      bool,
     /// Wave choppiness (horizontal displacement gain) — GUI-tunable.
@@ -284,17 +270,6 @@ struct App {
     /// WASD + Shift held state for surface-walk movement.
     move_keys:     MoveInput,
 
-    // ── Soak-terrain state ────────────────────────────────────────────────
-    /// Monotonic elapsed time since the soak started (seconds).  Drives the
-    /// deterministic scripted camera path in `SoakTerrain` mode.
-    soak_elapsed: f64,
-    /// Wall-clock instant when the soak mode started, for fps measurement.
-    soak_start: Instant,
-    /// Rolling frame count used to compute average fps between log ticks.
-    soak_frames_since_log: u64,
-    /// Elapsed seconds at the last periodic log tick.
-    soak_last_log_elapsed: f64,
-
     // rhi MUST be declared last: Rust drops fields in declaration order, and
     // rhi owns the VkDevice.  egui (above) holds Vulkan pipelines/textures
     // that must be freed before the device is destroyed.
@@ -302,7 +277,7 @@ struct App {
 }
 
 impl App {
-    fn new(mode: RenderMode) -> Self {
+    fn new() -> Self {
         Self {
             window:        None,
             egui:          None,
@@ -317,8 +292,7 @@ impl App {
             atmosphere:    None,
             clouds:        None,
             markers:       None,
-            scene:         None,
-            stress:        None,
+            rivers:        None,
             character:     None,
             #[cfg(feature = "flora")]
             flora_renderer: None,
@@ -349,7 +323,6 @@ impl App {
             load_timings:  None,
             show_load_stats: false,
             fps:           FpsMeter::new(),
-            mode,
             last_tick:     Instant::now(),
             minimized:     false,
             frame_counter: 0,
@@ -375,6 +348,7 @@ impl App {
             cloud_time:        0.0,
             markers_poles:     false,
             markers_equator:   false,
+            rivers_enabled:    true,
             wave_enabled:      true,
             wave_choppiness:   1.3,
             wave_foam:         0.4,
@@ -386,10 +360,6 @@ impl App {
             cursor_pos_prev:   None,
             scroll:        0.0,
             move_keys:     MoveInput::default(),
-            soak_elapsed:           0.0,
-            soak_start:             Instant::now(),
-            soak_frames_since_log:  0,
-            soak_last_log_elapsed:  0.0,
             rhi:           None,
         }
     }
@@ -543,79 +513,6 @@ impl App {
 
     // ── Per-frame update ──────────────────────────────────────────────────
 
-    /// Compute the scripted soak-terrain camera for the current elapsed time.
-    ///
-    /// # Camera path
-    ///
-    /// The path loops with period `SOAK_PERIOD_S` and has three phases:
-    ///
-    ///   0 → DESCENT_END   — exponential descent from 100 km orbit to 500 m skim altitude.
-    ///   DESCENT_END → ASCENT_START — skim at low altitude with slow azimuth rotation.
-    ///   ASCENT_START → SOAK_PERIOD_S — ascent back to 100 km orbit.
-    ///
-    /// A slow continuous azimuth drift (one revolution per two full periods) ensures
-    /// the LOD tree sees genuinely different surface regions each loop.
-    ///
-    /// The polar angle is fixed at 45° from the north pole to keep camera-relative
-    /// rendering stable (avoids the pole singularity in look_at).
-    fn soak_camera(&self, elapsed: f64) -> Camera {
-        use controls::globe::spherical_to_cartesian;
-        use glam::{Quat, Vec3};
-
-        const PLANET_RADIUS_M: f64 = controls::PLANET_RADIUS;
-
-        // ── Altitude profile ─────────────────────────────────────────────
-        const HIGH_ALT: f64   = 100_000.0; // 100 km orbit
-        const LOW_ALT:  f64   =     500.0; // 500 m skim
-        const SOAK_PERIOD_S: f64  = 40.0;  // one full loop in seconds
-        const DESCENT_FRAC:  f64  = 0.35;  // fraction of period spent descending
-        const SKIM_FRAC:     f64  = 0.25;  // fraction skimming at low alt
-        // ascent occupies the remaining (1 - DESCENT_FRAC - SKIM_FRAC) of the period
-
-        let phase = (elapsed % SOAK_PERIOD_S) / SOAK_PERIOD_S; // 0..1 within the period
-
-        let altitude = if phase < DESCENT_FRAC {
-            // Descent: exponential ease-in so LOD splits happen gradually then rapidly.
-            let t = phase / DESCENT_FRAC; // 0..1
-            let log_high = HIGH_ALT.ln();
-            let log_low  = LOW_ALT.ln();
-            (log_high + (log_low - log_high) * t).exp()
-        } else if phase < DESCENT_FRAC + SKIM_FRAC {
-            // Skim: constant low altitude.
-            LOW_ALT
-        } else {
-            // Ascent: exponential ease-out back to orbit.
-            let t = (phase - DESCENT_FRAC - SKIM_FRAC) / (1.0 - DESCENT_FRAC - SKIM_FRAC);
-            let log_low  = LOW_ALT.ln();
-            let log_high = HIGH_ALT.ln();
-            (log_low + (log_high - log_low) * t).exp()
-        };
-
-        let radius = PLANET_RADIUS_M + altitude;
-
-        // ── Azimuth: one full revolution every two periods ───────────────
-        let theta = (elapsed / (SOAK_PERIOD_S * 2.0) * std::f64::consts::TAU) as f32;
-
-        // ── Fixed polar angle: 45° from north pole ───────────────────────
-        let phi = std::f32::consts::FRAC_PI_4;
-
-        let pos = spherical_to_cartesian(radius, theta, phi);
-
-        let forward = (-pos).normalize().as_vec3();
-        let world_up = Vec3::Y;
-        let right    = forward.cross(world_up).normalize();
-        let up       = right.cross(forward).normalize();
-        let orientation = Quat::from_mat3(&glam::Mat3::from_cols(right, up, -forward));
-
-        Camera {
-            position: pos,
-            orientation,
-            fov_y_radians: 60_f32.to_radians(),
-            near: 0.5,
-            far: 750_000.0,
-        }
-    }
-
     fn update_nav(&mut self, dt: f32) {
         let (dx, dy) = self.mouse_delta;
         match self.nav.mode() {
@@ -680,15 +577,8 @@ impl ApplicationHandler for App {
             return;
         }
 
-        let title = match self.mode {
-            RenderMode::Planet      => "enki",
-            RenderMode::Markers     => "enki — markers",
-            RenderMode::Stress      => "enki — stress-streaming",
-            RenderMode::SoakTerrain => "enki — soak-terrain",
-        };
-
         let attrs = WindowAttributes::default()
-            .with_title(title)
+            .with_title("enki")
             .with_inner_size(LogicalSize::new(1280u32, 720u32))
             .with_resizable(true);
 
@@ -722,8 +612,8 @@ impl ApplicationHandler for App {
         let color_format = rhi.swapchain_format();
         let samples      = rhi.msaa_samples();
 
-        match self.mode {
-            RenderMode::Planet | RenderMode::SoakTerrain => {
+        {
+            {
                 // Build the terrain pipelines for PlanetView.
                 use enki_render::{terrain_pass::TERRAIN_WGSL, material::ChunkPush};
                 use enki_rhi::{GraphicsPipelineDesc, ShaderModule};
@@ -811,6 +701,11 @@ impl ApplicationHandler for App {
                     Ok(m)  => self.markers = Some(m),
                     Err(e) => log::error!("Markers::new failed: {e}"),
                 }
+                // River-network ribbons (geometry traced once the heightfield loads).
+                match Rivers::new(&mut rhi, color_format, samples, PLANET_RADIUS) {
+                    Ok(r)  => self.rivers = Some(r),
+                    Err(e) => log::error!("Rivers::new failed: {e}"),
+                }
                 // Solar-system bodies (sun + distant planets as lit spheres).
                 match BodyRenderer::new(&mut rhi, color_format, samples) {
                     Ok(b)  => self.bodies = Some(b),
@@ -891,38 +786,9 @@ impl ApplicationHandler for App {
                     // near-cut subset is streamed resident per frame.
                     nanite_resolution: NANITE_BAKE_RES,
                 };
-                if matches!(self.mode, RenderMode::SoakTerrain) {
-                    self.soak_start = Instant::now();
-                }
                 self.loader = Some(loading::Loader::spawn(params));
                 self.pending_planet_cfg = Some(cfg);
                 log::info!("Async load started (heightfield + Nanite bake on a worker thread)");
-            }
-            RenderMode::Markers => {
-                match Scene::new(&mut rhi, color_format, samples) {
-                    Ok(s) => {
-                        log::info!("Scene built (markers mode)");
-                        self.scene = Some(s);
-                    }
-                    Err(e) => {
-                        log::error!("Scene::new failed: {e}");
-                        event_loop.exit();
-                        return;
-                    }
-                }
-            }
-            RenderMode::Stress => {
-                match StressHarness::new(&mut rhi, color_format, samples) {
-                    Ok(h) => {
-                        log::info!("Stress harness built");
-                        self.stress = Some(h);
-                    }
-                    Err(e) => {
-                        log::error!("StressHarness::new failed: {e}");
-                        event_loop.exit();
-                        return;
-                    }
-                }
             }
         }
 
@@ -1254,7 +1120,12 @@ impl App {
                             w.set_wind_source(Arc::clone(&out.hf));
                         }
                         if let Some(c) = self.clouds.as_mut() {
-                            c.set_wind_source(Arc::clone(&out.hf));
+                            c.set_source(Arc::clone(&out.hf));
+                        }
+                        // Hand the heightfield to the river tracer; the (one-time)
+                        // trace + GPU upload run lazily on the first record() call.
+                        if let Some(r) = self.rivers.as_mut() {
+                            r.set_source(Arc::clone(&out.hf), cfg.lod.height_scale);
                         }
                         self.terrain_height_scale = cfg.lod.height_scale;
                         self.planet_view = Some(planet_view_from_hf(cfg, out.hf));
@@ -1297,22 +1168,11 @@ impl App {
             }
         }
 
-        // ── Navigation update (skipped in soak mode — camera is scripted) ──
-        if !matches!(self.mode, RenderMode::SoakTerrain) {
-            self.update_nav(dt);
-        } else {
-            self.soak_elapsed += dt as f64;
-            self.soak_frames_since_log += 1;
-        }
+        // ── Navigation update ──────────────────────────────────────────────
+        self.update_nav(dt);
 
         // ── Snapshot state for this frame ─────────────────────────────────
-        let (camera, altitude) = if matches!(self.mode, RenderMode::SoakTerrain) {
-            let cam = self.soak_camera(self.soak_elapsed);
-            let alt = (cam.position.length() - controls::PLANET_RADIUS).max(0.0);
-            (cam, alt)
-        } else {
-            (self.active_camera(), self.altitude_m())
-        };
+        let (camera, altitude) = (self.active_camera(), self.altitude_m());
         let nav_mode      = self.nav.mode();
         let view_mode     = self.view_mode;
         // Ocean view modes (11–12) don't recolor the terrain — show it lit.
@@ -1343,6 +1203,7 @@ impl App {
             let cloud_params      = self.cloud_params;
             let markers_poles     = self.markers_poles;
             let markers_equator   = self.markers_equator;
+            let rivers_enabled    = self.rivers_enabled;
             let wind_params       = self.wind.as_ref().map(|w| w.params).unwrap_or_default();
             let sea_level_m       = self.sea_level_m;
             let wave_enabled      = self.wave_enabled;
@@ -1367,7 +1228,7 @@ impl App {
                 wind_enabled, wind_params,
                 atmo_enabled, atmo_params,
                 clouds_enabled, cloud_params,
-                markers_poles, markers_equator,
+                markers_poles, markers_equator, rivers_enabled,
                 None, planet_stats.as_ref(), load_stats.as_ref(),
             ))
         } else {
@@ -1408,6 +1269,7 @@ impl App {
             self.cloud_params      = out.clouds;
             self.markers_poles     = out.markers_poles;
             self.markers_equator   = out.markers_equator;
+            self.rivers_enabled    = out.rivers_enabled;
             self.sky.time_scale    = out.time_scale;
             self.sky.paused        = out.paused;
             if out.cycle_nav {
@@ -1562,13 +1424,26 @@ impl App {
                     // 2. Per-frame uniforms (incl. this frame's active-slot list) + cull.
                     //    FrameUniforms gives the rotation-only camera-relative view-proj
                     //    AND the terrain's lights.
+                    // Character shadow capsule (camera-relative) for the Nanite ground
+                    // to receive — only while a third-person character is shown.
+                    let char_capsule = if nav_mode == NavMode::Surface {
+                        self.surface.as_ref().filter(|t| t.show_character()).map(|tpc| {
+                            let feet = tpc.feet_position();
+                            let up = feet.normalize().as_vec3();
+                            let feet_rel = (feet - camera_world_pos).as_vec3();
+                            let head_rel = feet_rel + up * CHAR_SHADOW_HEIGHT;
+                            (feet_rel.to_array(), head_rel.to_array(), CHAR_SHADOW_RADIUS)
+                        })
+                    } else {
+                        None
+                    };
                     if let Some(n) = self.nanite.as_mut() {
                         // Dithered LOD cross-fade is only useful with TAA on (it
                         // resolves the per-frame stipple into a smooth blend).
                         let _ = n.update(
                             rhi, fi, camera_world_pos, &fu, screen_h_px,
                             camera.fov_y_radians, self.nanite_tau, terrain_view,
-                            self.taa_enabled, self.frame_counter as u32,
+                            self.taa_enabled, self.frame_counter as u32, char_capsule,
                         );
                         let _ = n.record_cull(rhi, fi);
                     }
@@ -1721,6 +1596,16 @@ impl App {
                     }
                 }
 
+                // River-network ribbons — translucent water draped on land (above
+                // sea level), so the later ocean pass never paints over them.
+                if self.rivers_enabled {
+                    if let Some(r) = self.rivers.as_mut() {
+                        if let Err(e) = r.record(rhi, fi, &fu, camera_world_pos) {
+                            log::error!("Rivers::record error: {e}");
+                        }
+                    }
+                }
+
                 // Character (after terrain/Nanite, before the translucent ocean).
                 if draw_character {
                     if let (Some(ch), Some(tpc)) =
@@ -1797,10 +1682,10 @@ impl App {
                         // the OPAQUE depth (seabed/terrain, captured before the ocean),
                         // so terrain occlusion is unchanged.
                         if self.clouds_enabled {
-                            if let Some(c) = self.clouds.as_ref() {
+                            if let Some(c) = self.clouds.as_mut() {
                                 if let Err(e) = c.record(
                                     rhi, fi, &fu, &camera, scene_depth,
-                                    (ext.width, ext.height), self.cloud_time,
+                                    (ext.width, ext.height), self.cloud_time, dt,
                                     self.cloud_params, view_mode == 13,
                                 ) {
                                     log::error!("Clouds::record error: {e}");

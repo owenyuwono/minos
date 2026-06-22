@@ -27,8 +27,7 @@ pub struct PagePool {
 impl PagePool {
     /// Create a pool of `capacity` slots, all initially free.
     pub fn new(capacity: usize) -> Self {
-        // Reversed so `pop` hands out low indices first (nicer for debugging).
-        let free = (0..capacity as u32).rev().collect();
+        let free = (0..capacity as u32).collect();
         Self { capacity, free, graveyard: VecDeque::new() }
     }
 

@@ -42,9 +42,7 @@ impl Orbit {
             let n = self.plane_normal.normalize_or_zero();
             if n.length_squared() < 0.5 { DVec3::Y } else { n }
         };
-        let r = if n.x.abs() < 0.9 { DVec3::X } else { DVec3::Z };
-        let u = r.cross(n).normalize();
-        let v = n.cross(u);
+        let (u, v) = n.any_orthonormal_pair();
         (u * theta.cos() + v * theta.sin()) * self.radius_m
     }
 }

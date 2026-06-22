@@ -1,5 +1,4 @@
 //! `nav_mode` — navigation mode state machine.
-#![allow(dead_code)]
 //!
 //! Tracks which camera controller is active and mediates transitions between
 //! them.  The three modes form a linear state machine:
@@ -102,17 +101,6 @@ impl NavState {
             self.mode = NavMode::Globe;
         }
     }
-
-    /// True when a globe camera snapshot is stored (i.e. we entered
-    /// `Placement` or `Surface` from `Globe`).
-    pub fn has_saved_globe_camera(&self) -> bool {
-        self.saved_globe_camera.is_some()
-    }
-
-    /// Borrow the saved globe camera snapshot without consuming it.
-    pub fn saved_globe_camera(&self) -> Option<&Camera> {
-        self.saved_globe_camera.as_ref()
-    }
 }
 
 impl Default for NavState {
@@ -142,16 +130,14 @@ mod tests {
     fn starts_in_globe_mode() {
         let state = NavState::new();
         assert_eq!(state.mode(), NavMode::Globe);
-        assert!(!state.has_saved_globe_camera());
     }
 
     #[test]
-    fn globe_to_placement_snapshots_camera() {
+    fn globe_to_placement_transitions() {
         let mut state = NavState::new();
         let cam = test_camera();
         state.begin_placement(&cam);
         assert_eq!(state.mode(), NavMode::Placement);
-        assert!(state.has_saved_globe_camera());
     }
 
     #[test]

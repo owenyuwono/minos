@@ -17,7 +17,6 @@
 
 pub mod bake;
 pub mod cluster;
-pub mod debug;
 pub mod render;
 pub mod residency;
 pub mod stream;

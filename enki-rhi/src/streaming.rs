@@ -491,10 +491,7 @@ impl StreamingUploader {
             arr
         };
 
-        for (i, bytes) in [pos_bytes, nrm_bytes, col_bytes, plate_bytes, idx_bytes]
-            .iter()
-            .enumerate()
-        {
+        for bytes in [pos_bytes, nrm_bytes, col_bytes, plate_bytes, idx_bytes] {
             let dst = unsafe {
                 std::slice::from_raw_parts_mut(
                     self.staging_ptr.add(write_offset),
@@ -503,7 +500,6 @@ impl StreamingUploader {
             };
             dst.copy_from_slice(bytes);
             write_offset += bytes.len();
-            let _ = i;
         }
 
         // ── Allocate DEVICE_LOCAL vertex+index buffers ────────────────────────

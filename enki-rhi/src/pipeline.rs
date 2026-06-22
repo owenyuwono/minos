@@ -165,47 +165,20 @@ impl PipelineStore {
 
         // ── Vertex input ────────────────────────────────────────────────────
         // 4 separate bindings, each carries one vec3<f32> attribute.
-        let bindings = [
+        let bindings: [_; 4] = std::array::from_fn(|i| {
             vk::VertexInputBindingDescription::default()
-                .binding(0)
+                .binding(i as u32)
                 .stride(12) // sizeof(vec3) = 3 × 4
-                .input_rate(vk::VertexInputRate::VERTEX),
-            vk::VertexInputBindingDescription::default()
-                .binding(1)
-                .stride(12)
-                .input_rate(vk::VertexInputRate::VERTEX),
-            vk::VertexInputBindingDescription::default()
-                .binding(2)
-                .stride(12)
-                .input_rate(vk::VertexInputRate::VERTEX),
-            vk::VertexInputBindingDescription::default()
-                .binding(3)
-                .stride(12)
-                .input_rate(vk::VertexInputRate::VERTEX),
-        ];
+                .input_rate(vk::VertexInputRate::VERTEX)
+        });
 
-        let attributes = [
+        let attributes: [_; 4] = std::array::from_fn(|i| {
             vk::VertexInputAttributeDescription::default()
-                .location(0)
-                .binding(0)
+                .location(i as u32)
+                .binding(i as u32)
                 .format(vk::Format::R32G32B32_SFLOAT)
-                .offset(0),
-            vk::VertexInputAttributeDescription::default()
-                .location(1)
-                .binding(1)
-                .format(vk::Format::R32G32B32_SFLOAT)
-                .offset(0),
-            vk::VertexInputAttributeDescription::default()
-                .location(2)
-                .binding(2)
-                .format(vk::Format::R32G32B32_SFLOAT)
-                .offset(0),
-            vk::VertexInputAttributeDescription::default()
-                .location(3)
-                .binding(3)
-                .format(vk::Format::R32G32B32_SFLOAT)
-                .offset(0),
-        ];
+                .offset(0)
+        });
 
         let vertex_input = if vertex_pulling {
             // No vertex buffers — the shader pulls from storage via vertex_index.
@@ -325,7 +298,7 @@ impl PipelineStore {
     /// fullscreen triangle via `vertex_index`), no depth, no culling, a single
     /// color attachment, and a caller-supplied descriptor set layout (e.g. the TAA
     /// resolve's sampled-image + UBO set). 1-sample.
-    pub fn create_fullscreen(
+    pub(crate) fn create_fullscreen(
         &mut self,
         shader: &ShaderModule,
         vs_entry: &str,
@@ -471,9 +444,7 @@ impl PipelineStore {
 
     /// Destroy all pipelines. Called from `Rhi::drop`.
     pub fn destroy_all(&mut self) {
-        let keys: Vec<u64> = self.map.keys().cloned().collect();
-        for key in keys {
-            let entry = self.map.remove(&key).unwrap();
+        for (_, entry) in std::mem::take(&mut self.map) {
             unsafe {
                 self.device.destroy_pipeline(entry.pipeline, None);
                 self.device.destroy_pipeline_layout(entry.layout, None);

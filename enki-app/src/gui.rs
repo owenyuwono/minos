@@ -92,6 +92,8 @@ pub struct UiOutput {
     /// Reference markers: pole spikes / equator ring.
     pub markers_poles: bool,
     pub markers_equator: bool,
+    /// Draw the traced river network.
+    pub rivers_enabled: bool,
 }
 
 // ── EguiState ─────────────────────────────────────────────────────────────
@@ -212,6 +214,7 @@ impl EguiState {
         clouds:            crate::clouds::CloudParams,
         markers_poles:     bool,
         markers_equator:   bool,
+        rivers_enabled:    bool,
         stress_stats:      Option<&str>,
         planet_stats:      Option<&PlanetViewStats>,
         load_stats:        Option<&LoadTimings>,
@@ -241,6 +244,7 @@ impl EguiState {
             clouds,
             markers_poles,
             markers_equator,
+            rivers_enabled,
             cycle_nav: false,
             exit_surface: false,
             dismiss_load_stats: false,
@@ -384,7 +388,15 @@ impl EguiState {
                         ui.add_enabled(on,
                             egui::Slider::new(&mut out.clouds.noise_scale, 500.0..=8000.0).text("Feature size (m)"));
                         ui.add_enabled(on,
+                            egui::Slider::new(&mut out.clouds.cloud_type, 0.0..=1.0).text("Type (stratus→cumulus)"));
+                        ui.add_enabled(on,
+                            egui::Slider::new(&mut out.clouds.moisture_influence, 0.0..=1.0).text("Climate influence"));
+                        ui.add_enabled(on,
                             egui::Slider::new(&mut out.clouds.hg_g, 0.0..=0.95).text("Forward scatter"));
+                        ui.add_enabled(on,
+                            egui::Slider::new(&mut out.clouds.powder, 0.0..=1.0).text("Powder (dark edges)"));
+                        ui.add_enabled(on,
+                            egui::Slider::new(&mut out.clouds.curl, 0.0..=1.0).text("Curl turbulence"));
                         ui.add_enabled(on,
                             egui::Slider::new(&mut out.clouds.steps, 16.0..=96.0).text("March steps"));
                     });
@@ -393,6 +405,7 @@ impl EguiState {
                     CollapsingHeader::new("Reference").default_open(false).show(ui, |ui| {
                         ui.checkbox(&mut out.markers_equator, "Equator");
                         ui.checkbox(&mut out.markers_poles, "Poles + axis");
+                        ui.checkbox(&mut out.rivers_enabled, "Rivers");
                     });
 
                     // ── Trees (flora) ────────────────────────────────────────

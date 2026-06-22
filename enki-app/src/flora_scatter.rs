@@ -28,16 +28,22 @@ pub struct TreeInstance {
     pub scale: f32,
 }
 
-/// Draw trees within this distance of the player (m).
-pub const RADIUS_M: f64 = 150.0;
+/// Draw trees within this distance of the player (m). Sized so faraway trees
+/// stay visible instead of popping out a few steps ahead — the count this
+/// implies at the default density is the real cost (see `MAX_TREES`).
+pub const RADIUS_M: f64 = 300.0;
 /// Mean spacing between candidate cells (m) — the lat-lon cell edge. Smaller =
 /// denser grove.
 pub const SPACING_M: f64 = 5.0;
-/// Hard cap on drawn instances — the nearest `MAX_TREES` render, farther cells
-/// drop. ponytail: trees are plain per-instance draws (NOT Nanite-virtualized),
-/// so this bounds the per-frame draw cost; raise it once trees go through a
-/// virtualized/instanced path (then the radius can grow without an fps cliff).
-pub const MAX_TREES: usize = 400;
+/// Safety ceiling on drawn instances — a hang-guard, NOT a routine LOD cull. At
+/// the default `RADIUS_M`×density every tree in the window renders (no faraway
+/// trees hidden); this only trips on a pathological density×radius, and when it
+/// does we drop the FARTHEST and warn (so a cull is never silent).
+/// ponytail: trees are plain per-instance draws (NOT Nanite-virtualized), so the
+/// per-frame draw cost scales linearly with the count — this is the upper bound
+/// until trees go through a virtualized/instanced path; then the radius can grow
+/// without an fps cliff and this ceiling can lift.
+pub const MAX_TREES: usize = 16000;
 
 /// splitmix64-style finalizer over a mixed (cell_i, cell_j, salt) key.
 fn hash(cell_i: i64, cell_j: i64, salt: u64) -> u64 {
@@ -113,8 +119,15 @@ pub fn scatter(
             });
         }
     }
-    // Cap: keep the nearest MAX_TREES (bounds the per-frame draw calls).
+    // Safety ceiling: only trips on a pathological density×radius. Keep the
+    // nearest MAX_TREES and warn — dropped faraway trees are never silent.
     if out.len() > MAX_TREES {
+        log::warn!(
+            "flora_scatter: {} trees in range exceeds MAX_TREES={}; dropping the farthest {}",
+            out.len(),
+            MAX_TREES,
+            out.len() - MAX_TREES,
+        );
         out.sort_by(|a, b| {
             let da = (a.origin - center).length_squared();
             let db = (b.origin - center).length_squared();

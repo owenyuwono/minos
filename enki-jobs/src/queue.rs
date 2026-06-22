@@ -139,14 +139,4 @@ impl PriorityQueue {
     pub fn len(&self) -> usize {
         self.present.len()
     }
-
-    /// Whether the queue has no live entries.
-    pub fn is_empty(&self) -> bool {
-        self.present.is_empty()
-    }
-
-    /// Whether the queue has any live entry for `key`.
-    pub fn contains(&self, key: ChunkKey) -> bool {
-        self.present.contains(&key)
-    }
 }

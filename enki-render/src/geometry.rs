@@ -2,21 +2,6 @@
 //! geometry provider (placeholder or future terrain). Both sides depend only on
 //! this file; neither knows the other's internals.
 
-/// Identifies a single chunk for upload/retirement bookkeeping.
-/// Planet-generation details (quadtree, noise, tessellation) are deferred;
-/// keep this minimal so it can be extended later without changing consumers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ChunkParams {
-    /// Cube-face index (0–5, or 0 for the placeholder analytic sphere face).
-    pub face: u8,
-    /// LOD level (0 = finest). Placeholder always uses level 0.
-    pub level: u8,
-    /// Column index within the face at this LOD level.
-    pub ix: u32,
-    /// Row index within the face at this LOD level.
-    pub iy: u32,
-}
-
 /// All vertex and index data needed to upload one terrain chunk to the GPU.
 ///
 /// Layout rules (enforced by the uploader, not here):
@@ -129,72 +114,15 @@ pub fn placeholder_sphere(radius: f32, subdivisions: u32) -> ChunkMeshArrays {
     }
 }
 
-/// Flat grid patch for exercising the depth range at varied distances.
-///
-/// `size` is the side length in metres; `grid` is the number of quads per side
-/// (minimum 1, reasonable values: 8–64). The patch lies in the XZ plane (Y = 0),
-/// with normals pointing up (+Y) and CCW winding viewed from above.
-///
-/// Color: uniform warm grey with slight variation across the grid so seams between
-/// patches at different LODs are visible.
-///
-/// `origin` is set to `DVec3::ZERO` — the app positions the patch via `ChunkPush.model`.
-pub fn placeholder_patch(size: f32, grid: u32) -> ChunkMeshArrays {
-    let grid = grid.max(1);
-    let step = size / grid as f32;
-    let half = size * 0.5;
-
-    let vert_count = ((grid + 1) * (grid + 1)) as usize;
-    let mut positions = Vec::with_capacity(vert_count);
-    let mut normals = Vec::with_capacity(vert_count);
-    let mut colors = Vec::with_capacity(vert_count);
-
-    for row in 0..=grid {
-        for col in 0..=grid {
-            let x = -half + col as f32 * step;
-            let z = -half + row as f32 * step;
-            positions.push([x, 0.0, z]);
-            normals.push([0.0, 1.0, 0.0]); // up
-
-            // Slight UV-based variation for visual seam detection
-            let u = col as f32 / grid as f32;
-            let v = row as f32 / grid as f32;
-            let base = 0.45f32;
-            let var = 0.08 * (u + v - 1.0).abs();
-            colors.push([base + var, base + var * 0.9, base + var * 0.7]);
-        }
+/// UV sphere with INWARD-facing normals — the same geometry as
+/// [`placeholder_sphere`] but with reversed triangle winding (so cull-BACK keeps
+/// the inside-facing surface). For shell volumes seen from inside (ocean/atmosphere).
+pub fn sphere_inward(radius: f32, subdivisions: u32) -> ChunkMeshArrays {
+    let mut mesh = placeholder_sphere(radius, subdivisions);
+    for tri in mesh.indices.chunks_exact_mut(3) {
+        tri.swap(0, 2);
     }
-
-    let tri_count = (grid * grid * 2) as usize;
-    let mut indices = Vec::with_capacity(tri_count * 3);
-    let row_len = grid + 1;
-
-    for row in 0..grid {
-        for col in 0..grid {
-            let tl = row * row_len + col;
-            let tr = tl + 1;
-            let bl = tl + row_len;
-            let br = bl + 1;
-
-            // CCW winding viewed from above (+Y):
-            indices.push(tl);
-            indices.push(bl);
-            indices.push(tr);
-
-            indices.push(tr);
-            indices.push(bl);
-            indices.push(br);
-        }
-    }
-
-    ChunkMeshArrays {
-        positions,
-        normals,
-        colors,
-        plate_colors: None,
-        indices,
-        origin: glam::DVec3::ZERO,
-    }
+    mesh
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -246,16 +174,17 @@ mod tests {
     }
 
     #[test]
-    fn patch_mesh_valid() {
-        let mesh = placeholder_patch(1000.0, 8);
-        validate_mesh(&mesh, "patch(8)");
-    }
-
-    #[test]
-    fn patch_mesh_min_grid() {
-        let mesh = placeholder_patch(100.0, 0); // should clamp to 1
-        validate_mesh(&mesh, "patch(0→1)");
-        // 1×1 grid = 2 triangles = 6 indices
-        assert_eq!(mesh.indices.len(), 6, "1×1 patch must have 6 indices");
+    fn sphere_inward_reverses_winding() {
+        let out = placeholder_sphere(50_000.0, 16);
+        let inw = sphere_inward(50_000.0, 16);
+        validate_mesh(&inw, "sphere_inward(16)");
+        assert_eq!(inw.indices.len(), out.indices.len());
+        // Each triangle's winding is reversed (first/last swapped).
+        for tri in 0..out.indices.len() / 3 {
+            let b = tri * 3;
+            assert_eq!(inw.indices[b], out.indices[b + 2]);
+            assert_eq!(inw.indices[b + 1], out.indices[b + 1]);
+            assert_eq!(inw.indices[b + 2], out.indices[b]);
+        }
     }
 }

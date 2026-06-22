@@ -4,8 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-glam = { version = "0.33.1", features = ["serde"] }
-serde = { version = "1", features = ["derive"] }
+glam = "0.33.1"
 enki-planet = { path = "../enki-planet" }
 enki-render = { path = "../enki-render" }
 enki-rhi = { path = "../enki-rhi" }

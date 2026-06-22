@@ -15,150 +15,13 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Map elevation `e` (normalized, -1..1 range) and `slope` (0–1) to an RGB color.
-///
-/// Seabed (e < 0): geological sediment bands — abyssal to sandy shelf.
-/// Land (e >= 0): sand through highland/rock, with snow at high elevation.
-/// Slope override (land only): steep slopes blend toward rock grey.
-pub fn elevation_color(e: f32, slope: f32) -> [f32; 3] {
-    let r;
-    let g;
-    let b;
-
-    if e < 0.0 {
-        // ---- SEABED --------------------------------------------------------
-        // Abyssal sediment #232220
-        let r_aby = 0x23_u8 as f32 / 255.0;
-        let g_aby = 0x22_u8 as f32 / 255.0;
-        let b_aby = 0x20_u8 as f32 / 255.0;
-        // Deep sediment #3a352c
-        let r_dep = 0x3a_u8 as f32 / 255.0;
-        let g_dep = 0x35_u8 as f32 / 255.0;
-        let b_dep = 0x2c_u8 as f32 / 255.0;
-        // Slope sediment #605442
-        let r_slp = 0x60_u8 as f32 / 255.0;
-        let g_slp = 0x54_u8 as f32 / 255.0;
-        let b_slp = 0x42_u8 as f32 / 255.0;
-        // Sandy shelf #9c8a66
-        let r_shf = 0x9c_u8 as f32 / 255.0;
-        let g_shf = 0x8a_u8 as f32 / 255.0;
-        let b_shf = 0x66_u8 as f32 / 255.0;
-
-        if e < -0.55 {
-            // Pure abyssal
-            r = r_aby;
-            g = g_aby;
-            b = b_aby;
-        } else if e < -0.18 {
-            // Abyssal → deep sediment (blend window 0.015 around −0.55)
-            let t = clamp01((e + 0.55) / 0.015);
-            r = lerp(r_aby, r_dep, t);
-            g = lerp(g_aby, g_dep, t);
-            b = lerp(b_aby, b_dep, t);
-        } else if e < -0.045 {
-            // Deep → slope sediment (blend window 0.015 around −0.18)
-            let t = clamp01((e + 0.18) / 0.015);
-            r = lerp(r_dep, r_slp, t);
-            g = lerp(g_dep, g_slp, t);
-            b = lerp(b_dep, b_slp, t);
-        } else {
-            // Slope → sandy shelf (blend window 0.015 around −0.045)
-            let t = clamp01((e + 0.045) / 0.015);
-            r = lerp(r_slp, r_shf, t);
-            g = lerp(g_slp, g_shf, t);
-            b = lerp(b_slp, b_shf, t);
-        }
-    } else {
-        // ---- LAND ----------------------------------------------------------
-        // Sandy shelf at waterline #9c8a66
-        let r_shf = 0x9c_u8 as f32 / 255.0;
-        let g_shf = 0x8a_u8 as f32 / 255.0;
-        let b_shf = 0x66_u8 as f32 / 255.0;
-        // Beach sand #b8a36e
-        let r_snd = 0xb8_u8 as f32 / 255.0;
-        let g_snd = 0xa3_u8 as f32 / 255.0;
-        let b_snd = 0x6e_u8 as f32 / 255.0;
-        // Lowland #5a7a4a
-        let r_low = 0x5a_u8 as f32 / 255.0;
-        let g_low = 0x7a_u8 as f32 / 255.0;
-        let b_low = 0x4a_u8 as f32 / 255.0;
-        // Highland #8a7a55
-        let r_hig = 0x8a_u8 as f32 / 255.0;
-        let g_hig = 0x7a_u8 as f32 / 255.0;
-        let b_hig = 0x55_u8 as f32 / 255.0;
-        // Bare rock #7a7060
-        let r_rck = 0x7a_u8 as f32 / 255.0;
-        let g_rck = 0x70_u8 as f32 / 255.0;
-        let b_rck = 0x60_u8 as f32 / 255.0;
-        // Snow #e6e8eb
-        let r_snw = 0xe6_u8 as f32 / 255.0;
-        let g_snw = 0xe8_u8 as f32 / 255.0;
-        let b_snw = 0xeb_u8 as f32 / 255.0;
-
-        let (mut cr, mut cg, mut cb);
-
-        if e < 0.012 {
-            // Sandy shelf → beach sand (blend over full 0..0.012 range)
-            let t = clamp01(e / 0.012);
-            cr = lerp(r_shf, r_snd, t);
-            cg = lerp(g_shf, g_snd, t);
-            cb = lerp(b_shf, b_snd, t);
-        } else if e < 0.18 {
-            // Sand → lowland (blend window 0.015 around 0.012)
-            let t = clamp01((e - 0.012) / 0.015);
-            cr = lerp(r_snd, r_low, t);
-            cg = lerp(g_snd, g_low, t);
-            cb = lerp(b_snd, b_low, t);
-        } else if e < 0.42 {
-            // Lowland → highland (blend window 0.015 around 0.18)
-            let t = clamp01((e - 0.18) / 0.015);
-            cr = lerp(r_low, r_hig, t);
-            cg = lerp(g_low, g_hig, t);
-            cb = lerp(b_low, b_hig, t);
-        } else if e < 0.62 {
-            // Highland → bare rock (blend window 0.015 around 0.42)
-            let t = clamp01((e - 0.42) / 0.015);
-            cr = lerp(r_hig, r_rck, t);
-            cg = lerp(g_hig, g_rck, t);
-            cb = lerp(b_hig, b_rck, t);
-        } else {
-            // Pure bare rock
-            cr = r_rck;
-            cg = g_rck;
-            cb = b_rck;
-        }
-
-        // Snow blend: start at 0.55, fully white by 0.62
-        if e > 0.55 {
-            let snow_t = clamp01((e - 0.55) / (0.62 - 0.55));
-            cr = lerp(cr, r_snw, snow_t);
-            cg = lerp(cg, g_snw, snow_t);
-            cb = lerp(cb, b_snw, snow_t);
-        }
-
-        // Slope override: blend toward rock grey #6e6a64 on cliffs
-        if slope > 0.22 {
-            let rock_blend = clamp01((slope - 0.22) / 0.20);
-            cr = lerp(cr, 0x6e_u8 as f32 / 255.0, rock_blend);
-            cg = lerp(cg, 0x6a_u8 as f32 / 255.0, rock_blend);
-            cb = lerp(cb, 0x64_u8 as f32 / 255.0, rock_blend);
-        }
-
-        r = cr;
-        g = cg;
-        b = cb;
-    }
-
-    [r, g, b]
-}
-
 // Temperature below which land trends to snow/ice (blended over SNOW_BLEND °C).
 const SNOW_TEMP: f32 = -2.0;
 const SNOW_BLEND: f32 = 5.0;
 
 /// Climate-driven biome coloring.
 ///
-/// - Seabed (`e < 0`): identical geological sediment bands to [`elevation_color`].
+/// - Seabed (`e < 0`): geological sediment bands — abyssal to sandy shelf.
 ///   The water shell draws the ocean; climate does not recolor the seabed.
 /// - Land (`e >= 0`): biome from `(temp_c, moisture)`.
 ///   - Dry axis (moisture < ~0.22): desert (hot) → steppe (cold).
@@ -175,7 +38,7 @@ pub fn biome_color(temp_c: f32, moisture: f32, elevation: f32, slope: f32) -> [f
     let e = elevation;
 
     if e < 0.0 {
-        // ---- SEABED: verbatim copy of elevation_color seabed branch ----------
+        // ---- SEABED: geological sediment bands (abyssal → sandy shelf) -------
         let r_aby = 0x23_u8 as f32 / 255.0;
         let g_aby = 0x22_u8 as f32 / 255.0;
         let b_aby = 0x20_u8 as f32 / 255.0;
@@ -294,47 +157,6 @@ pub fn biome_color(temp_c: f32, moisture: f32, elevation: f32, slope: f32) -> [f
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn seabed_deep_is_dark() {
-        let c = elevation_color(-0.8, 0.0);
-        assert!(c[0] < 0.2 && c[1] < 0.2 && c[2] < 0.2);
-    }
-
-    #[test]
-    fn land_green() {
-        let c = elevation_color(0.1, 0.0);
-        assert!(c[1] > c[0] && c[1] > c[2]); // green channel dominant
-    }
-
-    #[test]
-    fn snow_at_high_elevation() {
-        let c = elevation_color(0.65, 0.0);
-        assert!(c[0] > 0.8 && c[1] > 0.8 && c[2] > 0.8);
-    }
-
-    #[test]
-    fn slope_override_darkens_land() {
-        let flat = elevation_color(0.1, 0.0);
-        let steep = elevation_color(0.1, 0.9);
-        // slope grey is darker/more neutral than green lowland
-        assert!(steep[0] > steep[1] * 0.9); // R and G closer on steep grey
-        let _ = flat;
-    }
-
-    #[test]
-    fn colors_in_range() {
-        for ei in -20i32..=20 {
-            let e = ei as f32 / 20.0;
-            for si in 0..=10 {
-                let slope = si as f32 / 10.0;
-                let c = elevation_color(e, slope);
-                assert!(c[0] >= 0.0 && c[0] <= 1.0);
-                assert!(c[1] >= 0.0 && c[1] <= 1.0);
-                assert!(c[2] >= 0.0 && c[2] <= 1.0);
-            }
-        }
-    }
 
     // -- biome_color tests -------------------------------------------------------
 

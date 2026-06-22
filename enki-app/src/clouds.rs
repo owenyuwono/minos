@@ -4,7 +4,8 @@
 //! refraction split (the reopened 1× instance) so it composites over the resolved
 //! opaque scene and can sample its depth for terrain occlusion. The headline
 //! feature: clouds advect with the planet's baked wind field (one global vector
-//! sampled at the sub-camera point each frame — see `record`).
+//! sampled at the sub-camera point each frame — see `record`), and their coverage
+//! is gated by the baked climate **moisture** field (Phase 2).
 //!
 //! Modeled on [`crate::ocean::WaveSurface`] for the GPU plumbing (custom set +
 //! per-FiF UBOs) and on [`crate::atmosphere::Atmosphere`] for the lifecycle.
@@ -13,22 +14,28 @@
 //! fly-through. **TAA-on only** (needs the water split); off → not drawn.
 //!
 //! ponytail: analytic in-shader noise (enki-rhi can't upload a 3D texture), full
-//! res, no cloud reprojection. Upgrades live in `docs/clouds-research.md`.
+//! res, pseudo-curl turbulence (not Bridson), no cloud reprojection. Coverage
+//! moisture is a coarse equirect grid in a storage buffer (no texture upload).
+//! Upgrades live in `docs/clouds-research.md`.
 
 use std::sync::Arc;
 
-use bytemuck::{Pod, Zeroable};
+use bytemuck::{cast_slice, Pod, Zeroable};
 use enki_planet::height::HeightField;
 use enki_render::{camera::Camera, frame::FrameUniforms};
 use enki_rhi::{vk, BindingDesc, BufferHandle, GraphicsPipelineDesc, PipelineHandle, Rhi, RhiError};
-use glam::Vec3;
+use glam::{DVec3, Vec3};
 
 const CLOUDS_WGSL: &str = include_str!("clouds.wgsl");
+
+/// Moisture/coverage grid resolution (equirect lat-lon). Coarse — placement only.
+const GRID_W: usize = 256;
+const GRID_H: usize = 128;
 
 /// GUI-tunable cloud knobs. Frequencies/altitudes are in metres (planet scale).
 #[derive(Debug, Clone, Copy)]
 pub struct CloudParams {
-    /// Fraction of sky covered, 0..1.
+    /// Fraction of sky covered, 0..1 (before the moisture gate).
     pub coverage: f32,
     /// Extinction per metre (optical thickness) — drives opacity + self-shadow.
     pub density: f32,
@@ -44,6 +51,14 @@ pub struct CloudParams {
     pub steps: f32,
     /// Henyey-Greenstein anisotropy (forward scatter / silver lining).
     pub hg_g: f32,
+    /// Cloud type 0..1: stratus (low, flat) → cumulus (tall, billowy).
+    pub cloud_type: f32,
+    /// Powder (Beer-powder) dark-edge strength, 0..1.
+    pub powder: f32,
+    /// Pseudo-curl turbulence amount (wispy churning edges), 0..1.
+    pub curl: f32,
+    /// How strongly climate moisture gates coverage, 0 (uniform) .. 1 (full).
+    pub moisture_influence: f32,
 }
 
 impl Default for CloudParams {
@@ -57,11 +72,15 @@ impl Default for CloudParams {
             noise_scale: 2500.0,
             steps: 48.0,
             hg_g: 0.4,
+            cloud_type: 0.6,
+            powder: 0.3,
+            curl: 0.3,
+            moisture_influence: 0.7,
         }
     }
 }
 
-/// GPU mirror of `clouds.wgsl`'s `CloudParams` (std140, all vec4 → 144 bytes).
+/// GPU mirror of `clouds.wgsl`'s `CloudParams` (std140, all vec4 → 176 bytes).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CloudParamsGpu {
@@ -74,6 +93,9 @@ struct CloudParamsGpu {
     march: [f32; 4],      // steps, hg_g, noise_scale, time
     screen: [f32; 4],     // width, height, tan_half_fov, aspect
     misc: [f32; 4],       // debug, proj_a, proj_b, _pad
+    extra: [f32; 4],      // cloud_type, powder, curl, moisture_influence
+    grid: [f32; 4],       // grid_w, grid_h, has_moisture, _pad
+    wind_offset: [f32; 4],// accumulated world-space drift (xyz, m) + boil (w)
 }
 
 struct CloudFrame {
@@ -90,8 +112,16 @@ pub struct Clouds {
     /// 3-index buffer feeding `vertex_index` for the fullscreen triangle.
     idx: BufferHandle,
     frames: Vec<CloudFrame>,
-    /// Planet wind source (set once the heightfield loads; static until then).
-    wind_src: Option<Arc<dyn HeightField>>,
+    /// Coarse equirect climate-moisture grid (baked once; bound to every set).
+    moisture_buf: BufferHandle,
+    moisture_scratch: Vec<f32>,
+    moisture_baked: bool,
+    /// Accumulated world-space wind drift (metres) + vertical "boil" — advected each
+    /// frame so the planet-fixed cloud field never swings with the camera.
+    wind_offset: Vec3,
+    wind_boil: f32,
+    /// Planet wind+moisture source (set once the heightfield loads; static until then).
+    src: Option<Arc<dyn HeightField>>,
     base_radius: f64,
 }
 
@@ -108,6 +138,7 @@ impl Clouds {
             BindingDesc { binding: 1, ty: vk::DescriptorType::UNIFORM_BUFFER, stages: both },
             BindingDesc { binding: 2, ty: vk::DescriptorType::SAMPLED_IMAGE, stages: frag },
             BindingDesc { binding: 3, ty: vk::DescriptorType::SAMPLER, stages: frag },
+            BindingDesc { binding: 4, ty: vk::DescriptorType::STORAGE_BUFFER, stages: frag },
         ])?;
         let sampler = rhi.create_sampler()?;
 
@@ -132,6 +163,13 @@ impl Clouds {
         // Index buffer values ARE the vertex indices the VS reads (no vertex buffer).
         let idx = rhi.create_index_buffer(&[0u32, 1, 2])?;
 
+        // Shared moisture grid (baked once in `record` when the planet loads).
+        let moisture_buf = rhi.create_gpu_buffer(
+            (GRID_W * GRID_H * std::mem::size_of::<f32>()) as u64,
+            true,
+            vk::BufferUsageFlags::STORAGE_BUFFER,
+        )?;
+
         let fif = rhi.frames_in_flight();
         let mut frames = Vec::with_capacity(fif);
         for _ in 0..fif {
@@ -149,19 +187,33 @@ impl Clouds {
             rhi.write_uniform_binding(set, 0, frame_ubo)?;
             rhi.write_uniform_binding(set, 1, cloud_ubo)?;
             rhi.write_sampler_binding(set, 3, sampler);
+            rhi.write_storage_binding(set, 4, moisture_buf)?;
             // Binding 2 (scene depth) is written per-frame in `record`.
             frames.push(CloudFrame { frame_ubo, cloud_ubo, set });
         }
 
-        Ok(Self { pipeline, layout, sampler, idx, frames, wind_src: None, base_radius })
+        Ok(Self {
+            pipeline,
+            layout,
+            sampler,
+            idx,
+            frames,
+            moisture_buf,
+            moisture_scratch: vec![0.5; GRID_W * GRID_H],
+            moisture_baked: false,
+            wind_offset: Vec3::ZERO,
+            wind_boil: 0.0,
+            src: None,
+            base_radius,
+        })
     }
 
     /// Record the cloud raymarch. Call inside the reopened 1× water instance,
-    /// BEFORE the waves (so the opaque sea occludes sky-clouds), sampling the
-    /// resolved opaque `scene_depth`. `time` is real elapsed seconds (drift rate).
+    /// AFTER the waves (clouds are a shell above sea level), sampling the resolved
+    /// opaque `scene_depth`. `time` is real elapsed seconds (drift rate).
     #[allow(clippy::too_many_arguments)]
     pub fn record(
-        &self,
+        &mut self,
         rhi: &mut Rhi,
         fi: u32,
         fu: &FrameUniforms,
@@ -169,9 +221,19 @@ impl Clouds {
         scene_depth: vk::ImageView,
         extent: (u32, u32),
         time: f32,
+        dt: f32,
         params: CloudParams,
         debug: bool,
     ) -> Result<(), RhiError> {
+        // Lazy one-time moisture bake once the planet's heightfield is available.
+        if !self.moisture_baked {
+            if let Some(hf) = self.src.clone() {
+                bake_moisture(hf.as_ref(), &mut self.moisture_scratch);
+                rhi.write_storage_bytes(self.moisture_buf, cast_slice(&self.moisture_scratch))?;
+                self.moisture_baked = true;
+            }
+        }
+
         let f = &self.frames[fi as usize];
         rhi.write_sampled_image_binding(
             f.set,
@@ -193,14 +255,20 @@ impl Clouds {
         // varying advection would tear the field over time; this stays coherent and
         // changes smoothly as you fly to a new region (how Decima/UE5 do it).
         let sub = camera.position.normalize();
-        let wind = self
-            .wind_src
-            .as_ref()
-            .map(|h| h.wind_at(sub))
-            .unwrap_or_default();
+        let wind = self.src.as_ref().map(|h| h.wind_at(sub)).unwrap_or_default();
         let wdir = Vec3::new(wind.x, wind.y, wind.z);
         let wlen = wdir.length();
         let wnorm = if wlen > 1e-4 { wdir / wlen } else { Vec3::ZERO };
+
+        // Accumulate the drift (world metres) instead of dir×elapsed_time, so the
+        // planet-fixed field advects smoothly and never swings when the camera orbits.
+        // ponytail: grows unbounded over a session; f32 noise precision is fine for
+        // hours — modulo by the noise period if it ever matters.
+        let speed_mps = params.wind_speed * wind.speed;
+        self.wind_offset += wnorm * (speed_mps * dt);
+        self.wind_boil += speed_mps * 0.5 * dt;
+        let drift = self.wind_offset;
+        let drift_dir = if drift.length() > 1.0 { drift.normalize() } else { wnorm };
 
         // Reversed-Z projection constants (solve forward distance from sampled depth).
         let (near, far) = (camera.near, camera.far);
@@ -213,10 +281,18 @@ impl Clouds {
             fwd: [fwd.x, fwd.y, fwd.z, 0.0],
             center_rel: [center_rel.x, center_rel.y, center_rel.z, self.base_radius as f32],
             shell: [params.base_alt_m, params.thickness_m, params.coverage, params.density],
-            wind: [wnorm.x, wnorm.y, wnorm.z, params.wind_speed * wind.speed],
+            wind: [drift_dir.x, drift_dir.y, drift_dir.z, 0.0],
             march: [params.steps, params.hg_g, params.noise_scale, time],
             screen: [extent.0 as f32, extent.1 as f32, tan_half, aspect],
             misc: [if debug { 1.0 } else { 0.0 }, proj_a, proj_b, 0.0],
+            extra: [params.cloud_type, params.powder, params.curl, params.moisture_influence],
+            grid: [
+                GRID_W as f32,
+                GRID_H as f32,
+                if self.moisture_baked { 1.0 } else { 0.0 },
+                0.0,
+            ],
+            wind_offset: [drift.x, drift.y, drift.z, self.wind_boil],
         };
         rhi.write_storage_bytes(f.cloud_ubo, bytemuck::bytes_of(&gpu))?;
 
@@ -227,9 +303,12 @@ impl Clouds {
         Ok(())
     }
 
-    /// Supply the planet as the wind source once loaded; until then clouds are static.
-    pub fn set_wind_source(&mut self, hf: Arc<dyn HeightField>) {
-        self.wind_src = Some(hf);
+    /// Supply the planet as the wind + moisture source once loaded; until then
+    /// clouds are static with uniform coverage. Triggers the one-time moisture bake
+    /// on the next `record`.
+    pub fn set_source(&mut self, hf: Arc<dyn HeightField>) {
+        self.src = Some(hf);
+        self.moisture_baked = false;
     }
 
     /// Free the caller-owned sampler before RHI teardown.
@@ -238,12 +317,29 @@ impl Clouds {
     }
 }
 
+/// Bake the climate moisture into an equirect lat-lon grid (matches the shader's
+/// `sample_moisture`: dir = (cosLat·sinLon, sinLat, cosLat·cosLon)).
+fn bake_moisture(hf: &dyn HeightField, out: &mut [f32]) {
+    for iy in 0..GRID_H {
+        let v = (iy as f64 + 0.5) / GRID_H as f64;
+        let lat = (v - 0.5) * std::f64::consts::PI;
+        let (sin_lat, cos_lat) = lat.sin_cos();
+        for ix in 0..GRID_W {
+            let u = (ix as f64 + 0.5) / GRID_W as f64;
+            let lon = (u - 0.5) * std::f64::consts::TAU;
+            let (sin_lon, cos_lon) = lon.sin_cos();
+            let dir = DVec3::new(cos_lat * sin_lon, sin_lat, cos_lat * cos_lon).normalize();
+            out[iy * GRID_W + ix] = hf.moisture(dir);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn cloud_params_gpu_is_std140_sized() {
-        // 9 × vec4 = 144 bytes.
-        assert_eq!(std::mem::size_of::<super::CloudParamsGpu>(), 144);
+        // 12 × vec4 = 192 bytes.
+        assert_eq!(std::mem::size_of::<super::CloudParamsGpu>(), 192);
     }
 
     #[test]

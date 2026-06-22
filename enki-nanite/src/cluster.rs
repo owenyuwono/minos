@@ -8,27 +8,17 @@
 //! translation is applied at draw time.
 
 use glam::{DVec3, Vec3};
-use serde::{Deserialize, Serialize};
 
 /// World-space bounding sphere; `center` is patch-origin-relative (f32).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BoundingSphere {
     pub center: Vec3,
     pub radius: f32,
 }
 
-/// Normal cone for backface cluster culling (meshopt convention): cull when
-/// `dot(normalize(apex - camera), axis) >= cutoff`.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct NormalCone {
-    pub apex: Vec3,
-    pub axis: Vec3,
-    pub cutoff: f32,
-}
-
 /// One cluster-local vertex. Clusters are self-contained, so vertices shared
 /// across cluster boundaries are duplicated — the standard meshlet layout.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClusterVertex {
     /// Patch-origin-relative position (f32).
     pub position: [f32; 3],
@@ -61,14 +51,13 @@ pub const ROOT_PARENT_ERROR: f32 = f32::INFINITY;
 /// up. Monotonicity (`parent_error >= self_error`) and nested parent bounds are
 /// guaranteed by the baker — together they make the per-cluster test a globally
 /// consistent, crack-free DAG cut.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Cluster {
     pub vertices: Vec<ClusterVertex>,
     /// Triangles as cluster-local vertex indices (each `< vertices.len() <= 64`).
     pub triangles: Vec<[u8; 3]>,
     /// Group bounding sphere (shared within the group); projects `self_error`.
     pub bounds: BoundingSphere,
-    pub normal_cone: NormalCone,
     /// Group simplification error in world units (shared within group). `0` at LOD0.
     pub self_error: f32,
     /// Parent group's error (`>= self_error` by construction). `+inf` for roots.
@@ -82,10 +71,6 @@ pub struct Cluster {
 }
 
 impl Cluster {
-    #[inline]
-    pub fn triangle_count(&self) -> usize {
-        self.triangles.len()
-    }
     /// A root cluster has no parent (its `parent_error` is `+inf`).
     #[inline]
     pub fn is_root(&self) -> bool {
@@ -94,16 +79,11 @@ impl Cluster {
 }
 
 /// The full baked cluster DAG for one terrain patch — the resident bundle for v1.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ClusterAsset {
     pub clusters: Vec<Cluster>,
     /// Absolute planet-space origin (f64); cluster positions are relative to this.
     pub patch_origin: DVec3,
-    /// Provenance of the baked patch (cube-sphere quadtree node).
-    pub face: u8,
-    pub level: u8,
-    pub ix: u32,
-    pub iy: u32,
 }
 
 impl ClusterAsset {

@@ -9,7 +9,6 @@ pub mod descriptor;
 pub mod device;
 pub mod image;
 pub mod instance;
-pub mod memory;
 pub mod pipeline;
 pub mod queue;
 pub mod shader;
@@ -522,7 +521,7 @@ impl Rhi {
     // ── Storage buffers (generic GPU-driven data) ───────────────────────────
 
     /// Create a storage buffer (SSBO). `host_visible = true` makes it mappable
-    /// and readable via [`Self::read_storage_buffer`]; `false` is DEVICE_LOCAL.
+    /// and readable via [`Self::read_buffer`]; `false` is DEVICE_LOCAL.
     pub fn create_storage_buffer(
         &mut self,
         data: &[u8],
@@ -531,11 +530,6 @@ impl Rhi {
         let dev_a: *mut gpu_allocator::vulkan::Allocator = &mut *self.device.allocator;
         self.buffers
             .create_storage_buffer(unsafe { &mut *dev_a }, data, host_visible)
-    }
-
-    /// Read a host-visible buffer's contents back to CPU.
-    pub fn read_storage_buffer(&self, handle: BufferHandle) -> Result<Vec<u8>, RhiError> {
-        self.buffers.read_buffer(handle)
     }
 
     /// Create a buffer with caller-chosen usage flags (indirect-args, visible-list,
@@ -663,20 +657,6 @@ impl Rhi {
         unsafe { self.device.handle.destroy_sampler(sampler, None) };
     }
 
-    /// Create a fullscreen post-process pipeline (no vertex input, no depth, one
-    /// color attachment, custom set layout). For the TAA resolve pass.
-    pub fn create_fullscreen_pipeline(
-        &mut self,
-        shader: &ShaderModule,
-        vs_entry: &str,
-        fs_entry: &str,
-        set_layout: vk::DescriptorSetLayout,
-        color_format: vk::Format,
-    ) -> Result<PipelineHandle, RhiError> {
-        self.pipelines
-            .create_fullscreen(shader, vs_entry, fs_entry, set_layout, color_format)
-    }
-
     // ── TAA (temporal anti-aliasing) ─────────────────────────────────────────
 
     /// Initialise the TAA resolve resources. Call once after the swapchain is
@@ -699,7 +679,9 @@ impl Rhi {
             BindingDesc { binding: 4, ty: vk::DescriptorType::UNIFORM_BUFFER, stages: frag },
         ];
         let set_layout = self.create_descriptor_set_layout(&bindings)?;
-        let pipeline = self.create_fullscreen_pipeline(
+        // Fullscreen post-process pipeline (no vertex input, no depth, one color
+        // attachment, custom set layout) for the TAA resolve pass.
+        let pipeline = self.pipelines.create_fullscreen(
             shader, vs_entry, fs_entry, set_layout, self.swapchain.format,
         )?;
         let sampler = self.create_sampler()?;

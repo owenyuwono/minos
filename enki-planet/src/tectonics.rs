@@ -145,70 +145,10 @@ pub struct TectonicQuery {
     pub rock_hardness: f64,
 }
 
-/// Serialisable / Arc-shareable snapshot of a fully-baked Tectonics.
-///
-/// Fields populated in Phase 1 are filled. Fields deferred to Phase 2/3
-/// are stored as empty `Vec`s / zero values and marked `// PHASE 2`.
-#[derive(Debug, Clone)]
-pub struct TectonicsBaked {
-    pub res: usize,
-    pub seed: u32,
-    pub arc_density: f64,
-    pub hotspot_count: u32,
-    pub hotspot_intensity: f64,
-    pub composition: f64,
-    pub plates: Vec<PlateWire>,
-    /// Per-texel plate id (0-based). Length = TOTAL_TEXELS.
-    pub comp_id: Vec<u16>,
-    /// Per-texel distance to boundary (radians). Length = TOTAL_TEXELS.
-    pub dist_field: Vec<f32>,
-    /// Per-texel neighbour plate id. Length = TOTAL_TEXELS.
-    pub neighbor_id: Vec<u16>,
-    /// Per-texel signed crust SDF (radians). Length = TOTAL_TEXELS. // PHASE 2
-    pub crust_dist: Vec<f32>,
-    /// Per-texel distance to paleo crack network. Length = TOTAL_TEXELS. // PHASE 2
-    pub paleo_dist: Vec<f32>,
-    /// Per-texel baked convergence (blurred). Length = TOTAL_TEXELS.
-    pub conv_field: Vec<f32>,
-    /// Per-texel baked shear (blurred). Length = TOTAL_TEXELS.
-    pub shear_field: Vec<f32>,
-    /// Per-texel blurred plate base elevation. Length = TOTAL_TEXELS.
-    pub base_elev_field: Vec<f32>,
-    /// Per-texel wide-smoothed uplift field. Length = TOTAL_TEXELS.
-    pub uplift_field: Vec<f32>,
-    /// Per-texel substrate rock hardness [0,1] (composition-scaled contrast). Length = TOTAL_TEXELS.
-    pub rock_hardness: Vec<f32>,
-    // Volcano arrays — all empty in Phase 1/2; populated in Phase 3. // PHASE 2
-    pub vol_pos: Vec<f32>,
-    pub vol_base_radius: Vec<f32>,
-    pub vol_height: Vec<f32>,
-    pub vol_crater_frac: Vec<f32>,
-    pub vol_kind: Vec<u8>,
-    pub vol_intensity: Vec<f32>,
-    pub vol_bucket_res: u32,
-    pub vol_bucket_start: Vec<i32>,
-    pub vol_bucket_idx: Vec<i32>,
-    // Hotspot arrays. // PHASE 2
-    pub hotspot_pos: Vec<f32>,
-    pub hotspot_intensity_arr: Vec<f32>,
-    pub hotspot_is_chain: Vec<u8>,
-}
-
-/// Serialisable plate (mirrors `PlateWire` in tectonics.ts).
-#[derive(Debug, Clone)]
-pub struct PlateWire {
-    pub id: usize,
-    pub seed_dir: [f64; 3],
-    pub plate_type: PlateType,
-    pub base_elevation: f64,
-    pub omega: [f64; 3],
-    pub color: [f64; 3],
-}
-
 // ---------------------------------------------------------------------------
-// Cube-map helpers (inline — cubemap.rs is still a stub)
+// Cube-map helpers (inline — deliberately kept local to tectonics, per ki source)
 // These are direct ports of cubemap.ts: dirToTexel, texelToDir,
-// neighborTexel, texelIndex, sampleSmooth.
+// neighborTexel, texelIndex, sampleC1.
 // ---------------------------------------------------------------------------
 
 /// (face, x, y) texel coordinate.
@@ -358,88 +298,9 @@ fn neighbor_texel(face: usize, x: usize, y: usize, dx: i32, dy: i32) -> Texel {
     dir_to_texel(DVec3::new(nx_f, ny_f, nz_f).normalize())
 }
 
-/// Bilinear sample of a Float32 cubemap field at a unit direction.
-/// Mirrors `sampleSmooth` in cubemap.ts (FACE_BASES UV convention).
-///
-/// Edge path: when the 2×2 cell crosses a face boundary, fetch via `neighbor_texel`
-/// (the dir-roundtrip helper), exactly matching JS sampleSmooth's edge path.
-///
-/// JS sampleSmooth detail (cubemap.ts lines ~290–330):
-///   - Interior fast path: all 4 texels in-bounds → direct fetch.
-///   - Edge path: anchor = clamped in-bounds corner; each cell corner is reached
-///     via neighborTexel(face, axx, ayy, ox, oy) where ox,oy ∈ {-1,0,1}.
-// ponytail: kept for reference / potential C0-field reuse; all tectonics field
-// sampling now goes through `sample_c1`. Allow dead_code rather than delete.
-#[allow(dead_code)]
-fn sample_smooth(field: &[f32], dir: DVec3) -> f64 {
-    let ax = dir.x.abs();
-    let ay = dir.y.abs();
-    let az = dir.z.abs();
-
-    let (face, sc, tc, mc) = if ax >= ay && ax >= az {
-        if dir.x > 0.0 { (0usize, dir.z,  dir.y,  ax) }
-        else            { (1,     -dir.z,  dir.y,  ax) }
-    } else if ay >= ax && ay >= az {
-        if dir.y > 0.0 { (2,  dir.x,  dir.z,  ay) }
-        else            { (3,  dir.x, -dir.z,  ay) }
-    } else if dir.z > 0.0 {
-        (4, -dir.x,  dir.y,  az)
-    } else {
-        (5,  dir.x,  dir.y,  az)
-    };
-
-    let hres = (RES as f64) * 0.5;
-    let fx_cont = (sc / mc + 1.0) * hres - 0.5;
-    let fy_cont = (tc / mc + 1.0) * hres - 0.5;
-
-    let x0i = fx_cont.floor() as i32;
-    let y0i = fy_cont.floor() as i32;
-    let fu = fx_cont - fx_cont.floor();
-    let fv = fy_cont - fy_cont.floor();
-    let x1i = x0i + 1;
-    let y1i = y0i + 1;
-
-    let fetch = |xc: usize, yc: usize, dx: i32, dy: i32| -> f64 {
-        let t = neighbor_texel(face, xc, yc, dx, dy);
-        field[texel_index(t.face, t.x, t.y)] as f64
-    };
-
-    let v00: f64;
-    let v10: f64;
-    let v01: f64;
-    let v11: f64;
-
-    // Interior fast path: entire 2×2 cell is in-bounds on the same face.
-    if x0i >= 0 && y0i >= 0 && x1i < RES as i32 && y1i < RES as i32 {
-        let base = face * RES * RES;
-        let x0 = x0i as usize; let y0 = y0i as usize;
-        let x1 = x1i as usize; let y1 = y1i as usize;
-        v00 = field[base + y0 * RES + x0] as f64;
-        v10 = field[base + y0 * RES + x1] as f64;
-        v01 = field[base + y1 * RES + x0] as f64;
-        v11 = field[base + y1 * RES + x1] as f64;
-    } else {
-        // Edge path: anchor = clamped in-bounds corner; offsets ∈ {-1,0,1}.
-        let axx = x0i.clamp(0, (RES as i32) - 1) as usize;
-        let ayy = y0i.clamp(0, (RES as i32) - 1) as usize;
-        let ox0 = x0i - axx as i32;  // ∈ {-1, 0}
-        let ox1 = x1i - axx as i32;  // ∈ {0, 1}
-        let oy0 = y0i - ayy as i32;  // ∈ {-1, 0}
-        let oy1 = y1i - ayy as i32;  // ∈ {0, 1}
-        v00 = fetch(axx, ayy, ox0, oy0);
-        v10 = fetch(axx, ayy, ox1, oy0);
-        v01 = fetch(axx, ayy, ox0, oy1);
-        v11 = fetch(axx, ayy, ox1, oy1);
-    }
-
-    let top = v00 + (v10 - v00) * fu;
-    let bot = v01 + (v11 - v01) * fu;
-    top + (bot - top) * fv
-}
-
 /// C1 smoothstep bilinear sample of a Float32 cubemap field at a unit direction.
-/// Identical to `sample_smooth` except smoothstep is applied to the fractional
-/// texel coords before the bilinear lerp (`fu = fu*fu*(3-2*fu)`, same for `fv`),
+/// Plain bilinear except smoothstep is applied to the fractional texel coords
+/// before the bilinear lerp (`fu = fu*fu*(3-2*fu)`, same for `fv`),
 /// giving zero slope at cell edges — no C0 kinks / boundary staircasing.
 /// Mirrors `_sampleC1` in tectonics.ts (lines ~3118-3186).
 /// NOT safe for sentinel-valued fields (comp_id / neighbor_id — use direct lookup).
@@ -1693,7 +1554,7 @@ const ARC_CRUST_WIDTH:  f64 = 0.090;
 ///
 /// After `new()` all plate-level query fields are populated. Crust/paleo/volcano
 /// fields are Phase-2 work and are zeroed (see `// PHASE 2` markers).
-#[allow(dead_code)] // Phase-2 fields used by to_baked/from_baked in Phase 3
+#[allow(dead_code)] // some baked fields are retained for parity but not yet queried
 pub struct Tectonics {
     pub plates: Vec<Plate>,
 
@@ -3116,122 +2977,6 @@ impl Tectonics {
     /// Number of plates generated.
     pub fn plate_count(&self) -> usize { self.plates.len() }
 
-    // ---------------------------------------------------------------------------
-    // Serialisation — to_baked / from_baked
-    //
-    // to_baked()   : snapshot all baked state by cloning flat arrays.
-    // from_baked() : reconstruct a fully-functional Tectonics WITHOUT re-running
-    //               the expensive generation pipeline.  Noise closures are
-    //               re-derived from the stored seed (same streams 5, 13, 18).
-    // ---------------------------------------------------------------------------
-
-    /// Serialise all baked state into a `TectonicsBaked` snapshot.
-    ///
-    /// All flat arrays are cloned; the returned value owns its data.
-    /// Mirrors `toBaked()` in tectonics.ts.
-    pub fn to_baked(&self) -> TectonicsBaked {
-        let plates_wire: Vec<PlateWire> = self.plates.iter().map(|p| PlateWire {
-            id:            p.id,
-            seed_dir:      [p.seed_dir.x, p.seed_dir.y, p.seed_dir.z],
-            plate_type:    p.plate_type.clone(),
-            base_elevation: p.base_elevation,
-            omega:         [p.omega.x, p.omega.y, p.omega.z],
-            color:         p.color,
-        }).collect();
-
-        TectonicsBaked {
-            res:              RES,
-            seed:             self.seed,
-            arc_density:      self.arc_density,
-            hotspot_count:    self.hotspot_count,
-            hotspot_intensity: self.hotspot_intensity,
-            composition:      self.composition,
-            plates:           plates_wire,
-            comp_id:          self.comp_id.clone(),
-            dist_field:       self.dist_field.clone(),
-            neighbor_id:      self.neighbor_id.clone(),
-            crust_dist:       self.crust_dist.clone(),
-            paleo_dist:       self.paleo_dist.clone(),
-            conv_field:       self.conv_field.clone(),
-            shear_field:      self.shear_field.clone(),
-            base_elev_field:  self.base_elev_field.clone(),
-            uplift_field:     self.uplift_field.clone(),
-            rock_hardness:    self.rock_hardness.clone(),
-            vol_pos:          self.vol_pos.clone(),
-            vol_base_radius:  self.vol_base_radius.clone(),
-            vol_height:       self.vol_height.clone(),
-            vol_crater_frac:  self.vol_crater_frac.clone(),
-            vol_kind:         self.vol_kind.clone(),
-            vol_intensity:    self.vol_intensity.clone(),
-            vol_bucket_res:   self.vol_bucket_res,
-            vol_bucket_start: self.vol_bucket_start.clone(),
-            vol_bucket_idx:   self.vol_bucket_idx.clone(),
-            hotspot_pos:           self.hotspot_pos.clone(),
-            hotspot_intensity_arr: self.hotspot_intensity_arr.clone(),
-            hotspot_is_chain:      self.hotspot_is_chain.clone(),
-        }
-    }
-
-    /// Reconstruct a fully-functional `Tectonics` from a `TectonicsBaked` snapshot.
-    ///
-    /// Does NOT re-run the generation pipeline; all query results will be
-    /// bit-identical to the original instance.  Noise is re-derived from
-    /// the stored seed using the same stream ids as the constructor.
-    /// Mirrors `fromBaked()` in tectonics.ts.
-    pub fn from_baked(b: &TectonicsBaked) -> Self {
-        let plates: Vec<Plate> = b.plates.iter().map(|pw| Plate {
-            id:            pw.id,
-            seed_dir:      DVec3::new(pw.seed_dir[0], pw.seed_dir[1], pw.seed_dir[2]),
-            plate_type:    pw.plate_type.clone(),
-            base_elevation: pw.base_elevation,
-            omega:         DVec3::new(pw.omega[0], pw.omega[1], pw.omega[2]),
-            color:         pw.color,
-        }).collect();
-
-        // Re-derive noise from seed (exact same stream ids as the constructor).
-        let warp_noise      = Noise3D::new(derive_seed(b.seed, 5));
-        let fine_warp_noise = Noise3D::new(derive_seed(b.seed, 13));
-        let vol_noise       = Noise3D::new(derive_seed(b.seed, 18));
-        // Stream 19 is only consumed during bake_hardness (already baked into rock_hardness),
-        // but reconstructed for parity with the constructor's stream set.
-        let hardness_noise  = Noise3D::new(derive_seed(b.seed, 19));
-
-        Tectonics {
-            plates,
-            seed:             b.seed,
-            arc_density:      b.arc_density,
-            hotspot_count:    b.hotspot_count,
-            hotspot_intensity: b.hotspot_intensity,
-            composition:      b.composition,
-            comp_id:          b.comp_id.clone(),
-            dist_field:       b.dist_field.clone(),
-            neighbor_id:      b.neighbor_id.clone(),
-            conv_field:       b.conv_field.clone(),
-            shear_field:      b.shear_field.clone(),
-            base_elev_field:  b.base_elev_field.clone(),
-            uplift_field:     b.uplift_field.clone(),
-            rock_hardness:    b.rock_hardness.clone(),
-            crust_dist:       b.crust_dist.clone(),
-            paleo_dist:       b.paleo_dist.clone(),
-            warp_noise,
-            fine_warp_noise,
-            vol_noise,
-            hardness_noise,
-            vol_pos:          b.vol_pos.clone(),
-            vol_base_radius:  b.vol_base_radius.clone(),
-            vol_height:       b.vol_height.clone(),
-            vol_crater_frac:  b.vol_crater_frac.clone(),
-            vol_kind:         b.vol_kind.clone(),
-            vol_intensity:    b.vol_intensity.clone(),
-            vol_bucket_res:   b.vol_bucket_res,
-            vol_bucket_start: b.vol_bucket_start.clone(),
-            vol_bucket_idx:   b.vol_bucket_idx.clone(),
-            hotspot_pos:           b.hotspot_pos.clone(),
-            hotspot_intensity_arr: b.hotspot_intensity_arr.clone(),
-            hotspot_is_chain:      b.hotspot_is_chain.clone(),
-        }
-    }
-
     /// Wide-smoothed uplift field value at `dir` (C1). Positive = broad orogen,
     /// negative = broad basin. Uses the same domain-warp as `query`.
     /// Mirrors `upliftAt` in tectonics.ts (lines ~3193-3210). Consumed by Phase-4
@@ -3270,27 +3015,6 @@ impl Tectonics {
             dir.z + WARP_AMP * dz,
         ).normalize();
         sample_c1(&self.rock_hardness, w)
-    }
-
-    /// Tangent surface velocity of the owning plate at `dir`: ω × dir.
-    /// Mirrors `velocityAt` in tectonics.ts.
-    pub fn velocity_at(&self, dir: DVec3) -> DVec3 {
-        let dx = fbm(&self.warp_noise, dir.x + 13.7, dir.y,         dir.z,
-                     WARP_OCTAVES, WARP_FREQ, 2.0, 0.5);
-        let dy = fbm(&self.warp_noise, dir.x,         dir.y + 13.7, dir.z,
-                     WARP_OCTAVES, WARP_FREQ, 2.0, 0.5);
-        let dz = fbm(&self.warp_noise, dir.x,         dir.y,         dir.z + 13.7,
-                     WARP_OCTAVES, WARP_FREQ, 2.0, 0.5);
-        let w = DVec3::new(dir.x + WARP_AMP * dx, dir.y + WARP_AMP * dy, dir.z + WARP_AMP * dz).normalize();
-        let t = dir_to_texel(w);
-        let idx  = texel_index(t.face, t.x, t.y);
-        let pid  = self.comp_id[idx] as usize;
-        let omega = self.plates[pid].omega;
-        DVec3::new(
-            omega.y * dir.z - omega.z * dir.y,
-            omega.z * dir.x - omega.x * dir.z,
-            omega.x * dir.y - omega.y * dir.x,
-        )
     }
 
     /// Volcano elevation contribution at `dir`.

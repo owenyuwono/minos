@@ -1,8 +1,7 @@
 //! `third_person` — surface walker with an orbiting chase camera.
 #![allow(dead_code)]
 //!
-//! The character's feet ride the terrain surface (same grounding as
-//! [`super::first_person`]). Movement is **camera-relative**: WASD moves in the
+//! The character's feet ride the terrain surface. Movement is **camera-relative**: WASD moves in the
 //! camera's horizontal frame and the body turns to face its travel direction
 //! (Zelda / modern-3rd-person feel). The mouse orbits the camera around the
 //! character; scroll changes the boom length. A view toggle drops the camera to
@@ -19,7 +18,7 @@ use enki_planet::height::HeightField;
 use enki_render::camera::Camera;
 use glam::{DVec3, Mat3, Quat, Vec3};
 
-use super::first_person::{project_onto_tangent_plane, surface_radius, MoveInput, SPRINT_MULTIPLIER};
+use super::tangent::{project_onto_tangent_plane, surface_radius, MoveInput, SPRINT_MULTIPLIER};
 use super::terrain_grid::grid_surface_radius;
 
 // ── Constants ─────────────────────────────────────────────────────────────

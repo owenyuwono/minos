@@ -18,9 +18,10 @@ use bytemuck::cast_slice;
 use enki_planet::climate::WindSample;
 use enki_planet::height::HeightField;
 use enki_render::{frame::FrameUniforms, material::ChunkPush};
-use enki_rhi::{vk, BufferHandle, GraphicsPipelineDesc, PipelineHandle, Rhi, RhiError};
-use glam::{DVec3, Mat4};
+use enki_rhi::{vk, BufferHandle, PipelineHandle, Rhi, RhiError};
+use glam::DVec3;
 
+use crate::markers::{draw_ribbon, overlay_pipeline};
 use sim::{build_indices, WindSim, VERT_COUNT};
 
 const WIND_WGSL: &str = include_str!("wind.wgsl");
@@ -57,23 +58,13 @@ impl WindOverlay {
         samples: vk::SampleCountFlags,
         base_radius: f64,
     ) -> Result<Self, RhiError> {
-        let shader = rhi.create_shader_module(WIND_WGSL)?;
-        let set0 = rhi.set0_layout();
-        let desc = |samples| GraphicsPipelineDesc {
-            shader,
-            vs_entry: "vs_main",
-            fs_entry: "fs_main",
-            push_constant_size: std::mem::size_of::<ChunkPush>() as u32,
-            set0_layout: set0,
-            color_format,
-            depth_format: vk::Format::D32_SFLOAT,
-            samples,
-            blend: true, // straight-alpha, depth-write OFF
-            fill: true,
-        };
-        let pipeline_msaa = rhi.create_graphics_pipeline(&desc(samples))?;
-        let pipeline_1x = rhi.create_graphics_pipeline(&desc(vk::SampleCountFlags::TYPE_1))?;
-        rhi.destroy_shader_module(shader);
+        // Two pipelines: the MSAA opaque pass + the 1× water-split instance (wind is
+        // drawn after the ocean, so the sample count depends on the split). Both are
+        // straight-alpha, depth-write OFF.
+        let push = std::mem::size_of::<ChunkPush>() as u32;
+        let pipeline_msaa = overlay_pipeline(rhi, WIND_WGSL, color_format, push, true, samples)?;
+        let pipeline_1x =
+            overlay_pipeline(rhi, WIND_WGSL, color_format, push, true, vk::SampleCountFlags::TYPE_1)?;
 
         let indices = build_indices();
         let idx_count = indices.len() as u32;
@@ -154,18 +145,10 @@ impl WindOverlay {
         rhi.write_storage_bytes(self.col_dyn[fi_u], cast_slice(&self.col_scratch))?;
 
         let pipeline = if one_x { self.pipeline_1x } else { self.pipeline_msaa };
-        rhi.bind_pipeline(fi, pipeline)?;
-        rhi.update_frame_uniforms(fi, bytemuck::bytes_of(fu))?;
-        // Positions are already camera-relative → identity model (translation 0).
-        let push = ChunkPush::camera_relative(camera_pos, camera_pos, Mat4::IDENTITY, 0);
         let p = self.pos_dyn[fi_u];
         let c = self.col_dyn[fi_u];
         // 4×vec3 layout: pos / (normal=pos, ignored) / color / (plate=pos, ignored).
-        rhi.bind_vertex_buffers(fi, &[p, p, c, p])?;
-        rhi.bind_index_buffer(fi, self.idx)?;
-        rhi.push_constants(fi, bytemuck::bytes_of(&push))?;
-        rhi.draw_indexed(fi, self.idx_count);
-        Ok(())
+        draw_ribbon(rhi, fi, fu, camera_pos, pipeline, p, p, c, self.idx, self.idx_count)
     }
 }
 

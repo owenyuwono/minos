@@ -201,7 +201,7 @@ fn build_curved_chain(
 
 /// Distribute `appendage_spec` offsets around `axis` per the continuous
 /// `radial_order` gene. Bit-faithful port of `applySymmetry`.
-pub fn apply_symmetry(
+fn apply_symmetry(
     appendage_spec: &[V3],
     radial_order: f64,
     axis: V3,
@@ -833,15 +833,14 @@ pub fn build_skeleton(genome: &Genome, rng: &mut Mulberry32, jitter_amp: f64) ->
         struct Draws {
             draw_a: f64,
             draw_b: f64,
-            #[allow(dead_code)]
-            draw_c: f64,
         }
         let mut draws = Vec::with_capacity(actual_children);
         for _ in 0..actual_children {
             let draw_a = (rng.next() - 0.5) * 0.16 * j_amp;
             let draw_b = (rng.next() - 0.5) * (std::f64::consts::PI / 18.0) * j_amp;
-            let draw_c = (rng.next() - 0.5) * (std::f64::consts::PI / 9.0) * j_amp;
-            draws.push(Draws { draw_a, draw_b, draw_c });
+            // 3rd draw per child is consumed for determinism (count fixed) but unused.
+            let _draw_c = (rng.next() - 0.5) * (std::f64::consts::PI / 9.0) * j_amp;
+            draws.push(Draws { draw_a, draw_b });
         }
 
         let parent_pos = nodes[node_idx].pos;

@@ -497,6 +497,22 @@ impl HeightField for TectonicHeightField {
     fn wind_at(&self, dir: DVec3) -> WindSample {
         self.climate.wind_at(dir)
     }
+
+    fn moisture(&self, dir: DVec3) -> f32 {
+        self.climate.moisture(dir)
+    }
+
+    fn flow_accum_at(&self, dir: DVec3) -> f32 {
+        self.erosion.as_ref().map(|e| e.acc_at(dir) as f32).unwrap_or(0.0)
+    }
+
+    fn flow_dir_at(&self, dir: DVec3) -> DVec3 {
+        self.erosion.as_ref().map(|e| e.flow_at(dir)).unwrap_or(DVec3::ZERO)
+    }
+
+    fn lake_mask_at(&self, dir: DVec3) -> f32 {
+        self.erosion.as_ref().map(|e| e.lake_mask_at(dir) as f32).unwrap_or(0.0)
+    }
 }
 
 // ---------------------------------------------------------------------------

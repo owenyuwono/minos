@@ -278,11 +278,8 @@ impl BufferStore {
 
     /// Destroy all remaining buffers. Called from `Rhi::drop`.
     pub fn destroy_all(&mut self, allocator: &mut Allocator) {
-        let keys: Vec<u64> = self.map.keys().copied().collect();
-        for id in keys {
-            if let Some(buf) = self.map.remove(&id) {
-                buf.destroy(&self.device, allocator);
-            }
+        for (_, buf) in std::mem::take(&mut self.map) {
+            buf.destroy(&self.device, allocator);
         }
     }
 

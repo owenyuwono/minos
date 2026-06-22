@@ -10,9 +10,11 @@
 //! `Atmosphere.ts` (Rayleigh/Mie) if the look needs physical accuracy.
 
 use bytemuck::cast_slice;
-use enki_render::{frame::FrameUniforms, geometry::placeholder_sphere, material::ChunkPush};
-use enki_rhi::{vk, BufferHandle, GraphicsPipelineDesc, PipelineHandle, Rhi, RhiError};
+use enki_render::{frame::FrameUniforms, geometry::sphere_inward, material::ChunkPush};
+use enki_rhi::{vk, BufferHandle, PipelineHandle, Rhi, RhiError};
 use glam::{DVec3, Mat4, Vec3};
+
+use crate::markers::overlay_pipeline;
 
 const ATMOSPHERE_WGSL: &str = include_str!("atmosphere.wgsl");
 
@@ -50,31 +52,21 @@ impl Atmosphere {
         samples: vk::SampleCountFlags,
         base_radius: f64,
     ) -> Result<Self, RhiError> {
-        let shader = rhi.create_shader_module(ATMOSPHERE_WGSL)?;
-        let pipeline = rhi.create_graphics_pipeline(&GraphicsPipelineDesc {
-            shader,
-            vs_entry: "vs_main",
-            fs_entry: "fs_main",
-            push_constant_size: std::mem::size_of::<ChunkPush>() as u32,
-            set0_layout: rhi.set0_layout(),
+        let pipeline = overlay_pipeline(
+            rhi,
+            ATMOSPHERE_WGSL,
             color_format,
-            depth_format: vk::Format::D32_SFLOAT,
+            std::mem::size_of::<ChunkPush>() as u32,
+            true, // alpha-blend, depth-write OFF
             samples,
-            blend: true, // alpha-blend, depth-write OFF
-            fill: true,
-        })?;
-        rhi.destroy_shader_module(shader);
+        )?;
 
-        let mesh = placeholder_sphere(base_radius as f32, 96);
-        // `placeholder_sphere` winds CW-from-outside; reverse so cull-BACK keeps the
-        // near (camera-facing) hemisphere — the halo + haze layer in front.
-        let mut indices = mesh.indices.clone();
-        for tri in indices.chunks_exact_mut(3) {
-            tri.swap(0, 2);
-        }
+        // Inward-wound sphere so cull-BACK keeps the near (camera-facing)
+        // hemisphere — the halo + haze layer in front.
+        let mesh = sphere_inward(base_radius as f32, 96);
         let pos = rhi.create_vertex_buffer(cast_slice(&mesh.positions))?;
         let nrm = rhi.create_vertex_buffer(cast_slice(&mesh.normals))?;
-        let idx = rhi.create_index_buffer(&indices)?;
+        let idx = rhi.create_index_buffer(&mesh.indices)?;
 
         Ok(Self { pipeline, pos, nrm, idx, count: mesh.indices.len() as u32, base_radius })
     }

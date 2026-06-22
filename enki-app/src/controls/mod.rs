@@ -17,13 +17,13 @@
 //! ```text
 //!   winit MouseMotion { delta: (dx, dy) }
 //!       → GlobeControls::on_drag(dx, dy)          // in Globe mode
-//!       → FirstPersonController::on_mouse_look(dx, dy)  // in FirstPerson mode
+//!       → ThirdPersonController::on_mouse(dx, dy)  // in Surface mode
 //!
 //!   winit MouseWheel { delta }
 //!       → GlobeControls::on_scroll(delta)
 //!
 //!   winit KeyboardInput { key: W/A/S/D/Shift }
-//!       → MoveInput flags → FirstPersonController::on_move(input, dt)
+//!       → MoveInput flags → ThirdPersonController::on_move(input, dt)
 //!
 //!   winit MouseInput (left-click in Placement mode)
 //!       → camera_ray(camera, ndc_x, ndc_y, aspect)
@@ -34,7 +34,7 @@
 //! NO winit types appear in this module.
 
 pub mod globe;
-pub mod first_person;
+pub mod tangent;
 pub mod third_person;
 pub mod terrain_grid;
 pub mod surface_picker;
@@ -47,7 +47,7 @@ pub mod space;
 #[allow(unused_imports)]
 pub use globe::{GlobeControls, spherical_to_cartesian, cartesian_to_spherical, PLANET_RADIUS};
 #[allow(unused_imports)]
-pub use first_person::{FirstPersonController, MoveInput, SPRINT_MULTIPLIER};
+pub use tangent::{MoveInput, SPRINT_MULTIPLIER};
 #[allow(unused_imports)]
 pub use third_person::{ThirdPersonController, View};
 #[allow(unused_imports)]

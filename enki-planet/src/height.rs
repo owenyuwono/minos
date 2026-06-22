@@ -48,4 +48,29 @@ pub trait HeightField: Send + Sync {
     fn wind_at(&self, _dir: DVec3) -> WindSample {
         WindSample::default()
     }
+
+    /// Baked atmospheric moisture 0..1 along `dir` (humidity — drives cloud
+    /// placement). NOTE distinct from [`Self::wetness`] (surface rivers/lakes).
+    /// Default 0.5 (neutral) for height fields without a climate bake.
+    fn moisture(&self, _dir: DVec3) -> f32 {
+        0.5
+    }
+
+    /// Log-normalized drainage discharge 0..1 at `dir` (river-network tracer).
+    /// Default 0 (no erosion field). See `erosion::Erosion::acc_at`.
+    fn flow_accum_at(&self, _dir: DVec3) -> f32 {
+        0.0
+    }
+
+    /// World-space downhill flow tangent at `dir` (magnitude = coherence signal,
+    /// NOT unit). Default zero. See `erosion::Erosion::flow_at`.
+    fn flow_dir_at(&self, _dir: DVec3) -> DVec3 {
+        DVec3::ZERO
+    }
+
+    /// Lake-basin presence mask 0..1 at `dir` (river tracer terminates in lakes).
+    /// Default 0. See `erosion::Erosion::lake_mask_at`.
+    fn lake_mask_at(&self, _dir: DVec3) -> f32 {
+        0.0
+    }
 }

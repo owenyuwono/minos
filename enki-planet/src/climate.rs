@@ -346,6 +346,13 @@ impl Climate {
         sample_smooth(&self.wind_speed, dir, MOIST_RES).clamp(0.0, 1.0) as f32
     }
 
+    /// Sample the baked **atmospheric moisture** at a unit planet-local direction,
+    /// ∈ [0,1] (humidity, not surface water — drives cloud placement). Mirrors
+    /// [`Self::sample`]'s moisture half without the temperature evaluation.
+    pub fn moisture(&self, dir: DVec3) -> f32 {
+        sample_smooth(&self.moisture_field, dir, MOIST_RES).clamp(0.0, 1.0) as f32
+    }
+
     // -----------------------------------------------------------------------
     // Serialisation
     // -----------------------------------------------------------------------

@@ -24,6 +24,73 @@ const COL_EQUATOR: [f32; 3] = [0.25, 0.95, 0.40]; // green
 const COL_NORTH: [f32; 3] = [0.95, 0.28, 0.22]; // red
 const COL_SOUTH: [f32; 3] = [0.32, 0.55, 0.98]; // blue
 
+// ── Shared overlay helpers ──────────────────────────────────────────────────
+// The planet overlays (markers / atmosphere / rivers / solar bodies / ocean
+// shell) all build the same kind of pipeline (standard set0, reversed-Z D32,
+// `vs_main`/`fs_main`) and the ribbon overlays (markers / rivers / wind) all
+// record the same camera-relative draw. These two helpers de-dup that boilerplate.
+
+/// Build an overlay graphics pipeline: standard `set0` (FrameUniforms), reversed-Z
+/// `D32_SFLOAT` depth, `vs_main`/`fs_main`, filled. `blend` selects alpha-blend +
+/// depth-write OFF (translucent) vs opaque + depth-write ON; `samples` picks the
+/// MSAA count (pass `TYPE_1` for a 1× water-split instance). The shader module is
+/// created from `wgsl_src` and destroyed once the pipeline is built.
+pub(crate) fn overlay_pipeline(
+    rhi: &mut Rhi,
+    wgsl_src: &str,
+    color_format: vk::Format,
+    push_constant_size: u32,
+    blend: bool,
+    samples: vk::SampleCountFlags,
+) -> Result<PipelineHandle, RhiError> {
+    let shader = rhi.create_shader_module(wgsl_src)?;
+    let pipeline = rhi.create_graphics_pipeline(&GraphicsPipelineDesc {
+        shader,
+        vs_entry: "vs_main",
+        fs_entry: "fs_main",
+        push_constant_size,
+        set0_layout: rhi.set0_layout(),
+        color_format,
+        depth_format: vk::Format::D32_SFLOAT,
+        samples,
+        blend,
+        fill: true,
+    });
+    let pipeline = pipeline?;
+    rhi.destroy_shader_module(shader);
+    Ok(pipeline)
+}
+
+/// Record one camera-relative ribbon draw: bind `pipeline`, push this frame's
+/// uniforms, an identity (camera-at-origin) `ChunkPush`, then bind the 4×vec3
+/// vertex layout `[pos, second, col, pos]` (the overlays alias slots 1/3 to a
+/// position-or-normal buffer) and issue an indexed draw of `idx_count`.
+///
+/// Each layer fills `pos`/`second`/`col`/`idx` with its own contents and writes
+/// the per-FiF position buffer before calling this.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_ribbon(
+    rhi: &mut Rhi,
+    fi: u32,
+    fu: &FrameUniforms,
+    camera_pos: DVec3,
+    pipeline: PipelineHandle,
+    pos: BufferHandle,
+    second: BufferHandle,
+    col: BufferHandle,
+    idx: BufferHandle,
+    idx_count: u32,
+) -> Result<(), RhiError> {
+    rhi.bind_pipeline(fi, pipeline)?;
+    rhi.update_frame_uniforms(fi, bytemuck::bytes_of(fu))?;
+    let push = ChunkPush::camera_relative(camera_pos, camera_pos, Mat4::IDENTITY, 0);
+    rhi.bind_vertex_buffers(fi, &[pos, second, col, pos])?;
+    rhi.bind_index_buffer(fi, idx)?;
+    rhi.push_constants(fi, bytemuck::bytes_of(&push))?;
+    rhi.draw_indexed(fi, idx_count);
+    Ok(())
+}
+
 /// One template vertex of a marker polyline.
 struct MVert {
     /// Unit surface direction.
@@ -56,23 +123,17 @@ impl Markers {
         samples: vk::SampleCountFlags,
         base_radius: f64,
     ) -> Result<Self, RhiError> {
-        let shader = rhi.create_shader_module(MARKERS_WGSL)?;
-        let pipeline = rhi.create_graphics_pipeline(&GraphicsPipelineDesc {
-            shader,
-            vs_entry: "vs_main",
-            fs_entry: "fs_main",
-            push_constant_size: std::mem::size_of::<ChunkPush>() as u32,
-            set0_layout: rhi.set0_layout(),
+        // Opaque (alpha 1) so depth-write is ON: the markers write depth in the
+        // opaque pass, so the later water pass fails its depth test over them and
+        // they show through the sea (instead of being painted over).
+        let pipeline = overlay_pipeline(
+            rhi,
+            MARKERS_WGSL,
             color_format,
-            depth_format: vk::Format::D32_SFLOAT,
+            std::mem::size_of::<ChunkPush>() as u32,
+            false,
             samples,
-            // Opaque (alpha 1) so depth-write is ON: the markers write depth in the
-            // opaque pass, so the later water pass fails its depth test over them and
-            // they show through the sea (instead of being painted over).
-            blend: false,
-            fill: true,
-        })?;
-        rhi.destroy_shader_module(shader);
+        )?;
 
         let (template, segments) = build_template();
         let indices = build_indices(&segments);
@@ -123,16 +184,10 @@ impl Markers {
         rhi.write_storage_bytes(self.pos_dyn[fi_u], cast_slice(&self.pos_scratch))?;
         rhi.write_storage_bytes(self.col_dyn[fi_u], cast_slice(&self.col_scratch))?;
 
-        rhi.bind_pipeline(fi, self.pipeline)?;
-        rhi.update_frame_uniforms(fi, bytemuck::bytes_of(fu))?;
-        let push = ChunkPush::camera_relative(camera_pos, camera_pos, Mat4::IDENTITY, 0);
         let p = self.pos_dyn[fi_u];
         let c = self.col_dyn[fi_u];
-        rhi.bind_vertex_buffers(fi, &[p, p, c, p])?;
-        rhi.bind_index_buffer(fi, self.idx)?;
-        rhi.push_constants(fi, bytemuck::bytes_of(&push))?;
-        rhi.draw_indexed(fi, self.idx_count);
-        Ok(())
+        // 4×vec3 layout: pos / (normal=pos, ignored) / color / (plate=pos, ignored).
+        draw_ribbon(rhi, fi, fu, camera_pos, self.pipeline, p, p, c, self.idx, self.idx_count)
     }
 
     fn build(&mut self, camera_pos: DVec3, sea_radius: f64, poles: bool, equator: bool) {

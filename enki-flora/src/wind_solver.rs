@@ -274,13 +274,6 @@ impl WindSolver {
             }
         }
     }
-
-    /// Convenience: allocate + solve into a fresh `Vec<f32>` of length `count*16`.
-    pub fn solve(&mut self, time: f64, strength: f64, dir_x: f64, dir_z: f64) -> Vec<f32> {
-        let mut out = vec![0.0_f32; self.count * 16];
-        self.solve_into(&mut out, time, strength, dir_x, dir_z);
-        out
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -308,11 +301,19 @@ mod tests {
         m.iter().zip(ID.iter()).all(|(a, b)| (a - b).abs() < 1e-6)
     }
 
+    // Test convenience: allocate + solve into a fresh `Vec<f32>` (the app uses
+    // `solve_into` directly to reuse a buffer).
+    fn solve(s: &mut WindSolver, time: f64, strength: f64, dir_x: f64, dir_z: f64) -> Vec<f32> {
+        let mut out = vec![0.0_f32; s.count * 16];
+        s.solve_into(&mut out, time, strength, dir_x, dir_z);
+        out
+    }
+
     #[test]
     fn strength_zero_is_all_identity() {
         let bones = sample_bones();
         let mut solver = WindSolver::new(&bones);
-        let out = solver.solve(3.21, 0.0, 1.0, 0.0);
+        let out = solve(&mut solver, 3.21, 0.0, 1.0, 0.0);
         assert_eq!(out.len(), bones.len() * 16);
         for c in 0..bones.len() {
             assert!(is_identity(&out[c * 16..c * 16 + 16]), "bone {c} not identity at strength 0");
@@ -323,7 +324,7 @@ mod tests {
     fn rigid_bone_stays_identity_when_windy() {
         let bones = sample_bones();
         let mut solver = WindSolver::new(&bones);
-        let out = solver.solve(1.7, 1.0, 1.0, 0.0);
+        let out = solve(&mut solver, 1.7, 1.0, 1.0, 0.0);
         // Bone 0 is rigid → its WORLD matrix is identity (root + identity local).
         assert!(is_identity(&out[0..16]), "rigid root must stay identity");
         // A flexing bone moves: its matrix is NOT identity under wind.
@@ -335,11 +336,11 @@ mod tests {
         let bones = sample_bones();
         let mut s1 = WindSolver::new(&bones);
         let mut s2 = WindSolver::new(&bones);
-        let a = s1.solve(2.5, 0.7, 0.3, -0.9);
-        let b = s2.solve(2.5, 0.7, 0.3, -0.9);
+        let a = solve(&mut s1, 2.5, 0.7, 0.3, -0.9);
+        let b = solve(&mut s2, 2.5, 0.7, 0.3, -0.9);
         assert_eq!(a, b, "solver not deterministic");
         // Re-solving the SAME solver instance with the same inputs is stable too.
-        let c = s1.solve(2.5, 0.7, 0.3, -0.9);
+        let c = solve(&mut s1, 2.5, 0.7, 0.3, -0.9);
         assert_eq!(a, c, "re-solve differs");
     }
 
@@ -347,7 +348,7 @@ mod tests {
     fn output_is_finite_and_affine() {
         let bones = sample_bones();
         let mut solver = WindSolver::new(&bones);
-        let out = solver.solve(0.42, 1.0, 1.0, 0.5);
+        let out = solve(&mut solver, 0.42, 1.0, 1.0, 0.5);
         for &x in &out {
             assert!(x.is_finite());
         }
@@ -374,7 +375,7 @@ mod tests {
         let mut solver = WindSolver::new(&bones);
         for &(dx, dz) in &[(1.0_f32, 0.0_f32), (0.0, 1.0), (0.7, -0.3), (-0.4, -0.9)] {
             // time 0.6 → bone 1's angle is non-zero, so it actually moves.
-            let out = solver.solve(0.6, 1.0, dx as f64, dz as f64);
+            let out = solve(&mut solver, 0.6, 1.0, dx as f64, dz as f64);
             let m = &out[16..32]; // bone 1's mat4 (column-major); parent is identity.
             // A point on the bone, above its pivot (0,1,0).
             let (px, py, pz) = (0.0_f32, 1.5, 0.0);

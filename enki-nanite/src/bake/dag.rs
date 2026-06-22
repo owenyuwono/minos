@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use glam::Vec3;
 
-use crate::cluster::{BoundingSphere, Cluster, ClusterAsset, ClusterVertex, NormalCone, ROOT_PARENT_ERROR};
+use crate::cluster::{BoundingSphere, Cluster, ClusterAsset, ClusterVertex, ROOT_PARENT_ERROR};
 use enki_planet::height::HeightField;
 
 use super::cluster_build::{build_base_clusters, MAX_CLUSTER_TRIS, MAX_CLUSTER_VERTS};
@@ -299,7 +299,6 @@ pub fn build_dag(base: Vec<Cluster>) -> Vec<Cluster> {
                     meshopt::build_meshlets(&simplified, &adapter, MAX_CLUSTER_VERTS, MAX_CLUSTER_TRIS, 0.0);
                 for i in 0..pmesh.len() {
                     let m = pmesh.get(i);
-                    let b = meshopt::compute_meshlet_bounds(m, &adapter);
                     let vertices: Vec<ClusterVertex> = m
                         .vertices
                         .iter()
@@ -327,11 +326,6 @@ pub fn build_dag(base: Vec<Cluster>) -> Vec<Cluster> {
                         vertices,
                         triangles,
                         bounds: group_bounds,
-                        normal_cone: NormalCone {
-                            apex: Vec3::from_array(b.cone_apex),
-                            axis: Vec3::from_array(b.cone_axis),
-                            cutoff: b.cone_cutoff,
-                        },
                         self_error: group_error,
                         parent_error: ROOT_PARENT_ERROR,
                         parent_bounds: group_bounds,
@@ -408,10 +402,6 @@ pub fn bake_patch_timed(params: &PatchParams, hf: &dyn HeightField) -> (ClusterA
     let asset = ClusterAsset {
         clusters,
         patch_origin: origin,
-        face: params.face,
-        level: params.level,
-        ix: params.ix,
-        iy: params.iy,
     };
     (asset, timings)
 }

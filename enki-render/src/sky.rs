@@ -11,8 +11,6 @@
 use glam::{DVec3, Vec3};
 use std::f64::consts::TAU;
 
-use crate::lights::Lights;
-
 // ── True-scale constants (SI) ────────────────────────────────────────────────
 
 /// 1 astronomical unit (m) — Earth's mean orbital radius.
@@ -89,22 +87,10 @@ impl SkyModel {
         DVec3::new(cd * ch, sd, cd * sh)
     }
 
-    /// Sun angular radius from the planet (rad) — true-scale ≈ 0.0047 rad (the
-    /// ~0.53° disk seen from Earth).
-    pub fn sun_angular_radius(&self) -> f64 {
-        (SUN_RADIUS_M / AU_M).asin()
-    }
-
     /// Warm-white directional-light color (premultiplied intensity). The sun DISK
     /// uses its own HDR over-drive in the shader; this is the surface lighting color.
     pub fn sun_light_color(&self) -> Vec3 {
         Vec3::new(1.0, 0.96, 0.90) * 1.3
-    }
-
-    /// Scene lights for the current sun position: one directional sun, no fill,
-    /// hemisphere/ambient base kept (clean day/night terminator).
-    pub fn lights(&self) -> Lights {
-        Lights::from_sun(self.sun_dir().as_vec3(), self.sun_light_color())
     }
 
     /// Heliocentric spin axis (north pole), tilted from the orbital normal (+Y) by the

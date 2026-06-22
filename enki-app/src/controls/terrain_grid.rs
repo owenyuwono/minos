@@ -32,7 +32,7 @@ use super::PLANET_RADIUS;
 /// and with the drawn mesh. Wraps [`grid_surface_radius`] (the parameterized impl;
 /// tests/tools that need a custom radius or resolution call that directly).
 ///
-/// Grounding against the analytic field instead (`first_person::surface_radius`)
+/// Grounding against the analytic field instead (`tangent::surface_radius`)
 /// makes objects dive into sub-cell detail the mesh never draws — see module docs.
 pub fn ground_radius(hf: &dyn HeightField, height_scale: f64, dir: DVec3) -> f64 {
     grid_surface_radius(hf, PLANET_RADIUS, height_scale, crate::NANITE_BAKE_RES, dir)

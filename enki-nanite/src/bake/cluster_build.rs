@@ -6,7 +6,7 @@
 //! are treated as roots / always-finest). The DAG builder (next N0 step) groups
 //! these, simplifies, and fills in real parent links + monotonic errors.
 
-use crate::cluster::{BoundingSphere, Cluster, ClusterVertex, NormalCone, ROOT_PARENT_ERROR};
+use crate::cluster::{BoundingSphere, Cluster, ClusterVertex, ROOT_PARENT_ERROR};
 use glam::Vec3;
 
 use super::tessellate::PatchMesh;
@@ -68,17 +68,10 @@ pub fn build_base_clusters(mesh: &PatchMesh) -> Vec<Cluster> {
             center: Vec3::from_array(b.center),
             radius: b.radius,
         };
-        let normal_cone = NormalCone {
-            apex: Vec3::from_array(b.cone_apex),
-            axis: Vec3::from_array(b.cone_axis),
-            cutoff: b.cone_cutoff,
-        };
-
         clusters.push(Cluster {
             vertices,
             triangles,
             bounds,
-            normal_cone,
             self_error: 0.0,
             parent_error: ROOT_PARENT_ERROR,
             parent_bounds: bounds,

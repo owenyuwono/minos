@@ -4,7 +4,7 @@
 //! GPU-driven pipeline: a compute pass selects the crack-free LOD cut + frustum-
 //! culls clusters into a visible list, then a single indirect, vertex-pulling
 //! draw rasterizes them. A push-constant debug mode flat-colors by
-//! triangle / cluster / LOD (Unreal-style), mirroring [`crate::debug::id_color`].
+//! triangle / cluster / LOD (Unreal-style), via `id_color` in `nanite_draw.wgsl`.
 //!
 //! v1 layout notes:
 //! - All geometry is flattened into flat storage buffers (no vertex buffers); the
@@ -492,7 +492,7 @@ impl NaniteRenderer {
 
         // Read back this slot's previous result (GPU-complete after begin_frame's
         // fence wait) before we overwrite the args — a diagnostic visible count.
-        if let Ok(bytes) = rhi.read_storage_buffer(args_buf) {
+        if let Ok(bytes) = rhi.read_buffer(args_buf) {
             if bytes.len() >= 4 {
                 let vc = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
                 self.last_visible = vc / (MAX_CLUSTER_TRIS as u32 * 3);

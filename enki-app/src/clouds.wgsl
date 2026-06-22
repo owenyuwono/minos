@@ -5,17 +5,21 @@
 // the FS reconstructs a camera-relative ray, intersects the shell, and marches
 // analytic Perlin-Worley-ish noise advected by the planet's wind. Lighting is
 // Beer + Henyey-Greenstein + a short sun light-march + Hillaire multiscatter
-// octaves (energy-conserving integration), sun/ambient driven by FrameUniforms.
-// Terrain occlusion samples the resolved opaque depth (reversed-Z), no inverse
-// matrix needed. Camera at origin (camera-relative); planet centre = center_rel.
+// octaves (energy-conserving integration), powder dark-edge, sun/ambient from
+// FrameUniforms. Coverage is gated by the baked climate **moisture** field
+// (binding 4, equirect). Terrain occlusion samples the resolved opaque depth
+// (reversed-Z), no inverse matrix needed. Camera at origin (camera-relative);
+// planet centre = center_rel.
 //
 // Pipeline contract: custom set0 — 0 FrameUniforms UBO, 1 CloudParams UBO,
-// 2 scene depth (SAMPLED), 3 sampler. Vertex-pulling pipeline (depth GREATER,
-// depth-write OFF, alpha-blend). Drawn inside the water-split 1× instance.
+// 2 scene depth (SAMPLED), 3 sampler, 4 moisture grid (STORAGE). Vertex-pulling
+// pipeline (depth GREATER, depth-write OFF, alpha-blend). Drawn in the water-split
+// 1× instance, AFTER the ocean (clouds are a shell above sea level).
 //
-// ponytail: analytic noise (no 3D texture — enki-rhi can't upload one), single
-// Worley octave, transmittance-only empty-space skip. Upgrades: detail octaves,
-// curl turbulence, powder, half-res + cloud reprojection. See docs/clouds-research.md.
+// ponytail: analytic noise (enki-rhi can't upload a 3D texture), single Worley
+// octave, pseudo-curl turbulence (not Bridson divergence-free), empty-space skip
+// via a cheap-density gate (no variable stepping), full-res. Upgrades: true curl,
+// half-res + cloud reprojection. See docs/clouds-research.md.
 
 const PI: f32 = 3.14159265359;
 
@@ -41,12 +45,16 @@ struct CloudParams {
     march     : vec4<f32>, // steps, hg_g, noise_scale(m), time(s)
     screen    : vec4<f32>, // width, height, tan_half_fov, aspect
     misc      : vec4<f32>, // debug, proj_a, proj_b, _pad
+    extra     : vec4<f32>, // cloud_type, powder, curl, moisture_influence
+    grid      : vec4<f32>, // moisture_grid_w, moisture_grid_h, has_moisture(0/1), _pad
+    wind_offset: vec4<f32>, // accumulated world-space wind drift (xyz, metres) + boil (w)
 }
 
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
 @group(0) @binding(1) var<uniform> cloud: CloudParams;
 @group(0) @binding(2) var depth_tex: texture_2d<f32>;
 @group(0) @binding(3) var depth_samp: sampler;
+@group(0) @binding(4) var<storage, read> moisture_grid: array<f32>;
 
 // ── Hashes (Dave Hoskins) ───────────────────────────────────────────────────
 fn hash13(p3in: vec3<f32>) -> f32 {
@@ -95,6 +103,11 @@ fn fbm(p0: vec3<f32>) -> f32 {
     return sum / 0.875; // normalize (0.5+0.25+0.125) → ~[0,1]
 }
 
+// Pseudo-curl turbulence (cheap noise vector, NOT divergence-free Bridson curl).
+fn noise3(p: vec3<f32>) -> vec3<f32> {
+    return vec3<f32>(vnoise(p), vnoise(p + 19.19), vnoise(p + 47.77)) * 2.0 - vec3<f32>(1.0);
+}
+
 // ── Worley F1 (detail erosion) ────────────────────────────────────────────────
 fn worley(x: vec3<f32>) -> f32 {
     let ip = floor(x);
@@ -128,35 +141,75 @@ fn ign(px: vec2<f32>, frame_n: f32) -> f32 {
     return fract(52.9829189 * fract(0.06711056 * p.x + 0.00583715 * p.y));
 }
 
-// Cloud density at a planet-centric position; `hfrac` is the 0..1 height in the shell.
-fn density_at(pos: vec3<f32>, hfrac: f32) -> f32 {
+// Baked climate moisture at a planet-centric direction (equirect; CPU bake uses
+// the matching dir = (cosLat·sinLon, sinLat, cosLat·cosLon)).
+fn sample_moisture(d: vec3<f32>) -> f32 {
+    let lon = atan2(d.x, d.z);
+    let lat = asin(clamp(d.y, -1.0, 1.0));
+    let u = lon / (2.0 * PI) + 0.5;
+    let v = lat / PI + 0.5;
+    let gw = i32(cloud.grid.x);
+    let gh = i32(cloud.grid.y);
+    let ix = clamp(i32(u * f32(gw)), 0, gw - 1);
+    let iy = clamp(i32(v * f32(gh)), 0, gh - 1);
+    return moisture_grid[iy * gw + ix];
+}
+
+// Effective coverage at a direction: base coverage gated by climate moisture.
+fn coverage_at(dir: vec3<f32>) -> f32 {
+    var cov = cloud.shell.z;
+    if (cloud.grid.z > 0.5) {
+        let m = sample_moisture(dir);
+        let mfac = smoothstep(0.2, 0.7, m);
+        cov = cov * mix(1.0, mfac, cloud.extra.w);
+    }
+    return cov;
+}
+
+// Vertical density window, blended stratus(low,thin) ↔ cumulus(tall,billowy).
+fn height_gradient(h: f32, cloud_type: f32) -> f32 {
+    let strat = clamp(h / 0.08, 0.0, 1.0) * clamp((0.45 - h) / 0.35, 0.0, 1.0);
+    let cumu = clamp(h / 0.20, 0.0, 1.0) * clamp((1.0 - h) / 0.45, 0.0, 1.0);
+    return mix(strat, cumu, cloud_type);
+}
+
+// Cloud density at a planet-centric position. `cheap` skips Worley erosion + curl
+// (used for the empty-space scout + the sun light-march).
+fn density_at(pos: vec3<f32>, hfrac: f32, cheap: bool) -> f32 {
+    let dir = normalize(pos);
+    let cov = coverage_at(dir);
+    if (cov <= 0.001) { return 0.0; }
+
     let inv = 1.0 / cloud.march.z; // 1 / noise_scale (m)
-    let t = cloud.march.w;
-    let ws = cloud.wind.w;
-    let wdir = cloud.wind.xyz;
+    // Wind drift is an ACCUMULATED world-space offset (metres), not dir×elapsed_time —
+    // so it advects the planet-fixed noise field smoothly and never swings with the
+    // camera (re-sampling the wind dir each frame only bends future drift). `sdir` is
+    // the drift direction (camera-independent) used for the height-skew.
+    let drift = cloud.wind_offset.xyz;
+    let boil = cloud.wind_offset.w;
+    let sdir = cloud.wind.xyz;
 
-    // Wind: base scrolls slowly; height-skew makes tops lead bases (wind shear).
-    let base_p = (pos + wdir * (t * ws) + wdir * (hfrac * cloud.march.z * 0.6)) * inv;
+    // Wind: base advects with the drift; height-skew makes tops lead bases (shear).
+    let base_p = (pos + drift + sdir * (hfrac * cloud.march.z * 0.6)) * inv;
     var shape = fbm(base_p);
-
-    // Height gradient window → flat bottoms, defined tops (density→0 at floor/ceiling).
-    let grad = clamp(hfrac / 0.15, 0.0, 1.0) * clamp((1.0 - hfrac) / 0.4, 0.0, 1.0);
-    shape *= grad;
+    shape *= height_gradient(hfrac, cloud.extra.x);
 
     // Coverage gate, then re-multiply by coverage (the bit ki omits → rounded edges).
-    let cov = cloud.shell.z;
     var d = clamp(remap(shape, 1.0 - cov, 1.0, 0.0, 1.0), 0.0, 1.0) * cov;
-    if (d <= 0.0) { return 0.0; }
+    if (d <= 0.0 || cheap) { return d; }
 
-    // Detail erosion (edge-only): faster-scrolling Worley + a small upward boil so
-    // the edges churn instead of sliding rigidly (ki's "decal" failure).
-    let det_p = (pos + wdir * (t * ws * 1.8) + vec3<f32>(0.0, 1.0, 0.0) * (t * ws * 0.5)) * (inv * 4.0);
-    let er = worley(det_p);
+    // Detail erosion (edge-only): faster-drifting Worley + a small upward boil so
+    // the edges churn instead of sliding rigidly, plus pseudo-curl turbulence.
+    var det = (pos + drift * 1.8 + vec3<f32>(0.0, 1.0, 0.0) * boil) * (inv * 4.0);
+    if (cloud.extra.z > 0.0) {
+        det += noise3(det * 0.5) * cloud.extra.z;
+    }
+    let er = worley(det);
     d = clamp(remap(d, er * 0.3, 1.0, 0.0, 1.0), 0.0, 1.0);
     return d;
 }
 
-// Optical depth toward the sun (short light-march).
+// Optical depth toward the sun (short, cheap light-march).
 fn light_optical_depth(pos: vec3<f32>, sun_dir: vec3<f32>, ri: f32, ro: f32) -> f32 {
     let ls = (ro - ri) * 0.12;
     var lp = pos;
@@ -166,7 +219,7 @@ fn light_optical_depth(pos: vec3<f32>, sun_dir: vec3<f32>, ri: f32, ro: f32) -> 
         let r = length(lp);
         let hf = (r - ri) / (ro - ri);
         if (hf >= 0.0 && hf <= 1.0) {
-            acc += density_at(lp, hf) * cloud.shell.w * ls;
+            acc += density_at(lp, hf, true) * cloud.shell.w * ls;
         }
     }
     return acc;
@@ -179,9 +232,6 @@ struct VsOut {
 
 @vertex
 fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
-    // Oversized fullscreen triangle: (-1,-1), (3,-1), (-1,3). CCW (front-facing)
-    // in the positive-height Vulkan viewport, so cull-BACK keeps it. z=1 (reversed-Z
-    // near) → passes depth GREATER everywhere; depth-write is off.
     var out: VsOut;
     // vid 0 → (-1,-1), 1 → (-1,3), 2 → (3,-1). This winding is front-facing under
     // cull-BACK: we bypass the projection's -f Y-flip, so only the framebuffer's
@@ -255,6 +305,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let sun_dir = normalize(frame.sun0_dir.xyz);
     let cos_t = dot(dir, sun_dir);
     let g = cloud.march.y;
+    let powder_amt = cloud.extra.y;
     let steps = max(i32(cloud.march.x), 1);
     let seg = t_exit - t_enter;
     let dt = seg / f32(steps);
@@ -275,22 +326,30 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let r = length(pos);
         let hfrac = (r - ri) / (ro - ri);
         if (hfrac >= 0.0 && hfrac <= 1.0) {
-            let dens = density_at(pos, hfrac);
-            if (dens > 0.0) {
-                let sigma_t = dens * cloud.shell.w;
-                let tau = light_optical_depth(pos, sun_dir, ri, ro);
-                // Hillaire multiscatter octaves (a=b=c=0.5): cheap soft interior glow.
-                var msum = 0.0;
-                var oa = 1.0; var ob = 1.0; var oc2 = 1.0;
-                for (var n = 0; n < 3; n = n + 1) {
-                    msum += ob * exp(-tau * oa) * hg(cos_t, g * oc2);
-                    oa *= 0.5; ob *= 0.5; oc2 *= 0.5;
+            // Empty-space scout: cheap density first; only do erosion + the sun
+            // light-march where there's actually cloud.
+            let cheap = density_at(pos, hfrac, true);
+            if (cheap > 0.01) {
+                let dens = density_at(pos, hfrac, false);
+                if (dens > 0.0) {
+                    let sigma_t = dens * cloud.shell.w;
+                    let tau = light_optical_depth(pos, sun_dir, ri, ro);
+                    // Hillaire multiscatter octaves (a=b=c=0.5): soft interior glow.
+                    var msum = 0.0;
+                    var oa = 1.0; var ob = 1.0; var oc2 = 1.0;
+                    for (var n = 0; n < 3; n = n + 1) {
+                        msum += ob * exp(-tau * oa) * hg(cos_t, g * oc2);
+                        oa *= 0.5; ob *= 0.5; oc2 *= 0.5;
+                    }
+                    // Powder (Beer-powder dark edge), gated by the slider.
+                    let powd = 1.0 - exp(-dens * 2.0);
+                    let sun_term = sun_col * msum * mix(1.0, powd, powder_amt);
+                    let lum = sun_term + amb;
+                    let step_t = exp(-sigma_t * dt);
+                    // energy-conserving integration (step-count independent)
+                    scattered += transmit * (1.0 - step_t) * lum;
+                    transmit *= step_t;
                 }
-                let lum = sun_col * msum + amb;
-                let step_t = exp(-sigma_t * dt);
-                // energy-conserving integration (step-count independent)
-                scattered += transmit * (1.0 - step_t) * lum;
-                transmit *= step_t;
             }
         }
         t += dt;

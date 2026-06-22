@@ -305,17 +305,18 @@ fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
     }
 }
 
-/// Per-gene additive offset, keyed by JS gene name. Genes absent from this map
+/// Per-gene additive offset, keyed by JS gene name. Genes absent from the map
 /// have offset 0 (matching the JS initializer where every gene starts at 0).
-struct EnvOffset {
-    /// Only the genes that ever receive a nonzero offset are tracked; lookups
-    /// for any other gene return 0.0.
+/// Only the genes that ever receive a nonzero offset are tracked; lookups for
+/// any other gene return 0.0.
+pub struct EnvOffsetTable {
     map: std::collections::HashMap<&'static str, f64>,
 }
 
-impl EnvOffset {
+impl EnvOffsetTable {
+    /// Additive offset for `name` (0.0 if the gene is unaffected by env).
     #[inline]
-    fn get(&self, name: &str) -> f64 {
+    pub fn get(&self, name: &str) -> f64 {
         self.map.get(name).copied().unwrap_or(0.0)
     }
 }
@@ -331,7 +332,7 @@ pub fn compute_env_offset(env: &Env) -> EnvOffsetTable {
     let aridity = env.aridity;
     let temperature = env.temperature;
 
-    let mut o = EnvOffset {
+    let mut o = EnvOffsetTable {
         map: std::collections::HashMap::new(),
     };
     let mut add = |name: &'static str, delta: f64| {
@@ -390,19 +391,7 @@ pub fn compute_env_offset(env: &Env) -> EnvOffsetTable {
         add("rootDepth", -0.20);
     }
 
-    EnvOffsetTable(o)
-}
-
-/// Public opaque handle around the offset map (so `compute_env_offset` has a
-/// nameable return type without exposing the internal `HashMap`).
-pub struct EnvOffsetTable(EnvOffset);
-
-impl EnvOffsetTable {
-    /// Additive offset for `name` (0.0 if the gene is unaffected by env).
-    #[inline]
-    pub fn get(&self, name: &str) -> f64 {
-        self.0.get(name)
-    }
+    o
 }
 
 // ---------------------------------------------------------------------------
