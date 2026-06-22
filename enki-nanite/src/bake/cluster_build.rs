@@ -53,6 +53,7 @@ pub fn build_base_clusters(mesh: &PatchMesh) -> Vec<Cluster> {
                     volcanism: mesh.volcanism[gv],
                     elevation: mesh.elevation[gv],
                     plate: mesh.plate[gv],
+                    horizon: mesh.horizon[gv],
                 }
             })
             .collect();

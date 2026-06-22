@@ -10,6 +10,8 @@
 //! Moisture is BAKED once into a 128²×6 cube-map at construction:
 //!   bandWetness · seaProximity · rainShadow · moistGain, then box-blurred.
 //!   Sampled bilinearly via `cubemap::sample_smooth`.
+//!   rainShadow marches UPWIND along the baked wind field (so wind drives
+//!   precipitation), which is why `bake_wind` runs before `bake_moisture`.
 //!
 //! `biome_color` is NOT here — it belongs to the mesher (task 4.2b).
 
@@ -250,6 +252,25 @@ impl Climate {
         // Touch seed stream 200 for determinism (mirrors climate.ts comment).
         let _jitter_seed = derive_seed(params.seed, 200);
 
+        // Wind bake knobs (ki defaults). Baked BEFORE moisture so the rain-shadow
+        // march can follow the REAL wind field (vortices + Coriolis) instead of the
+        // idealized zonal band. ki bakes moisture first and uses the zonal approx;
+        // climate is not ki-golden-gated, so enki reorders for a wind-driven shadow.
+        // (Both streams derive independently from `seed`, so the reorder is
+        // determinism-neutral — stream 200 above, stream 201 inside bake_wind.)
+        let wp = WindParams {
+            swirl_strength: params.swirl_strength.unwrap_or(0.6),
+            n_high: params.n_high.unwrap_or(4),
+            n_low: params.n_low.unwrap_or(3),
+            cross_isobar_max: params.cross_isobar_max.unwrap_or(0.4),
+            sigma_base: params.sigma_base.unwrap_or(0.18),
+            lat_spread: params.lat_spread.unwrap_or(0.17),
+            retrograde: params.retrograde.unwrap_or(1.0),
+            equator_taper_width: params.equator_taper_width.unwrap_or(0.20),
+        };
+        let WindBake { wind_x, wind_y, wind_z, wind_speed } =
+            bake_wind(MOIST_RES, params.seed, band_count, gradient, &wp);
+
         let moisture_field = bake_moisture(
             MOIST_RES,
             band_count,
@@ -263,21 +284,10 @@ impl Climate {
             invert_blend,
             &height_fn,
             &crust_dist_at,
+            &wind_x,
+            &wind_y,
+            &wind_z,
         );
-
-        // Wind bake knobs (ki defaults).
-        let wp = WindParams {
-            swirl_strength: params.swirl_strength.unwrap_or(0.6),
-            n_high: params.n_high.unwrap_or(4),
-            n_low: params.n_low.unwrap_or(3),
-            cross_isobar_max: params.cross_isobar_max.unwrap_or(0.4),
-            sigma_base: params.sigma_base.unwrap_or(0.18),
-            lat_spread: params.lat_spread.unwrap_or(0.17),
-            retrograde: params.retrograde.unwrap_or(1.0),
-            equator_taper_width: params.equator_taper_width.unwrap_or(0.20),
-        };
-        let WindBake { wind_x, wind_y, wind_z, wind_speed } =
-            bake_wind(MOIST_RES, params.seed, band_count, gradient, &wp);
 
         Climate {
             base_temp: params.base_temp,
@@ -429,12 +439,6 @@ fn band_wetness(dir_y: f64, band_count: u32) -> f64 {
     BAND_FLOOR + (1.0 - BAND_FLOOR) * raw
 }
 
-/// Index of the circulation band a latitude falls in (0 at equator, increasing poleward).
-fn band_index(dir_y: f64, band_count: u32) -> u32 {
-    let lat_angle = dir_y.clamp(-1.0, 1.0).asin().abs();
-    (lat_angle / (std::f64::consts::PI / (2.0 * band_count as f64))).floor() as u32
-}
-
 /// Bake the moisture cube-map. For each texel:
 ///   `moisture = clamp01(bandWetness · seaProximity · rainShadow · moistGain) · frozenAtten`
 /// then one cross-face box blur (centre weight 4, four cardinal neighbours weight 1).
@@ -452,8 +456,12 @@ fn bake_moisture(
     invert_blend: f64,
     height_fn: &impl Fn(DVec3, u32) -> f64,
     crust_dist_at: &impl Fn(DVec3) -> f64,
+    // Baked wind direction cube-maps (length 6·res²) — the rain shadow marches
+    // upwind along these instead of the idealized zonal belt.
+    wind_x: &[f32],
+    wind_y: &[f32],
+    wind_z: &[f32],
 ) -> Vec<f32> {
-    let polar_axis = DVec3::Y;
     let total = 6 * res * res;
     let mut field = vec![0.0f32; total];
 
@@ -470,16 +478,23 @@ fn bake_moisture(
                 let sea_prox = MOIST_SEAPROX_FLOOR
                     + (1.0 - MOIST_SEAPROX_FLOOR) * (-cd.max(0.0) / MOIST_INLAND_SCALE).exp();
 
-                // 3. Rain shadow — march UPWIND along this band's zonal wind.
-                //    east tangent = normalize(polarAxis × dir); wind sign alternates per band.
-                let east_raw = polar_axis.cross(dir);
-                let e_len = east_raw.length();
+                // 3. Rain shadow — march UPWIND along the BAKED wind field (vortices +
+                //    Coriolis), so leeward drying lands behind terrain relative to the
+                //    real local wind, not an idealized zonal belt. Tangent-project the
+                //    (blurred) wind vector and normalize; near-zero wind (poles) → no
+                //    shadow.
+                let idx = texel_index(face, x, y, res);
+                let wind_vec = DVec3::new(
+                    wind_x[idx] as f64,
+                    wind_y[idx] as f64,
+                    wind_z[idx] as f64,
+                );
+                let wind_t = wind_vec - dir * wind_vec.dot(dir);
+                let w_len = wind_t.length();
                 let shadow;
-                if e_len > 1e-6 {
-                    let east = east_raw / e_len;
-                    let wind_sign = if (band_index(dir.y, band_count) & 1) == 0 { 1.0_f64 } else { -1.0_f64 };
+                if w_len > 1e-4 {
                     // Upwind is opposite the wind travel direction.
-                    let up = -wind_sign * east;
+                    let up = -(wind_t / w_len);
                     let this_h = height_fn(dir, RAINSHADOW_LEVEL);
                     let mut max_upwind = this_h;
                     for s in 1..=UPWIND_STEPS {

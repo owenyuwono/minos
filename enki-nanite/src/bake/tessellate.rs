@@ -10,9 +10,97 @@
 //! Positions are stored **patch-origin-relative** (f32): `origin` is the displaced
 //! patch center in planet space (f64), and each position is `(world_f64 - origin)`.
 
-use enki_planet::face_bases::{cube_to_sphere, FACE_BASES};
+use enki_planet::face_bases::{cube_to_sphere, horizon_basis, FACE_BASES};
 use enki_planet::height::HeightField;
 use glam::DVec3;
+
+// ── Horizon self-shadow bake ─────────────────────────────────────────────────
+// Per-vertex terrain self-shadow data: for each surface point, the SINE of the
+// max terrain elevation angle in 4 azimuth directions (the `horizon_basis`
+// tangents: tan_a, tan_b, -tan_a, -tan_b). Sun-direction-agnostic → baked once,
+// the moving sun is compared against it at runtime (nanite_draw.wgsl). Stored as
+// a SINE so the runtime test is a pure dot-product (no trig).
+//
+// ponytail: a COARSE per-patch grid is marched (cost decoupled from the ~1024²
+// mesh), then each vertex bilinearly samples it. Upgrade to a per-face horizon
+// *texture* (needs an enki-rhi set1) only if crisper edges are needed.
+const HORIZON_AZIMUTHS: usize = 4;
+/// March steps per azimuth (quadratic-spaced: dense near, sparse far).
+const HORIZON_STEPS: u32 = 16;
+/// Max great-circle arc to march (rad) ≈ 12 km on a 50 km-radius planet; beyond
+/// this, curvature drops terrain below the local horizon anyway.
+const HORIZON_MAX_ARC: f64 = 0.24;
+/// Cap on the coarse grid side (texels = cap+1). Real bake res 1024 → 256; small
+/// test meshes use their own (smaller) resolution so tests stay fast.
+const HORIZON_GRID_CAP: usize = 256;
+
+/// Max elevation-angle SINE of terrain seen from the surface point at unit `dir`
+/// looking along tangent `t`, by marching the height field along the great circle.
+/// Curvature is implicit (real 3-D points), so terrain that curves away yields ≤ 0.
+fn march_horizon_sine(dir: DVec3, t: DVec3, p: &PatchParams, hf: &dyn HeightField) -> f32 {
+    let p0 = dir * (p.radius + hf.height(dir, p.level) * p.height_scale);
+    let mut max_s = 0.0f64;
+    for step in 1..=HORIZON_STEPS {
+        let f = step as f64 / HORIZON_STEPS as f64;
+        let arc = HORIZON_MAX_ARC * f * f; // quadratic: dense near the receiver
+        let di = (dir * arc.cos() + t * arc.sin()).normalize();
+        let pi = di * (p.radius + hf.height(di, p.level) * p.height_scale);
+        let los = pi - p0;
+        let len = los.length();
+        if len > 1e-6 {
+            let s = los.dot(dir) / len; // sine of elevation above p0's tangent plane
+            if s > max_s {
+                max_s = s;
+            }
+        }
+    }
+    max_s.max(0.0) as f32
+}
+
+/// Build a coarse `(hg+1)²` horizon grid over the patch's parameter square; each
+/// texel stores 4 horizon-elevation sines (the 4 `horizon_basis` azimuths).
+fn build_horizon_grid(p: &PatchParams, hg: usize, hf: &dyn HeightField) -> Vec<[f32; 4]> {
+    let basis = &FACE_BASES[p.face as usize];
+    let scale = 1.0 / (1u64 << p.level) as f64;
+    let g = hg + 1;
+    let mut grid = vec![[0.0f32; 4]; g * g];
+    for gy in 0..g {
+        for gx in 0..g {
+            let u = (p.ix as f64 + gx as f64 / hg as f64) * scale;
+            let v = (p.iy as f64 + gy as f64 / hg as f64) * scale;
+            let dir = cube_to_sphere(basis.n + basis.u * (u * 2.0 - 1.0) + basis.v * (v * 2.0 - 1.0))
+                .normalize();
+            let (ta, tb) = horizon_basis(dir);
+            grid[gy * g + gx] = [
+                march_horizon_sine(dir, ta, p, hf),
+                march_horizon_sine(dir, tb, p, hf),
+                march_horizon_sine(dir, -ta, p, hf),
+                march_horizon_sine(dir, -tb, p, hf),
+            ];
+        }
+    }
+    grid
+}
+
+/// Bilinearly sample the horizon grid at vertex grid coord `(gi, gj)` (∈ 0..=res).
+fn sample_horizon(grid: &[[f32; 4]], hg: usize, res: u32, gi: usize, gj: usize) -> [f32; 4] {
+    let g = hg + 1;
+    let fx = (gi as f64 / res as f64) * hg as f64;
+    let fy = (gj as f64 / res as f64) * hg as f64;
+    let x0 = (fx.floor() as usize).min(hg - 1);
+    let y0 = (fy.floor() as usize).min(hg - 1);
+    let tx = (fx - x0 as f64) as f32;
+    let ty = (fy - y0 as f64) as f32;
+    let (c00, c10) = (grid[y0 * g + x0], grid[y0 * g + x0 + 1]);
+    let (c01, c11) = (grid[(y0 + 1) * g + x0], grid[(y0 + 1) * g + x0 + 1]);
+    let mut out = [0.0f32; 4];
+    for k in 0..HORIZON_AZIMUTHS {
+        let a = c00[k] * (1.0 - tx) + c10[k] * tx;
+        let b = c01[k] * (1.0 - tx) + c11[k] * tx;
+        out[k] = a * (1.0 - ty) + b * ty;
+    }
+    out
+}
 
 /// Parameters describing one patch to tessellate.
 #[derive(Debug, Clone, Copy)]
@@ -44,6 +132,10 @@ pub struct PatchMesh {
     pub elevation: Vec<f32>,
     /// Per-vertex per-plate tint (debug "plate" view), parallel to `colors`.
     pub plate: Vec<[f32; 3]>,
+    /// Per-vertex terrain self-shadow: SINE of the max terrain elevation angle in
+    /// 4 azimuths (`horizon_basis` tangents). Sun-direction-agnostic; runtime
+    /// compares the sun elevation against it. Rides the DAG like the other scalars.
+    pub horizon: Vec<[f32; 4]>,
     /// Triangle-list indices, CCW from outside, 32-bit.
     pub indices: Vec<u32>,
     /// Per-vertex: `true` if the vertex lies on an outer patch edge (lock for DAG).
@@ -125,9 +217,16 @@ pub fn tessellate_patch(p: &PatchParams, hf: &dyn HeightField) -> PatchMesh {
     let mut volcanism = vec![0.0f32; vcount];
     let mut elevation = vec![0.0f32; vcount];
     let mut plate = vec![[0.0f32; 3]; vcount];
+    let mut horizon = vec![[0.0f32; 4]; vcount];
     let mut boundary = vec![false; vcount];
     let mut dir_cache = vec![DVec3::ZERO; vcount];
     let mut h_cache = vec![0.0f64; vcount];
+
+    // Coarse per-patch horizon grid (cost decoupled from the vertex count); each
+    // vertex bilinearly samples it below. Cap the grid res so small test meshes
+    // stay fast (the real bake at res 1024 uses HORIZON_GRID_CAP).
+    let hg = (res as usize).min(HORIZON_GRID_CAP).max(8);
+    let horizon_grid = build_horizon_grid(p, hg, hf);
 
     // Pass 1: positions + caches.
     for gj in 0..grid {
@@ -164,6 +263,7 @@ pub fn tessellate_patch(p: &PatchParams, hf: &dyn HeightField) -> PatchMesh {
             volcanism[vi] = hf.volcanism(dir);
             elevation[vi] = h_cache[vi] as f32;
             plate[vi] = hf.plate_color(dir);
+            horizon[vi] = sample_horizon(&horizon_grid, hg, res, gi, gj);
         }
     }
 
@@ -179,7 +279,7 @@ pub fn tessellate_patch(p: &PatchParams, hf: &dyn HeightField) -> PatchMesh {
         }
     }
 
-    PatchMesh { positions, normals, colors, material, wetness, volcanism, elevation, plate, indices, boundary, origin }
+    PatchMesh { positions, normals, colors, material, wetness, volcanism, elevation, plate, horizon, indices, boundary, origin }
 }
 
 #[cfg(test)]
@@ -191,6 +291,58 @@ mod tests {
     impl HeightField for SineHf {
         fn height(&self, dir: DVec3, _l: u8) -> f64 {
             0.01 * (dir.x * 7.0 + dir.y * 5.0 + dir.z * 3.0).sin()
+        }
+    }
+
+    /// Flat except a narrow Gaussian ridge centred at `bump_dir`.
+    struct RidgeHf {
+        bump_dir: DVec3,
+        height: f64,
+    }
+    impl HeightField for RidgeHf {
+        fn height(&self, dir: DVec3, _l: u8) -> f64 {
+            let d = (dir.normalize() - self.bump_dir).length();
+            self.height * (-d * d * 2000.0).exp()
+        }
+    }
+
+    /// Frame-consistency: the horizon march must see a ridge placed in a given
+    /// azimuth ONLY in that azimuth's slot — guards against a bake↔runtime axis
+    /// swap/sign flip (the runtime mirrors `horizon_basis` + this sine convention).
+    #[test]
+    fn horizon_sees_ridge_only_in_its_azimuth() {
+        use enki_planet::face_bases::horizon_basis;
+        let p = PatchParams {
+            face: 4, level: 0, ix: 0, iy: 0, resolution: 64,
+            radius: 50_000.0, height_scale: 1_000.0,
+        };
+        let dir = DVec3::Z; // +Z face centre
+        let (ta, tb) = horizon_basis(dir);
+        // Ridge ~2.5 km away (arc 0.05 rad) along +tan_a, peak ~500 m.
+        let arc: f64 = 0.05;
+        let bump_dir = (dir * arc.cos() + ta * arc.sin()).normalize();
+        let hf = RidgeHf { bump_dir, height: 0.5 };
+
+        let toward = march_horizon_sine(dir, ta, &p, &hf);
+        let perp = march_horizon_sine(dir, tb, &p, &hf);
+        let away = march_horizon_sine(dir, -ta, &p, &hf);
+        assert!(toward > 0.05, "ridge azimuth should be occluded: sine={toward}");
+        assert!(perp < 0.02, "perpendicular azimuth should be clear: sine={perp}");
+        assert!(away < 0.02, "opposite azimuth should be clear: sine={away}");
+    }
+
+    /// Flat terrain → ~0 horizon everywhere (nothing self-shadows).
+    #[test]
+    fn flat_terrain_has_no_horizon() {
+        struct FlatHf;
+        impl HeightField for FlatHf {
+            fn height(&self, _d: DVec3, _l: u8) -> f64 { 0.0 }
+        }
+        let m = tessellate_patch(&params(32), &FlatHf);
+        for h in &m.horizon {
+            for &s in h {
+                assert!(s < 1e-3, "flat terrain produced horizon sine {s}");
+            }
         }
     }
 

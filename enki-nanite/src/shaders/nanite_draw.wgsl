@@ -31,6 +31,7 @@ struct FrameData {
     ambient: vec4<f32>,
     planes: array<vec4<f32>, 6>,
     debug: vec4<u32>,
+    cam_world: vec4<f32>, // true camera world pos (xyz) — for radial-up reconstruction
 };
 
 struct Push {
@@ -85,6 +86,8 @@ struct VsOut {
     @location(9) volcanism: f32,
     @location(10) elevation: f32,
     @location(11) plate: vec3<f32>,
+    @location(12) horizon: vec4<f32>,   // per-azimuth horizon-elevation sines (self-shadow)
+    @location(13) world_rel: vec3<f32>, // camera-relative world pos (for radial up)
 };
 
 @vertex
@@ -132,6 +135,8 @@ fn vs_pull(@builtin(vertex_index) vid: u32) -> VsOut {
         out.volcanism = 0.0;
         out.elevation = 0.0;
         out.plate = vec3<f32>(0.0);
+        out.horizon = vec4<f32>(0.0);
+        out.world_rel = vec3<f32>(0.0);
         return out;
     }
 
@@ -140,7 +145,7 @@ fn vs_pull(@builtin(vertex_index) vid: u32) -> VsOut {
     // vertex base is needed.
     let gt = ci * MAX_TRIS + tri;
     let vidx = tris[gt * 3u + corner];
-    let base = vidx * 16u; // stride: pos3 + normal3 + color3 + material1 + wetness1 + volcanism1 + elevation1 + plate3
+    let base = vidx * 20u; // stride: pos3 + normal3 + color3 + material1 + wetness1 + volcanism1 + elevation1 + plate3 + horizon4
     let pos = vec3<f32>(verts[base + 0u], verts[base + 1u], verts[base + 2u]);
     let nrm = vec3<f32>(verts[base + 3u], verts[base + 4u], verts[base + 5u]);
     let col = vec3<f32>(verts[base + 6u], verts[base + 7u], verts[base + 8u]);
@@ -157,6 +162,8 @@ fn vs_pull(@builtin(vertex_index) vid: u32) -> VsOut {
     out.volcanism = verts[base + 11u];
     out.elevation = verts[base + 12u];
     out.plate = vec3<f32>(verts[base + 13u], verts[base + 14u], verts[base + 15u]);
+    out.horizon = vec4<f32>(verts[base + 16u], verts[base + 17u], verts[base + 18u], verts[base + 19u]);
+    out.world_rel = world_rel;
     return out;
 }
 
@@ -245,6 +252,37 @@ fn volcano_ramp(t: f32) -> vec3<f32> {
     return mix(c2, c3, (t - 0.8) / 0.2);
 }
 
+// Soft terrain self-shadow falloff. ponytail: a shader const (tuning knob —
+// rebuild to change); promote to a push constant + GUI slider when iterating.
+const HORIZON_STRENGTH: f32 = 12.0;
+
+// Mirror of enki_planet::face_bases::horizon_basis — MUST stay byte-identical so
+// the bake's azimuth-0 matches the runtime. Columns = (tan_a, tan_b, up).
+fn horizon_basis(up: vec3<f32>) -> mat3x3<f32> {
+    let r = select(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(0.0, 1.0, 0.0), abs(up.y) < 0.999);
+    let tan_a = normalize(r - up * dot(r, up));
+    let tan_b = cross(up, tan_a);
+    return mat3x3<f32>(tan_a, tan_b, up);
+}
+
+// Terrain self-shadow for the primary sun: 1 = lit, <1 = shadowed. `horizon` holds
+// per-azimuth horizon-elevation SINES (baked); compare to the sun's elevation sine
+// in the local tangent frame, bilinear in azimuth across the 4 slots.
+fn terrain_shadow(world_rel: vec3<f32>, horizon: vec4<f32>, sun: vec3<f32>) -> f32 {
+    let up = normalize(world_rel + frame.cam_world.xyz);
+    let sun_elev = dot(sun, up);
+    if (sun_elev <= 0.0) { return 1.0; } // night side: d0 already ~0
+    let b = horizon_basis(up);
+    let sun_h = sun - up * sun_elev; // horizontal sun direction
+    let az = atan2(dot(sun_h, b[1]), dot(sun_h, b[0])); // [-pi,pi], 0 = tan_a
+    var f = az / 1.5707963; // quadrant index in [-2,2]
+    if (f < 0.0) { f = f + 4.0; }
+    let i0 = u32(floor(f)) % 4u;
+    let i1 = (i0 + 1u) % 4u;
+    let h = mix(horizon[i0], horizon[i1], fract(f));
+    return 1.0 - clamp((h - sun_elev) * HORIZON_STRENGTH, 0.0, 1.0);
+}
+
 @fragment
 fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
     // Dithered LOD cross-fade (frame.debug.y = enabled). This cluster keeps only the
@@ -262,12 +300,23 @@ fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
     if (pc.mode == 0u) {
         // Lit — matches terrain.wgsl mode 0 (ambient + hemisphere + 2 suns + ACES).
         let n = normalize(in.normal);
-        let albedo = in.color;
+        // Rivers + lakes: blend a deep-water albedo by the per-vertex wetness mask
+        // (acc∪lake, baked at tessellation). Water fills the valleys the heightfield
+        // already carves and the flattened lake basins. A sharpened sun term fakes a
+        // wet sheen (no view vector here). ponytail: flat-shaded water — true planar
+        // reflection is the tracked RiverNetwork ribbon-mesh follow-up.
+        let wet = clamp(in.wetness, 0.0, 1.0);
+        let water = vec3<f32>(0.045, 0.11, 0.17);
+        let albedo = mix(in.color, water, wet);
         let ambient_term = frame.ambient.xyz * albedo;
         let hemi = hemisphere_ambient(n, frame.hemi_sky.xyz, frame.hemi_ground.xyz) * albedo;
         let d0 = max(dot(n, frame.sun0_dir.xyz), 0.0) * frame.sun0_color.xyz * albedo;
         let d1 = max(dot(n, frame.sun1_dir.xyz), 0.0) * frame.sun1_color.xyz * albedo;
-        rgb = aces_filmic(ambient_term + hemi + d0 + d1);
+        let sheen = wet * pow(max(dot(n, frame.sun0_dir.xyz), 0.0), 32.0) * frame.sun0_color.xyz;
+        // Terrain self-shadow: darken the primary-sun direct terms (diffuse + sheen),
+        // leaving ambient/hemisphere/fill so shadowed ground isn't black.
+        let sh = terrain_shadow(in.world_rel, in.horizon, normalize(frame.sun0_dir.xyz));
+        rgb = aces_filmic(ambient_term + hemi + (d0 + sheen) * sh + d1);
     } else if (pc.mode == 1u) {
         // Unlit — flat biome albedo (no lighting, no ACES).
         rgb = in.color;

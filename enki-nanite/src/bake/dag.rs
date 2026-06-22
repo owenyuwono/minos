@@ -78,6 +78,7 @@ struct MergedMesh {
     volcanism: Vec<f32>,
     elevation: Vec<f32>,
     plate: Vec<[f32; 3]>,
+    horizon: Vec<[f32; 4]>,
     indices: Vec<u32>,
     lock: Vec<bool>,
 }
@@ -94,6 +95,7 @@ fn merge_group(clusters: &[Cluster], group: &[usize]) -> MergedMesh {
     let mut volcanism = Vec::new();
     let mut elevation = Vec::new();
     let mut plate = Vec::new();
+    let mut horizon = Vec::new();
     let mut indices = Vec::new();
 
     for &ci in group {
@@ -110,6 +112,7 @@ fn merge_group(clusters: &[Cluster], group: &[usize]) -> MergedMesh {
                 volcanism.push(v.volcanism);
                 elevation.push(v.elevation);
                 plate.push(v.plate);
+                horizon.push(v.horizon);
                 id
             });
             local.push(id);
@@ -137,7 +140,7 @@ fn merge_group(clusters: &[Cluster], group: &[usize]) -> MergedMesh {
         }
     }
 
-    MergedMesh { positions, normals, colors, material, wetness, volcanism, elevation, plate, indices, lock }
+    MergedMesh { positions, normals, colors, material, wetness, volcanism, elevation, plate, horizon, indices, lock }
 }
 
 // ── METIS grouping ───────────────────────────────────────────────────────────
@@ -311,6 +314,7 @@ pub fn build_dag(base: Vec<Cluster>) -> Vec<Cluster> {
                                 volcanism: merged.volcanism[gv],
                                 elevation: merged.elevation[gv],
                                 plate: merged.plate[gv],
+                                horizon: merged.horizon[gv],
                             }
                         })
                         .collect();

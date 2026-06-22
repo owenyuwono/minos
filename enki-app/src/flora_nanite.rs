@@ -75,6 +75,8 @@ pub fn bake_branch_mesh(bm: &BranchMesh, model_rot: Quat) -> ClusterAsset {
         volcanism: vec![0.0; n],
         elevation: vec![0.0; n],
         plate: vec![[0.0; 3]; n],
+        // No terrain self-shadow horizon for a tree patch (zero = nothing occludes).
+        horizon: vec![[0.0f32; 4]; n],
         indices: bm.indices.clone(),
         // build_base_clusters ignores `boundary`; the DAG re-derives lock edges
         // from the welded merged-group mesh, so an all-false mask is correct.

@@ -75,6 +75,9 @@ struct GpuFrameData {
     ambient: [f32; 4],
     planes: [[f32; 4]; 6],
     debug: [u32; 4],
+    /// True camera world position (xyz); shader reconstructs radial up =
+    /// normalize(world_rel + cam_world) for the terrain self-shadow horizon query.
+    cam_world: [f32; 4],
 }
 
 /// Gribb–Hartmann frustum planes from a view-projection matrix, normalized.
@@ -106,10 +109,10 @@ fn extract_planes(vp: Mat4) -> [[f32; 4]; 6] {
 /// Resident-cluster pool capacity (number of GPU cluster slots). The DAG may be
 /// far larger; only the near-cut working set is resident at any time.
 const POOL_MAX_CLUSTERS: usize = 49_152;
-/// Floats per cluster slot (fixed stride): `MAX_CLUSTER_VERTS` verts × 16 floats
-/// (pos3 + normal3 + color3 + material1 + wetness1 + volcanism1 + elevation1 + plate3).
+/// Floats per cluster slot (fixed stride): `MAX_CLUSTER_VERTS` verts × 20 floats
+/// (pos3 + normal3 + color3 + material1 + wetness1 + volcanism1 + elevation1 + plate3 + horizon4).
 /// MUST match the per-vertex stride in nanite_draw.wgsl::vs_pull.
-const SLOT_FLOATS: usize = MAX_CLUSTER_VERTS * 16;
+const SLOT_FLOATS: usize = MAX_CLUSTER_VERTS * 20;
 /// Indices per cluster slot (fixed stride): `MAX_CLUSTER_TRIS` tris × 3.
 const SLOT_INDICES: usize = MAX_CLUSTER_TRIS * 3;
 const POOL_MAX_FLOATS: usize = POOL_MAX_CLUSTERS * SLOT_FLOATS;
@@ -344,13 +347,14 @@ impl NaniteRenderer {
     ) -> Result<(), RhiError> {
         let c = &asset.clusters[cluster_idx];
 
-        let mut vbuf: Vec<f32> = Vec::with_capacity(c.vertices.len() * 16);
+        let mut vbuf: Vec<f32> = Vec::with_capacity(c.vertices.len() * SLOT_FLOATS / MAX_CLUSTER_VERTS);
         for v in &c.vertices {
             vbuf.extend_from_slice(&v.position);
             vbuf.extend_from_slice(&v.normal);
             vbuf.extend_from_slice(&v.color);
             vbuf.extend_from_slice(&[v.material, v.wetness, v.volcanism, v.elevation]);
             vbuf.extend_from_slice(&v.plate);
+            vbuf.extend_from_slice(&v.horizon);
         }
         let verts_off = slot as u64 * SLOT_FLOATS as u64 * 4;
         rhi.write_storage_bytes_at(self.verts_buf, verts_off, bytemuck::cast_slice(&vbuf))?;
@@ -522,6 +526,7 @@ impl NaniteRenderer {
             planes: extract_planes(view_proj),
             // debug: [debug_mode, dither_enabled, frame_index, _]
             debug: [debug_mode, dither as u32, frame_index, 0],
+            cam_world: [camera_world.x as f32, camera_world.y as f32, camera_world.z as f32, 0.0],
         };
         rhi.write_storage_bytes(frame_buf, bytemuck::bytes_of(&data))?;
         // Reset indirect args: vertex_count = 0, instance_count = 1.

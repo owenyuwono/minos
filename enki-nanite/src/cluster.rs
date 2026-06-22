@@ -45,6 +45,9 @@ pub struct ClusterVertex {
     pub elevation: f32,
     /// Per-plate tint — debug "plate" view. Same free-ride as `material`.
     pub plate: [f32; 3],
+    /// Terrain self-shadow: SINE of the max terrain elevation angle in 4 azimuths
+    /// (`horizon_basis` tangents). Sun-direction-agnostic; same free-ride.
+    pub horizon: [f32; 4],
 }
 
 /// Parent error for root clusters: `+inf` always passes the cut's upper test.

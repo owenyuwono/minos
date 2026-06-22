@@ -69,6 +69,23 @@ pub fn patch_center_dir(face: u8, level: u8, ix: u32, iy: u32) -> DVec3 {
     cube_to_sphere(cube_pt).normalize()
 }
 
+/// Tangent-frame basis for horizon/azimuth queries at unit surface direction
+/// `dir` (the radial up). Returns `(tan_a, tan_b)` — two orthonormal tangents in
+/// the plane ⊥ `dir`, defining "azimuth 0" (`tan_a`) and "azimuth +90°" (`tan_b`).
+///
+/// **This is the single source of truth for azimuth 0**, shared by the horizon
+/// bake and the runtime shader (which mirrors this formula). It derives from
+/// `dir` ALONE — body +Y projected onto the tangent plane, falling back to +X at
+/// the poles — so bake and runtime agree regardless of cube face. (Cube-face u/v
+/// axes flip across faces and must NOT be used here.)
+pub fn horizon_basis(dir: DVec3) -> (DVec3, DVec3) {
+    let up = dir;
+    let r = if up.y.abs() < 0.999 { DVec3::Y } else { DVec3::X };
+    let tan_a = (r - up * r.dot(up)).normalize();
+    let tan_b = up.cross(tan_a); // unit, ⊥ both (right-handed)
+    (tan_a, tan_b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +162,28 @@ mod tests {
                 "level {level}: node_size={} expected={expected}",
                 node.node_size
             );
+        }
+    }
+
+    /// `horizon_basis` returns an orthonormal tangent pair ⊥ `dir`, stable at poles.
+    #[test]
+    fn horizon_basis_orthonormal_and_tangent() {
+        let dirs = [
+            DVec3::new(0.3, 0.2, 0.9).normalize(),
+            DVec3::Y,            // pole — +Y fallback path
+            DVec3::NEG_Y,        // other pole
+            DVec3::new(1.0, 0.0, 0.0),
+            DVec3::new(-0.5, 0.7, -0.5).normalize(),
+        ];
+        for d in dirs {
+            let (a, b) = horizon_basis(d);
+            assert!((a.length() - 1.0).abs() < 1e-9, "tan_a not unit for {d:?}");
+            assert!((b.length() - 1.0).abs() < 1e-9, "tan_b not unit for {d:?}");
+            assert!(a.dot(d).abs() < 1e-9, "tan_a not ⊥ dir for {d:?}");
+            assert!(b.dot(d).abs() < 1e-9, "tan_b not ⊥ dir for {d:?}");
+            assert!(a.dot(b).abs() < 1e-9, "tan_a not ⊥ tan_b for {d:?}");
+            // Right-handed: tan_a × tan_b == dir.
+            assert!((a.cross(b) - d).length() < 1e-9, "frame not right-handed for {d:?}");
         }
     }
 
