@@ -13,7 +13,7 @@
 // is dropping this file + the `#[cfg(feature="flora")]` wiring in main.rs.
 
 use enki_flora::color::pigment_to_color;
-use enki_flora::genome::{random_genome, resolve, Env, Genome, Resolved};
+use enki_flora::genome::{resolve, Env, Genome, Resolved};
 use enki_flora::mesh::{build_branch_mesh_with, BranchMeshOpts, WindBone};
 use enki_flora::wind_solver::WindSolver;
 use enki_rhi::{BufferHandle, Rhi, RhiError};
@@ -110,13 +110,6 @@ pub enum LeafMode {
 }
 
 impl LeafMode {
-    /// Parse `FLORA_LEAFMODE` (screenshot env). `single` ⇒ Single, anything else
-    /// (incl. unset/`cluster`) ⇒ Cluster. Prefer [`from_env_or`] so the unset
-    /// default comes from the canonical [`TreeSpec`], not a hardcoded Cluster.
-    pub fn from_env() -> Self {
-        Self::from_env_or(LeafMode::Cluster)
-    }
-
     /// Parse `FLORA_LEAFMODE`, falling back to `default` when the var is unset (so
     /// the viewer's startup leaf mode tracks the canonical [`TreeSpec`] default).
     pub fn from_env_or(default: Self) -> Self {
@@ -447,14 +440,6 @@ impl Default for TreeSpec {
 }
 
 impl FloraView {
-    /// Build the canonical default specimen ([`TreeSpec::default_specimen`]) at
-    /// `origin`. The in-planet app AND the viewer's startup BOTH go through this
-    /// (via [`TreeSpec`]), so the planet tree and the viewer's initial tree are
-    /// guaranteed identical.
-    pub fn default_specimen(rhi: &mut Rhi, origin: DVec3) -> Result<Self, RhiError> {
-        Self::from_spec(rhi, &TreeSpec::default_specimen(), origin)
-    }
-
     /// Build a tree from a [`TreeSpec`] at `origin` — the ONE entry point both the
     /// viewer and the in-planet app use for the default tree, so they can't drift.
     pub fn from_spec(rhi: &mut Rhi, spec: &TreeSpec, origin: DVec3) -> Result<Self, RhiError> {
@@ -468,52 +453,8 @@ impl FloraView {
         )
     }
 
-    /// Build the one tree: resolve `seed`, mesh it, upload buffers. `origin` is
-    /// the tree's f64 world position (surface point). Pipelines live in the
-    /// flora-owned `FloraRenderer`, not here.
-    pub fn new(rhi: &mut Rhi, seed: u32, origin: DVec3) -> Result<Self, RhiError> {
-        Self::new_with_mode(rhi, seed, origin, LeafMode::default())
-    }
-
-    /// As [`new`], but with an explicit leaf mode (Cluster/Single).
-    pub fn new_with_mode(
-        rhi: &mut Rhi,
-        seed: u32,
-        origin: DVec3,
-        leaf_mode: LeafMode,
-    ) -> Result<Self, RhiError> {
-        let env = Env::default();
-        let genome = random_genome(&env, seed);
-        Self::from_genome_with_mode(rhi, &genome, &env, origin, leaf_mode)
-    }
-
-    /// Build the tree from an EDITED genome + env (the egui-driven CAS path).
-    ///
-    /// Resolves `genome` against `env` then meshes/uploads it. Determinism is
-    /// preserved: `resolve` is the same pure function `new` calls, so an edited
-    /// genome that equals a `random_genome(env, seed)` output produces a
-    /// bit-identical tree. `new` now delegates here after its seed→genome draw.
-    pub fn from_genome(
-        rhi: &mut Rhi,
-        genome: &Genome,
-        env: &Env,
-        origin: DVec3,
-    ) -> Result<Self, RhiError> {
-        Self::from_genome_with_mode(rhi, genome, env, origin, LeafMode::default())
-    }
-
-    /// As [`from_genome`], with an explicit leaf mode (Cluster/Single).
-    pub fn from_genome_with_mode(
-        rhi: &mut Rhi,
-        genome: &Genome,
-        env: &Env,
-        origin: DVec3,
-        leaf_mode: LeafMode,
-    ) -> Result<Self, RhiError> {
-        Self::from_genome_with_mode_tuned(rhi, genome, env, origin, leaf_mode, LeafTuning::default())
-    }
-
-    /// As [`from_genome_with_mode`], with explicit render-side leaf-placement
+    /// Build the tree from an EDITED genome + env (the egui-driven CAS path), with
+    /// explicit render-side leaf-placement
     /// tuning. The tuning is RENDER-ONLY (it only reaches `build_leaf_mesh`), so
     /// it never affects the golden gen-core path.
     pub fn from_genome_with_mode_tuned(
@@ -551,11 +492,11 @@ impl FloraView {
         )
     }
 
-    /// Mesh + upload from an already-resolved tree. Genome-source-agnostic: both
-    /// `new` (seed) and `from_genome` (edited) funnel here. `tex_seed` keys the
-    /// CPU leaf-texture bake (genome.structural_seed). `leaf_mode` selects the
-    /// Cluster (one card/cluster) vs Single (fan into individual leaves) path;
-    /// `frondyness`/`spininess` are the single-fan gate (computed in `from_genome`).
+    /// Mesh + upload from an already-resolved tree. Genome-source-agnostic: every
+    /// build funnels through `from_genome_with_mode_tuned` into here. `tex_seed`
+    /// keys the CPU leaf-texture bake (genome.structural_seed). `leaf_mode` selects
+    /// the Cluster (one card/cluster) vs Single (fan into individual leaves) path;
+    /// `frondyness`/`spininess` are the single-fan gate (computed by the caller).
     #[allow(clippy::too_many_arguments)]
     fn from_resolved(
         rhi: &mut Rhi,
@@ -795,7 +736,7 @@ impl FloraView {
     /// `Wireframe`; otherwise writes the `debug_mode` push lane so the FS selects
     /// lit/unlit/normals/ao. Persists across `record` calls (the tree survives a
     /// mode switch — no rebuild needed). Survives a tree rebuild only if re-set,
-    /// so the viewer re-applies it after `from_genome` (cheap, idempotent).
+    /// so the viewer re-applies it after a rebuild (cheap, idempotent).
     pub fn set_render_mode(&mut self, mode: RenderMode) {
         self.mode = mode;
     }
@@ -929,7 +870,7 @@ impl FloraView {
     /// out of `record` so the Nanite branch path can draw the branches itself (its
     /// own cull+draw) while the leaves still render as cards via `record_leaves`.
     /// Draws at the tree's own surface-placed model (`self.origin`).
-    pub fn record_branch(
+    fn record_branch(
         &mut self,
         rhi: &mut Rhi,
         renderer: &FloraRenderer,
@@ -947,7 +888,7 @@ impl FloraView {
     /// Record ONLY the leaf cards. Used both by `record` (full tree) and by the
     /// Nanite branch path (which draws the branches via Nanite, then the leaves
     /// here unchanged — Nanite is for the branch geometry only).
-    pub fn record_leaves(
+    fn record_leaves(
         &mut self,
         rhi: &mut Rhi,
         renderer: &FloraRenderer,

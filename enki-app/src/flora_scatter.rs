@@ -11,7 +11,10 @@
 //! are fine for a walk-among-trees grove on the mid-latitude surface; revisit with
 //! a cube-sphere cell id + instanced draw if trees ever need planet-wide coverage.
 
+use std::sync::OnceLock;
+
 use enki_planet::height::HeightField;
+use enki_planet::noise::{fbm, Noise3D};
 use glam::{DVec3, Mat4, Vec3, Vec4};
 
 use crate::controls::terrain_grid::ground_radius;
@@ -45,6 +48,20 @@ pub const SPACING_M: f64 = 5.0;
 /// without an fps cliff and this ceiling can lift.
 pub const MAX_TREES: usize = 16000;
 
+// ── Forest groves (approach B) ──────────────────────────────────────────────
+// Climate decides WHERE forests can exist; a low-frequency noise breaks that
+// region into groves with bald clearings, so trees don't carpet the whole biome.
+// ponytail: tunables held as constants — eyeball them on the planet and nudge;
+// promote to GUI sliders if they need live tuning.
+
+/// Grove feature frequency on the unit sphere — bigger = smaller groves
+/// (≈ `PLANET_RADIUS / GROVE_FREQ` metres per blob, so ~600 m here).
+const GROVE_FREQ: f64 = 80.0;
+/// Grove-mask cut on the fbm output (≈[-1, 1]); higher = less forest cover.
+const GROVE_THRESH: f32 = 0.05;
+/// Soft edge half-width around the cut (grove → clearing falloff).
+const GROVE_EDGE: f32 = 0.20;
+
 /// splitmix64-style finalizer over a mixed (cell_i, cell_j, salt) key.
 fn hash(cell_i: i64, cell_j: i64, salt: u64) -> u64 {
     let mut x = (cell_i as u64).wrapping_mul(0x9E3779B97F4A7C15)
@@ -69,12 +86,60 @@ fn dir_of(lat: f64, lon: f64) -> DVec3 {
     DVec3::new(cl * lon.cos(), sl, cl * lon.sin())
 }
 
+/// Scalar Hermite smoothstep on `[e0, e1]`.
+#[inline]
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0).max(1e-6)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Fixed-seed noise for the grove mask (built once, lazily).
+fn grove_noise() -> &'static Noise3D {
+    static N: OnceLock<Noise3D> = OnceLock::new();
+    N.get_or_init(|| Noise3D::new(0xF0_4E_57)) // "FOrEST"
+}
+
+/// Forest suitability at unit `dir` ∈ [0, 1] (approach B). Zero off forest
+/// ground; inside it a low-freq grove mask carves blobs + clearings so trees
+/// don't carpet the whole biome. The climate gate mirrors
+/// [`enki_planet::coloring::biome_color`]'s land rules on the SAME inputs
+/// (`height(dir, 0)` for elevation + `climate(dir, h)` for temp/precip), so trees
+/// land on the green, tree-bearing terrain — not desert / tundra / rock / ocean.
+fn forest(hf: &dyn HeightField, dir: DVec3) -> f32 {
+    // Elevation in biome units (level 0 = the rendered grid; see terrain_grid).
+    let h = hf.height(dir, 0);
+    const BEACH: f64 = 0.02; // above the waterline/beach band (biome_color e<0.012)
+    if h <= BEACH {
+        return 0.0; // ocean / shore
+    }
+    if hf.wetness(dir) > 0.5 || hf.lake_mask_at(dir) > 0.5 {
+        return 0.0; // standing in a river / lake
+    }
+    let (temp_c, precip) = hf.climate(dir, h);
+    // Vegetated-forest band: warm enough (tundra→forest by ~8 °C), wet enough
+    // (desert/steppe→forest past ~0.45 precip), below the rock treeline (e~0.5).
+    let warm = smoothstep(2.0, 8.0, temp_c);
+    let wet = smoothstep(0.30, 0.45, precip);
+    let below_treeline = 1.0 - smoothstep(0.40, 0.55, h as f32);
+    let gate = warm * wet * below_treeline;
+    if gate <= 0.0 {
+        return 0.0;
+    }
+    // Grove mask → forest blobs with bald clearings between.
+    let p = dir * GROVE_FREQ;
+    let n = fbm(grove_noise(), p.x, p.y, p.z, 4, 1.0, 2.0, 0.5) as f32;
+    let grove = smoothstep(GROVE_THRESH - GROVE_EDGE, GROVE_THRESH + GROVE_EDGE, n);
+    gate * grove
+}
+
 /// All trees within `RADIUS_M` of `center` (the player's ground position), hashed
-/// deterministically per lat-lon cell. `density` ∈ [0,1] is the fraction of cells
-/// that get a tree. Each origin rides the **rendered** (grid-faceted) terrain via
-/// [`ground_radius`] — the SAME single-source grounding the character's feet use —
-/// so trees sit ON the drawn ground instead of diving into the analytic curve's
-/// sub-cell detail the mesh never draws.
+/// deterministically per lat-lon cell. `density` ∈ [0,1] is the *peak* per-cell
+/// chance; the actual chance is `density * forest(dir)`, so trees only appear on
+/// forest-suitable ground and clump into groves (see [`forest`]) instead of
+/// carpeting the whole surface. Each origin rides the **rendered** (grid-faceted)
+/// terrain via [`ground_radius`] — the SAME single-source grounding the
+/// character's feet use — so trees sit ON the drawn ground instead of diving into
+/// the analytic curve's sub-cell detail the mesh never draws.
 pub fn scatter(
     hf: &dyn HeightField,
     height_scale: f64,
@@ -100,13 +165,21 @@ pub fn scatter(
             continue; // skip the poles (lat-lon degenerates there)
         }
         for lj in (lj0 - w)..=(lj0 + w) {
-            if unit(hash(li, lj, 1)) >= density {
+            // Cheap reject first: `forest` only ever LOWERS the probability below
+            // `density`, so a cell that fails the bare density draw can't survive —
+            // skip the pricier dir + climate + grove eval for it.
+            let u = unit(hash(li, lj, 1));
+            if u >= density {
                 continue;
             }
             // Jitter within the cell (±0.4 cell) so the grid doesn't read as rows.
             let dlat = (unit(hash(li, lj, 2)) - 0.5) as f64 * 0.8 * da;
             let dlon = (unit(hash(li, lj, 3)) - 0.5) as f64 * 0.8 * da;
             let dir = dir_of(lat_c + dlat, lj as f64 * da + dlon);
+            // Forest gate (approach B): only forest ground, clumped into groves.
+            if u >= density * forest(hf, dir) {
+                continue;
+            }
             let r = ground_radius(hf, height_scale, dir);
             let origin = dir * r;
             if (origin - center).length() > RADIUS_M {
@@ -170,11 +243,54 @@ pub fn instance_model(origin: DVec3, yaw: f32, scale: f32, camera_world_pos: DVe
 mod tests {
     use super::*;
 
+    // Low forest land everywhere: h in (BEACH, treeline) + default climate
+    // (15 °C, 0.5 precip) → temperate forest, so only the grove mask gates trees.
     struct FlatHf;
     impl HeightField for FlatHf {
         fn height(&self, _dir: DVec3, _level: u8) -> f64 {
-            100.0
+            0.1
         }
+    }
+
+    /// Constant-climate region for exercising the `forest` biome gate.
+    struct Region {
+        h: f64,
+        temp: f32,
+        precip: f32,
+    }
+    impl HeightField for Region {
+        fn height(&self, _dir: DVec3, _level: u8) -> f64 {
+            self.h
+        }
+        fn climate(&self, _dir: DVec3, _height: f64) -> (f32, f32) {
+            (self.temp, self.precip)
+        }
+    }
+
+    #[test]
+    fn forest_only_on_wet_temperate_land() {
+        let dir = DVec3::new(0.3, 0.55, 0.2).normalize();
+        // Hard-rejected biomes → exactly zero suitability.
+        assert_eq!(forest(&Region { h: -0.1, temp: 15.0, precip: 0.6 }, dir), 0.0, "ocean");
+        assert_eq!(forest(&Region { h: 0.1, temp: 32.0, precip: 0.05 }, dir), 0.0, "desert (dry)");
+        assert_eq!(forest(&Region { h: 0.1, temp: -10.0, precip: 0.6 }, dir), 0.0, "frozen (cold)");
+        assert_eq!(forest(&Region { h: 0.85, temp: 15.0, precip: 0.6 }, dir), 0.0, "above treeline");
+        // Wet temperate land: climate gate is open, so SOME direction lands in a
+        // grove (the mask varies over the sphere) — i.e. forests exist, but not
+        // everywhere (clearings too).
+        let land = Region { h: 0.1, temp: 15.0, precip: 0.6 };
+        let mut in_grove = 0;
+        let mut total = 0;
+        for i in 0..4000 {
+            let a = i as f64 * 0.013;
+            let d = DVec3::new(a.cos(), (a * 0.7).sin() * 0.5, a.sin()).normalize();
+            total += 1;
+            if forest(&land, d) > 0.0 {
+                in_grove += 1;
+            }
+        }
+        assert!(in_grove > 0, "expected forest groves on wet temperate land");
+        assert!(in_grove < total, "expected clearings too (not a full carpet)");
     }
 
     #[test]

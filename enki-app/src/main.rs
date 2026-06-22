@@ -74,7 +74,7 @@ use enki_app::{
     flora_view::{FloraView, LeafMode, TreeSpec},
 };
 use controls::{
-    first_person::MoveInput,
+    tangent::MoveInput,
     globe::GlobeControls,
     nav_mode::{NavMode, NavState},
     third_person::ThirdPersonController,
@@ -98,10 +98,6 @@ use planet_view::{PlanetConfig, PlanetView, PlanetViewStats, planet_view_from_hf
 /// (see `controls::terrain_grid`). Must match the bake's `nanite_resolution`.
 const NANITE_BAKE_RES: u32 = 1024;
 
-/// Character shadow capsule (m): feet→head height and radius. The third-person
-/// character casts this onto the Nanite ground (see `nanite_draw.wgsl`).
-const CHAR_SHADOW_HEIGHT: f32 = 1.8;
-const CHAR_SHADOW_RADIUS: f32 = 0.5;
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
@@ -205,6 +201,9 @@ struct App {
     surface:      Option<ThirdPersonController>,
     /// Ground speed (m/s) the surface walker reported this frame; drives the gait.
     surface_speed: f32,
+    /// This frame's sun direction (body frame, toward the sun) — stashed so the TAA
+    /// resolve's screen-space sun shadow can read it (it's built in the Planet arm).
+    sun_dir_body: glam::Vec3,
     /// Last cursor NDC (x right, y up, -1..1) for Placement ray-cast.
     cursor_ndc:   (f32, f32),
     /// Shared terrain height source (clone of the loader's) so the FPS controller
@@ -330,6 +329,7 @@ impl App {
             globe:         GlobeControls::new(100_000.0),
             surface:       None,
             surface_speed: 0.0,
+            sun_dir_body:  glam::Vec3::Y,
             cursor_ndc:    (0.0, 0.0),
             height_field:  None,
             terrain_height_scale: 0.0,
@@ -1229,7 +1229,7 @@ impl App {
                 atmo_enabled, atmo_params,
                 clouds_enabled, cloud_params,
                 markers_poles, markers_equator, rivers_enabled,
-                None, planet_stats.as_ref(), load_stats.as_ref(),
+                planet_stats.as_ref(), load_stats.as_ref(),
             ))
         } else {
             None
@@ -1320,8 +1320,8 @@ impl App {
         }
 
         // ── 3D rendering ──────────────────────────────────────────────────
-        match self.mode {
-            RenderMode::Planet => {
+        {
+            {
                 // Build frame uniforms with rotation-only camera-relative view,
                 // as documented in FrameUniforms::new. With TAA on, jitter the
                 // projection sub-pixel (terrain + Nanite both read this view-proj).
@@ -1336,6 +1336,7 @@ impl App {
                 let sun_dir_body = spin
                     .mul_vec3(self.system.sun_dir_focused().as_vec3())
                     .normalize_or_zero();
+                self.sun_dir_body = sun_dir_body; // for the TAA-resolve sun shadow
                 let lights = Lights::from_sun(sun_dir_body, self.sky.sun_light_color());
                 let fu     = if taa_on {
                     FrameUniforms::new_jittered(
@@ -1424,19 +1425,11 @@ impl App {
                     // 2. Per-frame uniforms (incl. this frame's active-slot list) + cull.
                     //    FrameUniforms gives the rotation-only camera-relative view-proj
                     //    AND the terrain's lights.
-                    // Character shadow capsule (camera-relative) for the Nanite ground
-                    // to receive — only while a third-person character is shown.
-                    let char_capsule = if nav_mode == NavMode::Surface {
-                        self.surface.as_ref().filter(|t| t.show_character()).map(|tpc| {
-                            let feet = tpc.feet_position();
-                            let up = feet.normalize().as_vec3();
-                            let feet_rel = (feet - camera_world_pos).as_vec3();
-                            let head_rel = feet_rel + up * CHAR_SHADOW_HEIGHT;
-                            (feet_rel.to_array(), head_rel.to_array(), CHAR_SHADOW_RADIUS)
-                        })
-                    } else {
-                        None
-                    };
+                    // Character shadow is now the screen-space sun shadow in the TAA
+                    // resolve (real mesh silhouette + trees + terrain), so the old
+                    // capsule proxy is disabled. ponytail: capsule code in render.rs/
+                    // nanite_draw.wgsl is now dead — remove it once the SS shadow sticks.
+                    let char_capsule = None;
                     if let Some(n) = self.nanite.as_mut() {
                         // Dithered LOD cross-fade is only useful with TAA on (it
                         // resolves the per-frame stipple into a smooth blend).
@@ -1715,62 +1708,6 @@ impl App {
                     }
                 }
             }
-            RenderMode::Markers => {
-                rhi.begin_rendering(fi);
-                if let Some(scene) = self.scene.as_mut() {
-                    let fu = FrameUniforms::new(&camera, aspect, &scene.lights);
-                    if let Err(e) = scene.record_frame(rhi, fi, &fu, &camera, view_mode, wireframe) {
-                        log::error!("record_frame error: {e}");
-                    }
-                }
-            }
-            RenderMode::Stress => {
-                let lights = Lights::demiurge_default();
-                let fu     = FrameUniforms::new(&camera, aspect, &lights);
-                if let Some(harness) = self.stress.as_mut() {
-                    if let Err(e) = harness.upload_phase(rhi, fi) {
-                        log::error!("stress upload_phase error: {e}");
-                    }
-                }
-                rhi.begin_rendering(fi);
-                if let Some(harness) = self.stress.as_mut() {
-                    if let Err(e) = harness.draw_phase(rhi, fi, &fu) {
-                        log::error!("stress draw_phase error: {e}");
-                    }
-                }
-            }
-            RenderMode::SoakTerrain => {
-                // Scripted fly-through: builds LodCamera + FrameUniforms exactly
-                // as Planet mode does, but with a deterministic soak camera position.
-                let lights = Lights::demiurge_default();
-                let fu     = FrameUniforms::new(&camera, aspect, &lights);
-
-                let proj = reversed_z_perspective(
-                    camera.fov_y_radians, aspect, camera.near, camera.far,
-                );
-                let view_world      = camera.view_matrix();
-                let view_proj_local = proj * view_world;
-
-                let lod_cam = LodCamera {
-                    local_pos:       camera.position,
-                    v_fov_rad:       camera.fov_y_radians,
-                    screen_h_px,
-                    view_proj_local,
-                };
-                let camera_world_pos = camera.position;
-
-                if let Some(pv) = self.planet_view.as_mut() {
-                    pv.update(rhi, fi, self.frame_counter, &lod_cam, camera_world_pos);
-                }
-
-                rhi.begin_rendering(fi);
-                rhi.set_viewport_scissor_full(fi);
-                if let Some(pv) = self.planet_view.as_mut() {
-                    if let Err(e) = pv.record(rhi, fi, &fu, camera_world_pos, terrain_view, wireframe) {
-                        log::error!("PlanetView::record error (soak): {e}");
-                    }
-                }
-            }
         }
 
         self.frame_counter = self.frame_counter.wrapping_add(1);
@@ -1778,53 +1715,24 @@ impl App {
         // ── Periodic planet LOD stats log (every ~5 s) ───────────────────
         // Logs resident chunk count and build queue to confirm the planet is
         // initializing in headless test runs.
-        if matches!(self.mode, RenderMode::Planet) {
-            // ~300 frames at 60 fps ≈ 5 s; use wrapping so it fires even on slow hw.
-            if self.frame_counter % 300 == 1 {
-                if let Some(pv) = self.planet_view.as_ref() {
-                    let s = pv.stats();
-                    log::info!(
-                        "[planet] frame={} resident_chunks={} build_queue={} lod_levels={}-{}",
-                        self.frame_counter, s.resident_count, s.build_queue_depth,
-                        s.min_lod_level, s.max_lod_level,
-                    );
-                }
-                #[cfg(feature = "nanite")]
-                if self.nanite_enabled {
-                    if let Some(n) = self.nanite.as_ref() {
-                        log::info!(
-                            "[nanite] enabled — visible clusters (prev frame): {}",
-                            n.last_visible_clusters()
-                        );
-                    }
-                }
+        // ~300 frames at 60 fps ≈ 5 s; use wrapping so it fires even on slow hw.
+        if self.frame_counter % 300 == 1 {
+            if let Some(pv) = self.planet_view.as_ref() {
+                let s = pv.stats();
+                log::info!(
+                    "[planet] frame={} resident_chunks={} build_queue={} lod_levels={}-{}",
+                    self.frame_counter, s.resident_count, s.build_queue_depth,
+                    s.min_lod_level, s.max_lod_level,
+                );
             }
-        }
-
-        // ── Periodic soak stats log (every ~5 s, time-based) ─────────────
-        if matches!(self.mode, RenderMode::SoakTerrain) {
-            const SOAK_LOG_INTERVAL_S: f64 = 5.0;
-            if self.soak_elapsed - self.soak_last_log_elapsed >= SOAK_LOG_INTERVAL_S {
-                let wall_elapsed = self.soak_start.elapsed().as_secs_f64();
-                let dt_since_log = (self.soak_elapsed - self.soak_last_log_elapsed).max(1e-6);
-                let fps = self.soak_frames_since_log as f64 / dt_since_log;
-                let graveyard_size = rhi.streaming_graveyard_size();
-
-                if let Some(pv) = self.planet_view.as_ref() {
-                    let s = pv.stats();
+            #[cfg(feature = "nanite")]
+            if self.nanite_enabled {
+                if let Some(n) = self.nanite.as_ref() {
                     log::info!(
-                        "[soak] elapsed={:.1}s wall={:.1}s frame={} fps={:.1} \
-                         resident_chunks={} build_queue={} pending_upload={} \
-                         lod_levels={}-{} graveyard={}",
-                        self.soak_elapsed, wall_elapsed, self.frame_counter, fps,
-                        s.resident_count, s.build_queue_depth, s.pending_upload_count,
-                        s.min_lod_level, s.max_lod_level,
-                        graveyard_size,
+                        "[nanite] enabled — visible clusters (prev frame): {}",
+                        n.last_visible_clusters()
                     );
                 }
-
-                self.soak_last_log_elapsed = self.soak_elapsed;
-                self.soak_frames_since_log = 0;
             }
         }
 
@@ -1843,6 +1751,8 @@ impl App {
                 aspect * screen_h_px,
                 screen_h_px,
                 enki_render::taa::DEFAULT_HISTORY_BLEND,
+                self.sun_dir_body,
+                1.0, // screen-space sun-shadow strength (0 = off)
             );
             if let Err(e) = rhi.taa_resolve(fi, params.as_bytes()) {
                 log::error!("taa_resolve error: {e}");
@@ -1881,31 +1791,10 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     log::info!("enki starting");
 
-    let args: Vec<String> = std::env::args().collect();
-    let stress_flag  = args.iter().any(|a| a == "--stress-streaming")
-        || std::env::var("ENKI_STRESS_STREAMING").ok().as_deref() == Some("1");
-    let markers_flag = args.iter().any(|a| a == "--markers");
-    let soak_flag    = args.iter().any(|a| a == "--soak-terrain")
-        || std::env::var("ENKI_SOAK_TERRAIN").ok().as_deref() == Some("1");
-
-    let mode = if soak_flag {
-        log::info!("Mode: soak-terrain (scripted fly-through, deterministic camera)");
-        RenderMode::SoakTerrain
-    } else if stress_flag {
-        log::info!("Mode: stress-streaming");
-        RenderMode::Stress
-    } else if markers_flag {
-        log::info!("Mode: markers (depth-proof scene)");
-        RenderMode::Markers
-    } else {
-        log::info!("Mode: planet (default)");
-        RenderMode::Planet
-    };
-
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new(mode);
+    let mut app = App::new();
     if let Err(e) = event_loop.run_app(&mut app) {
         log::error!("Event loop exited with error: {e}");
         std::process::exit(1);

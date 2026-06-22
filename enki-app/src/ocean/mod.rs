@@ -25,13 +25,15 @@ use std::time::Instant;
 use bytemuck::{cast_slice, Pod, Zeroable};
 use enki_planet::height::HeightField;
 use enki_render::{
-    camera::Camera, frame::FrameUniforms, geometry::placeholder_sphere, material::ChunkPush,
+    camera::Camera, frame::FrameUniforms, geometry::sphere_inward, material::ChunkPush,
     water_pass::{OCEAN_SURFACE_WGSL, WATER_WGSL},
 };
 use enki_rhi::{
     vk, BindingDesc, BufferHandle, GraphicsPipelineDesc, PipelineHandle, Rhi, RhiError,
 };
 use glam::{DVec3, Mat4, Vec3};
+
+use crate::markers::overlay_pipeline;
 
 use sim::{OceanSim, OceanTexel, WaveParams};
 use spectrum::{CascadeParams, Spectrum};
@@ -60,34 +62,23 @@ impl Ocean {
         samples:      vk::SampleCountFlags,
         base_radius:  f64,
     ) -> Result<Self, RhiError> {
-        let shader = rhi.create_shader_module(WATER_WGSL)?;
-        let pipeline = rhi.create_graphics_pipeline(&GraphicsPipelineDesc {
-            shader,
-            vs_entry:           "vs_main",
-            fs_entry:           "fs_main",
-            push_constant_size: std::mem::size_of::<ChunkPush>() as u32,
-            set0_layout:        rhi.set0_layout(),
+        let pipeline = overlay_pipeline(
+            rhi,
+            WATER_WGSL,
             color_format,
-            depth_format:       vk::Format::D32_SFLOAT,
+            std::mem::size_of::<ChunkPush>() as u32,
+            true, // alpha-blend, depth-write OFF
             samples,
-            blend:              true, // alpha-blend, depth-write OFF
-            fill:               true,
-        })?;
-        rhi.destroy_shader_module(shader);
+        )?;
 
-        let mesh = placeholder_sphere(base_radius as f32, 128);
+        // Inward-wound sphere so cull-BACK keeps the near (camera-facing) hemisphere.
+        let mesh = sphere_inward(base_radius as f32, 128);
         let white = vec![[1.0f32, 1.0, 1.0]; mesh.positions.len()];
-        // `placeholder_sphere` winds CW-from-outside; reverse so cull-BACK keeps
-        // the near (camera-facing) hemisphere.
-        let mut indices = mesh.indices.clone();
-        for tri in indices.chunks_exact_mut(3) {
-            tri.swap(0, 2);
-        }
         let pos   = rhi.create_vertex_buffer(cast_slice(&mesh.positions))?;
         let nrm   = rhi.create_vertex_buffer(cast_slice(&mesh.normals))?;
         let col   = rhi.create_vertex_buffer(cast_slice(&white))?;
         let plate = rhi.create_vertex_buffer(cast_slice(&white))?;
-        let idx   = rhi.create_index_buffer(&indices)?;
+        let idx   = rhi.create_index_buffer(&mesh.indices)?;
 
         Ok(Self { pipeline, pos, nrm, col, plate, idx, count: mesh.indices.len() as u32, base_radius })
     }

@@ -59,7 +59,7 @@ fn halton(mut index: u32, base: u32) -> f32 {
 }
 
 /// Std140 uniform block consumed by the resolve shader (matches the WGSL
-/// `ResolveParams` struct). 2 × mat4 + 2 × vec4 = 160 bytes.
+/// `ResolveParams` struct). 3 × mat4 + 3 × vec4 = 240 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ResolveParams {
@@ -67,10 +67,16 @@ pub struct ResolveParams {
     pub cur_inv_view_proj: [[f32; 4]; 4],
     /// **Previous** frame's un-jittered view-proj (world → prev clip).
     pub prev_view_proj: [[f32; 4]; 4],
+    /// **Current** un-jittered view-proj (world → clip). Used by the screen-space
+    /// sun-shadow march to project marched points back to screen.
+    pub cur_view_proj: [[f32; 4]; 4],
     /// `(1/width, 1/height, width, height)`.
     pub texel: [f32; 4],
     /// `(history_blend_alpha, history_valid 0|1, _, _)`.
     pub misc: [f32; 4],
+    /// Screen-space sun shadow: `xyz` = sun direction (camera-relative/body frame,
+    /// toward the sun), `w` = shadow strength (0 = disabled).
+    pub sun: [f32; 4],
 }
 
 // SAFETY: plain old data, no padding (all fields 16-byte aligned).
@@ -171,12 +177,22 @@ impl TaaJitter {
     /// camera, so the previous view-proj is pre-multiplied by a translation of the
     /// camera delta `(cur_cam - prev_cam)`: `prev' = prev_vp · T(cur_cam-prev_cam)`.
     /// Without this the motion vectors would be wrong whenever the camera moves.
-    pub fn resolve_params(&self, width: f32, height: f32, alpha: f32) -> ResolveParams {
+    /// `sun_dir` is the (camera-relative/body-frame) direction toward the sun and
+    /// `shadow_strength` ∈ [0,1] the screen-space sun-shadow darkening (0 = off).
+    pub fn resolve_params(
+        &self,
+        width: f32,
+        height: f32,
+        alpha: f32,
+        sun_dir: glam::Vec3,
+        shadow_strength: f32,
+    ) -> ResolveParams {
         let delta = (self.cur_cam - self.prev_cam).as_vec3();
         let prev_vp = self.prev_view_proj * Mat4::from_translation(delta);
         ResolveParams {
             cur_inv_view_proj: self.cur_view_proj.inverse().to_cols_array_2d(),
             prev_view_proj: prev_vp.to_cols_array_2d(),
+            cur_view_proj: self.cur_view_proj.to_cols_array_2d(),
             texel: [1.0 / width.max(1.0), 1.0 / height.max(1.0), width, height],
             misc: [
                 alpha,
@@ -184,6 +200,7 @@ impl TaaJitter {
                 0.0,
                 0.0,
             ],
+            sun: [sun_dir.x, sun_dir.y, sun_dir.z, shadow_strength],
         }
     }
 }
@@ -230,11 +247,11 @@ mod tests {
     fn history_starts_invalid_then_valid() {
         let mut t = TaaJitter::new();
         assert!(!t.has_history());
-        let p = t.resolve_params(1920.0, 1080.0, 0.9);
+        let p = t.resolve_params(1920.0, 1080.0, 0.9, glam::Vec3::Y, 0.0);
         assert_eq!(p.misc[1], 0.0, "history must be invalid on the first frame");
         t.advance(Mat4::IDENTITY, DVec3::ZERO);
         assert!(t.has_history());
-        let p2 = t.resolve_params(1920.0, 1080.0, 0.9);
+        let p2 = t.resolve_params(1920.0, 1080.0, 0.9, glam::Vec3::Y, 0.0);
         assert_eq!(p2.misc[1], 1.0);
     }
 

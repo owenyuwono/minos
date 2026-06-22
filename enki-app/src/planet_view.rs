@@ -44,7 +44,7 @@ use std::sync::Arc;
 use glam::{DVec3, Mat4};
 use lru::LruCache;
 
-use enki_jobs::job::{ChunkBuildTemplate, MeshRequest};
+use enki_jobs::job::ChunkBuildTemplate;
 use enki_jobs::pool::WorkerPool;
 use enki_planet::height::HeightField;
 use enki_planet::lod::{LodCamera, LodConfig, LodTree};
@@ -165,7 +165,8 @@ pub struct PlanetConfig {
 /// (GPU-uploaded) chunk map.  Each frame the caller drives it with
 /// `update` (streaming decisions) then `record` (draw commands).
 ///
-/// The type parameter `U` allows tests to inject a fake uploader without a GPU.
+/// The streaming upload/retire goes through `RhiUploader`; the `ChunkUploader`
+/// trait lets the headless tests drive the same logic via a `FakeUploader`.
 ///
 /// # LRU capacity guideline
 ///
@@ -176,13 +177,13 @@ pub struct PlanetConfig {
 /// 1024 provides ~3× headroom for the typical orbit scenario (~348 resident).
 /// Pass values below 512 at your own risk — a `log::warn!` is emitted at
 /// construction time to make the misconfiguration visible.
-pub struct PlanetView<U: ChunkUploader> {
+pub struct PlanetView {
     tree: LodTree,
     pool: WorkerPool,
     /// CPU-side LRU: built but not yet GPU-resident meshes.
     cache: LruCache<ChunkKey, enki_planet::ChunkMeshArrays>,
     /// GPU-resident, drawable chunks.
-    resident: HashMap<ChunkKey, ResidentChunk<U::Handle>>,
+    resident: HashMap<ChunkKey, ResidentChunk<StreamedMesh>>,
     /// Keys to retry for upload (back-pressure queue).
     pending_upload: VecDeque<ChunkKey>,
     cfg: PlanetConfig,
@@ -204,7 +205,7 @@ pub struct PlanetViewStats {
     pub pending_upload_count: usize,
 }
 
-impl<U: ChunkUploader> PlanetView<U> {
+impl PlanetView {
     /// Return a lightweight snapshot of LOD statistics for the current frame.
     ///
     /// Cheap: iterates resident keys (typically < 1000) with no allocation.
@@ -234,115 +235,6 @@ impl<U: ChunkUploader> PlanetView<U> {
             min_lod_level,
             max_lod_level,
             pending_upload_count: self.pending_upload.len(),
-        }
-    }
-
-    /// Per-frame update: drain workers, run LOD, upload/retire GPU meshes.
-    ///
-    /// This is the generic version used for testing with a `FakeUploader`.
-    /// In production, use `PlanetView<RhiUploaderDummy>::update` which wraps this.
-    ///
-    /// Must be called **before** `rhi.begin_rendering(fi)` because streaming
-    /// uploads (`vkCmdCopyBuffer`) are illegal inside a dynamic-rendering instance.
-    ///
-    /// # Parameters
-    /// - `uploader`         — abstracted GPU upload/retire interface.
-    /// - `fi`               — frame-in-flight slot index.
-    /// - `frame_counter`    — monotonic frame counter (unused here; passed through for future use).
-    /// - `cam_local`        — camera state in planet-local space.
-    /// - `camera_world_pos` — world-space f64 camera position (logged only; used in `record`).
-    #[allow(dead_code)]
-    pub fn update_with_uploader(
-        &mut self,
-        uploader: &mut U,
-        fi: u32,
-        _frame_counter: u64,
-        cam_local: &LodCamera,
-        _camera_world_pos: DVec3,
-    ) {
-        // ── Step 1: drain worker pool into the LRU cache ───────────────────
-        for result in self.pool.drain() {
-            let key = result.key;
-            self.safe_cache_put(key, result.arrays);
-        }
-
-        // ── Step 2: LOD update ─────────────────────────────────────────────
-        let sel = {
-            let resident = &self.resident;
-            let cache    = &self.cache;
-            self.tree.update(
-                cam_local,
-                &|k| cache.contains(&k) || resident.contains_key(&k),
-                &|k| resident.contains_key(&k),
-            )
-        };
-
-        // ── Step 3: submit / cancel build jobs ─────────────────────────────
-        for (key, priority) in &sel.builds {
-            self.pool.submit(MeshRequest { key: *key, priority: *priority });
-        }
-        for key in &sel.cancels {
-            self.pool.cancel(*key);
-        }
-
-        // ── Step 4: upload meshes ──────────────────────────────────────────
-        // Process pending_upload (back-pressure retries) first, then sel.show.
-        // This ensures chunks that failed last frame get priority over new ones.
-        let mut to_upload: Vec<ChunkKey> = Vec::new();
-
-        let pending: Vec<ChunkKey> = self.pending_upload.drain(..).collect();
-        to_upload.extend(pending);
-        for key in &sel.show {
-            if !self.resident.contains_key(key) && !to_upload.contains(key) {
-                to_upload.push(*key);
-            }
-        }
-
-        for key in to_upload {
-            // Skip already-resident (no double-upload).
-            if self.resident.contains_key(&key) {
-                continue;
-            }
-
-            // Skip if not in cache yet (build still in flight).
-            if !self.cache.contains(&key) {
-                continue;
-            }
-
-            let upload_result = {
-                let arrays = self.cache.peek(&key).unwrap();
-                uploader.upload(fi, arrays)
-            };
-
-            match upload_result {
-                Ok(Some(handle)) => {
-                    // Success: promote to resident.  Keep cache entry (resident is
-                    // the source of truth; cache holds the CPU copy).
-                    // Use peek so promoting to resident does not disturb LRU order.
-                    let origin = self.cache.peek(&key).unwrap().origin;
-                    self.resident.insert(key, ResidentChunk { handle, origin });
-                }
-                Ok(None) => {
-                    // Back-pressure: re-queue for next frame; do NOT drop from cache.
-                    self.pending_upload.push_back(key);
-                }
-                Err(e) => {
-                    // Fatal upload error: log and discard so we don't spin forever.
-                    log::error!("PlanetView: streaming_upload failed for {:?}: {e}", key);
-                }
-            }
-        }
-
-        // ── Step 5: retire hidden meshes ───────────────────────────────────
-        for key in &sel.hide {
-            if let Some(rc) = self.resident.remove(key) {
-                uploader.retire(rc.handle);
-            }
-            // W1: if the key is still pending upload (back-pressured, not yet
-            // resident), sweep it from pending_upload so we don't upload a
-            // chunk the LOD no longer wants.  Leave the cache copy — the LRU
-            // will reclaim it naturally.
-            self.pending_upload.retain(|k| k != key);
         }
     }
 
@@ -390,22 +282,6 @@ impl<U: ChunkUploader> PlanetView<U> {
 
 // ── Production constructor (requires Rhi) ─────────────────────────────────────
 
-/// Dummy type used only to name the GPU variant of `PlanetView`.
-/// The real uploader is provided each frame via `update(&mut RhiUploader<'_>, ...)`.
-pub enum RhiUploaderDummy {}
-
-impl ChunkUploader for RhiUploaderDummy {
-    type Handle = StreamedMesh;
-
-    fn upload(&mut self, _fi: u32, _arrays: &enki_planet::ChunkMeshArrays) -> Result<Option<StreamedMesh>, RhiError> {
-        unreachable!("RhiUploaderDummy is never constructed")
-    }
-
-    fn retire(&mut self, _handle: StreamedMesh) {
-        unreachable!()
-    }
-}
-
 /// Build the GPU-path `PlanetView` from a PRE-BUILT height field.
 ///
 /// Skips the (expensive) height-field construction — the async loader builds the
@@ -415,14 +291,7 @@ impl ChunkUploader for RhiUploaderDummy {
 pub fn planet_view_from_hf(
     cfg: PlanetConfig,
     hf: Arc<dyn HeightField>,
-) -> PlanetView<RhiUploaderDummy> {
-    build_planet_view_from_hf(cfg, hf)
-}
-
-fn build_planet_view_from_hf<U: ChunkUploader>(
-    cfg: PlanetConfig,
-    hf: Arc<dyn HeightField>,
-) -> PlanetView<U> {
+) -> PlanetView {
     let template = ChunkBuildTemplate {
         resolution:   cfg.lod.resolution,
         radius:       cfg.lod.radius,
@@ -476,7 +345,7 @@ fn build_planet_view_from_hf<U: ChunkUploader>(
 
 // ── GPU-path update + record ──────────────────────────────────────────────────
 
-impl PlanetView<RhiUploaderDummy> {
+impl PlanetView {
     /// Per-frame update for the real GPU path.
     ///
     /// Constructs a transient `RhiUploader` from `rhi` + `fi` and drives the

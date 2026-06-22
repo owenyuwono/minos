@@ -82,5 +82,3 @@ mod tests {
         assert!(result.dot(up).abs() < 1e-5);
     }
 }
-</content>
-</invoke>

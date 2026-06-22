@@ -359,14 +359,7 @@ impl TectonicHeightField {
                 ocean_coverage: DEFAULT_OCEAN_COVERAGE,
                 tectonics: Some(tectonics.as_ref()),
                 res: None,
-                k0: None,
-                m_exp: None,
-                n_exp: None,
-                talus: None,
-                kw_min: None,
-                deposition_g: None,
                 b_steps: None,
-                b_uplift_rate: None,
             })
         };
 

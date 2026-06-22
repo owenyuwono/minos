@@ -10,7 +10,7 @@
 // (gui.rs new/on_window_event/render are copy-identical; only build_frame is
 // flora-specific): gene sliders grouped by tier, climate sliders, presets,
 // generate/reseed, and stats. Editing any gene/env LIVE-REBUILDS the tree via
-// FloraView::from_genome — the core dryad CAS loop.
+// FloraView::from_genome_with_mode_tuned — the core dryad CAS loop.
 //
 // Run:  cargo run -p enki-app --bin flora_viewer --features flora
 //
@@ -477,15 +477,6 @@ impl FloraGui {
 
     fn on_window_event(&mut self, window: &Window, event: &WindowEvent) -> bool {
         self.winit.on_window_event(window, event).consumed
-    }
-
-    fn wants_keyboard(&self) -> bool {
-        self.ctx.wants_keyboard_input()
-    }
-
-    /// True when the pointer is over an egui panel (so nav must not steal it).
-    fn wants_pointer(&self) -> bool {
-        self.ctx.wants_pointer_input() || self.ctx.is_pointer_over_area()
     }
 
     /// Build the flora CAS panel. Binds sliders to the live `genome`/`env`, so
@@ -955,19 +946,6 @@ impl FloraGui {
                                 ui.label(egui::RichText::new("(no tree)").color(dim));
                             }
 
-                            // (4) LEAF SHAPE — the silhouette = the sprite ALPHA. We
-                            // show the same COLOR image again labeled as the shape
-                            // (its cutout IS the silhouette); a checker behind would
-                            // need an extra blit — skipped (ponytail shortcut).
-                            ui.add_space(4.0);
-                            ui.label(egui::RichText::new("LEAF SHAPE (alpha)").color(heading));
-                            ui.label(
-                                egui::RichText::new(
-                                    "silhouette = the sprite's alpha cutout above",
-                                )
-                                .color(dim),
-                            );
-
                             // LEAF NORMAL map.
                             ui.add_space(4.0);
                             ui.label(egui::RichText::new("LEAF NORMAL").color(heading));
@@ -1375,10 +1353,9 @@ struct App {
     flora_nanite: Option<FloraNanite>,
     staging: Option<Staging>,
     egui: Option<FloraGui>,
-    fit: Fit,
     /// Interactive orbit/zoom/pan camera (replaces the auto-spin). Re-framed from
-    /// `fit` on every build/reseed. The screenshot path uses `fit` directly so
-    /// captures keep the deterministic auto-fit framing.
+    /// the auto-fit AABB on every build/reseed; the screenshot path drives this
+    /// directly so captures keep the deterministic auto-fit framing.
     orbit: OrbitCamera,
     /// Mouse drag state for the orbit controller. `last_cursor` is the previous
     /// CursorMoved position (for deltas); the button flags select orbit vs pan.
@@ -1458,11 +1435,6 @@ struct App {
     /// each rendered frame so we know when the scene has settled (camera at initial
     /// framing, pipelines/swapchain warm).
     screenshot: Option<String>,
-    /// ponytail: when `FLORA_SCREENSHOT_UI=1` is set ALONGSIDE `FLORA_SCREENSHOT`,
-    /// RENDER the egui panels into the captured frame (so the GUI layout shows up
-    /// in the PNG). Normal `FLORA_SCREENSHOT` without `_UI` still hides the panel
-    /// for a clean render.
-    screenshot_ui: bool,
     frame_count: u32,
     /// Set once the screenshot PNG has been written → `about_to_wait` shuts down
     /// and exits the event loop (exit 0).
@@ -1499,10 +1471,6 @@ impl App {
         let screenshot = std::env::var("FLORA_SCREENSHOT")
             .ok()
             .filter(|p| !p.trim().is_empty());
-        let screenshot_ui = std::env::var("FLORA_SCREENSHOT_UI")
-            .ok()
-            .map(|v| v.trim() == "1")
-            .unwrap_or(false);
         // ponytail: FLORA_VIEW (or its legacy alias FLORA_MODE) picks the INITIAL
         // render mode by name (case-insensitive) so a headless capture can target
         // any view, incl. the Nanite Triangle/Cluster/LOD debug views, without
@@ -1523,6 +1491,8 @@ impl App {
             Some(s) if s.eq_ignore_ascii_case("lod") => RenderMode::Lod,
             _ => RenderMode::Lit,
         };
+        // FLORA_WIND override (parsed once) seeds the initial wind strength/dir/clock.
+        let wo = wind_override();
         App {
             window: None,
             rhi: None,
@@ -1532,7 +1502,6 @@ impl App {
             flora_nanite: None,
             staging: None,
             egui: None,
-            fit: Fit { center: Vec3::ZERO, distance: 30.0 },
             // Real framing is set by the first build_tree(); this is a placeholder.
             orbit: OrbitCamera {
                 target: Vec3::ZERO,
@@ -1569,11 +1538,11 @@ impl App {
             // Wind ON by default at a gentle strength (strength 0 = exact static).
             // FLORA_WIND=strength,dirx,dirz[,time] overrides for headless capture.
             wind_on: true,
-            wind_strength: wind_override().map(|w| w.0).unwrap_or(0.6),
-            wind_dir: wind_override()
+            wind_strength: wo.map(|w| w.0).unwrap_or(0.6),
+            wind_dir: wo
                 .map(|w| Vec3::new(w.1, 0.0, w.2))
                 .unwrap_or(Vec3::new(1.0, 0.0, 0.0)),
-            wind_clock: wind_override().map(|w| w.3).unwrap_or(0.0),
+            wind_clock: wo.map(|w| w.3).unwrap_or(0.0),
             // Wind-direction gizmo ON by default (per the brief) so the set wind
             // direction is always visible; the FLORA_WIND capture shows it too.
             gizmo_on: true,
@@ -1591,7 +1560,6 @@ impl App {
                 .map(|v| v != "0")
                 .unwrap_or(true),
             screenshot,
-            screenshot_ui,
             frame_count: 0,
             screenshot_done: false,
         }
@@ -1633,11 +1601,11 @@ impl App {
                 }
                 let fov_y = 60_f32.to_radians();
                 let (min, max) = f.local_bounds();
-                self.fit = Fit::from_bounds(min, max, fov_y);
+                let fit = Fit::from_bounds(min, max, fov_y);
                 // Re-frame the orbit camera on each build/reseed (simplest: reset
                 // to the auto-fit pose). An optional FLORA_CAM=yaw,pitch,dist (degs
                 // + world units) overrides the starting pose for headless capture.
-                self.orbit = OrbitCamera::from_fit(self.fit);
+                self.orbit = OrbitCamera::from_fit(fit);
                 if let Some((yaw, pitch, dist)) = cam_override() {
                     self.orbit.yaw = yaw.to_radians();
                     self.orbit.pitch = (pitch.to_radians()).clamp(-PITCH_LIMIT, PITCH_LIMIT);
@@ -1692,10 +1660,10 @@ impl App {
                 self.flora = Some(f);
                 log::info!(
                     "Tree seed {} — fit center {:?} dist {:.1}m",
-                    self.seed, self.fit.center, self.fit.distance
+                    self.seed, fit.center, fit.distance
                 );
             }
-            Err(e) => log::error!("FloraView::from_genome failed: {e}"),
+            Err(e) => log::error!("FloraView::from_genome_with_mode_tuned failed: {e}"),
         }
     }
 
@@ -1895,9 +1863,8 @@ impl App {
         //    a submit; must be outside the rendering instance). Split-borrow
         //    egui/window/rhi/genome/env — all disjoint App fields. ──
         // ponytail: in screenshot mode SKIP the panel so the captured PNG is a
-        // clean render (no UI chrome) — UNLESS FLORA_SCREENSHOT_UI=1, which builds
-        // the panels so the GUI layout shows up in the PNG for inspection.
-        let build_panel = self.screenshot.is_none() || self.screenshot_ui;
+        // clean render (no UI chrome).
+        let build_panel = self.screenshot.is_none();
         let mut panel = PanelOut::default();
         if build_panel {
         if let (Some(egui), Some(window), Some(rhi)) =
@@ -2221,28 +2188,14 @@ impl App {
         self.frame_count = self.frame_count.wrapping_add(1);
         let do_capture = self.screenshot.is_some() && self.frame_count == SCREENSHOT_WARMUP_FRAMES;
         if do_capture {
-            if self.screenshot_ui {
-                // FLORA_SCREENSHOT_UI: draw the egui panels INTO the captured frame
-                // so the GUI layout is inspectable in the PNG. Open the capture
-                // pass, draw the composite, draw egui on top, then close + copy.
-                // (Consumes egui's tessellated output, so the swapchain UI pass
-                // below no-ops — fine: this is a one-shot headless capture+exit.)
-                if let Some(renderer) = self.flora_renderer.as_mut() {
-                    if let Err(e) = renderer.begin_capture(rhi, fi) {
-                        log::error!("flora begin_capture error: {e}");
-                    }
+            // Open the capture pass (draws the fs_output composite into it), then
+            // close + copy the captured frame into the host-visible readback buffer.
+            if let Some(renderer) = self.flora_renderer.as_mut() {
+                if let Err(e) = renderer.begin_capture(rhi, fi) {
+                    log::error!("flora begin_capture error: {e}");
                 }
-                if let Some(egui) = self.egui.as_mut() {
-                    egui.render(rhi, fi);
-                }
-                if let Some(renderer) = self.flora_renderer.as_mut() {
-                    if let Err(e) = renderer.end_capture(rhi, fi) {
-                        log::error!("flora end_capture error: {e}");
-                    }
-                }
-            } else if let Some(renderer) = self.flora_renderer.as_mut() {
-                if let Err(e) = renderer.record_capture(rhi, fi) {
-                    log::error!("flora record_capture error: {e}");
+                if let Err(e) = renderer.end_capture(rhi, fi) {
+                    log::error!("flora end_capture error: {e}");
                 }
             }
         }
@@ -2258,8 +2211,6 @@ impl App {
         // Close the MSAA 3D instance, open the 1-sample UI pass, record egui.
         // ponytail: skip egui in clean screenshot mode (no UI chrome in the PNG);
         // the panel was never built this frame, so render() would no-op anyway.
-        // In FLORA_SCREENSHOT_UI mode the panel WAS built but its output was
-        // already consumed by the capture pass above, so this render() no-ops too.
         rhi.begin_ui_pass(fi);
         if self.screenshot.is_none() {
             if let Some(egui) = self.egui.as_mut() {
@@ -2374,10 +2325,18 @@ impl ApplicationHandler for App {
             (Some(eg), Some(w)) => eg.on_window_event(w, &event),
             _ => false,
         };
-        let wants_kb = self.egui.as_ref().map(|e| e.wants_keyboard()).unwrap_or(false);
+        let wants_kb = self
+            .egui
+            .as_ref()
+            .map(|e| e.ctx.wants_keyboard_input())
+            .unwrap_or(false);
         // egui pointer gate for nav: true when the cursor is over a panel. Used
         // for the orbit mouse arms so dragging on a panel never moves the camera.
-        let wants_ptr = self.egui.as_ref().map(|e| e.wants_pointer()).unwrap_or(false);
+        let wants_ptr = self
+            .egui
+            .as_ref()
+            .map(|e| e.ctx.wants_pointer_input() || e.ctx.is_pointer_over_area())
+            .unwrap_or(false);
 
         match event {
             WindowEvent::CloseRequested => {

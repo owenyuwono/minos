@@ -74,7 +74,7 @@ fn mix3(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
     [mix(a[0], b[0], t), mix(a[1], b[1], t), mix(a[2], b[2], t)]
 }
 fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
-    let t = clamp((x - e0) / (e1 - e0).max(1e-9), 0.0, 1.0);
+    let t = f32::clamp((x - e0) / (e1 - e0).max(1e-9), 0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 fn fract(x: f32) -> f32 {
@@ -87,7 +87,7 @@ fn hsl2rgb(h: f32, s: f32, l: f32) -> [f32; 3] {
         // mod6 of (h*6 + k), then |.-3| - 1, clamped 0..1
         let v = h * 6.0 + k;
         let m6 = v - 6.0 * (v / 6.0).floor();
-        clamp((m6 - 3.0).abs() - 1.0, 0.0, 1.0)
+        f32::clamp((m6 - 3.0).abs() - 1.0, 0.0, 1.0)
     };
     let r = m(0.0);
     let g = m(4.0);
@@ -165,7 +165,7 @@ fn ridged_fbm(pw: [f32; 3], freq_in: f32, fw: f32) -> f32 {
         freq *= 2.13;
         amp *= 0.52;
     }
-    let h = clamp(total / norm.max(1e-9), 0.0, 1.0);
+    let h = f32::clamp(total / norm.max(1e-9), 0.0, 1.0);
     h.powf(0.65)
 }
 
@@ -178,7 +178,7 @@ fn bark_height_field(p_grain: [f32; 3], feature_scale: f32, fw: f32, bark_scale:
     let fine = ridged_fbm(pw, base_freq, fw);
     let mut combined = mix(fine, coarse, BARK_FISSURE_WEIGHT);
     combined *= 0.4 + 0.6 * coarse;
-    clamp(combined, 0.0, 1.0)
+    f32::clamp(combined, 0.0, 1.0)
 }
 
 fn bark_aniso_gain(orient: f32) -> f32 {
@@ -238,23 +238,23 @@ fn bark_albedo(p_grain: [f32; 3], h: f32, world_y: f32, g: &BarkGenes) -> [f32; 
     let b_s = g.hue * 0.55;
     let b_h = mix(0.09, 0.02, g.hue);
 
-    let palette_ridge = hsl2rgb(b_h, b_s, clamp(b_l + 0.07, 0.0, 1.0));
-    let palette_furrow = hsl2rgb(b_h, b_s * 1.15, clamp(b_l - 0.20, 0.0, 1.0));
-    let palette_lichen = hsl2rgb(0.26, 0.28, clamp(0.32 + b_l * 0.18, 0.0, 1.0));
-    let blotch_warm = hsl2rgb(clamp(b_h - 0.015, 0.0, 1.0), b_s, clamp(b_l - 0.05, 0.0, 1.0));
-    let blotch_cool = hsl2rgb(clamp(b_h + 0.05, 0.0, 1.0), b_s * 0.7, clamp(b_l - 0.07, 0.0, 1.0));
+    let palette_ridge = hsl2rgb(b_h, b_s, f32::clamp(b_l + 0.07, 0.0, 1.0));
+    let palette_furrow = hsl2rgb(b_h, b_s * 1.15, f32::clamp(b_l - 0.20, 0.0, 1.0));
+    let palette_lichen = hsl2rgb(0.26, 0.28, f32::clamp(0.32 + b_l * 0.18, 0.0, 1.0));
+    let blotch_warm = hsl2rgb(f32::clamp(b_h - 0.015, 0.0, 1.0), b_s, f32::clamp(b_l - 0.05, 0.0, 1.0));
+    let blotch_cool = hsl2rgb(f32::clamp(b_h + 0.05, 0.0, 1.0), b_s * 0.7, f32::clamp(b_l - 0.07, 0.0, 1.0));
 
     let base_sat = b_s * 0.58;
     let base_hue = mix(b_h, 0.065, 0.35);
     let mut base = hsl2rgb(base_hue, base_sat, b_l);
 
-    let furrow_t = clamp((0.45 - h) * 2.0, 0.0, 1.0);
-    let furrow_col = hsl2rgb(clamp(b_h - 0.005, 0.0, 1.0), b_s * 0.72, clamp(b_l - 0.20, 0.0, 1.0));
+    let furrow_t = f32::clamp((0.45 - h) * 2.0, 0.0, 1.0);
+    let furrow_col = hsl2rgb(f32::clamp(b_h - 0.005, 0.0, 1.0), b_s * 0.72, f32::clamp(b_l - 0.20, 0.0, 1.0));
     base = mix3(base, furrow_col, furrow_t * 0.55);
 
-    let lichen_crevice = clamp((0.22 - h) * 6.0, 0.0, 1.0);
-    let lichen_base = clamp(1.0 - world_y * 0.55, 0.0, 1.0);
-    let lichen_spatter = clamp(
+    let lichen_crevice = f32::clamp((0.22 - h) * 6.0, 0.0, 1.0);
+    let lichen_base = f32::clamp(1.0 - world_y * 0.55, 0.0, 1.0);
+    let lichen_spatter = f32::clamp(
         bark_noise([p_grain[0] * 3.7 + 7.3, p_grain[1] * 3.7 + 2.9, p_grain[2] * 3.7 + 5.1]) * 0.5
             + 0.5,
         0.0,
@@ -271,21 +271,21 @@ fn bark_albedo(p_grain: [f32; 3], h: f32, world_y: f32, g: &BarkGenes) -> [f32; 
         bark_noise([p_grain[0] * 0.22 + 9.2, p_grain[1] * 0.22 + 0.8, p_grain[2] * 0.22 + 6.4]) * 0.5
             + 0.5;
     oxide = smoothstep(0.40, 0.78, oxide);
-    let oxide_col = hsl2rgb(clamp(b_h - 0.01, 0.0, 1.0), clamp(b_s * 1.4, 0.0, 1.0), clamp(b_l - 0.05, 0.0, 1.0));
+    let oxide_col = hsl2rgb(f32::clamp(b_h - 0.01, 0.0, 1.0), f32::clamp(b_s * 1.4, 0.0, 1.0), f32::clamp(b_l - 0.05, 0.0, 1.0));
     base = mix3(base, oxide_col, oxide * 0.40);
 
-    let lenticel_mask = bark_lenticel(p_grain, clamp(g.lenticels * 1.2, 0.0, 1.0));
+    let lenticel_mask = bark_lenticel(p_grain, f32::clamp(g.lenticels * 1.2, 0.0, 1.0));
     let lenticel_col = mix3(palette_ridge, [palette_furrow[0] * 0.55, palette_furrow[1] * 0.55, palette_furrow[2] * 0.55], 0.75);
     base = mix3(base, lenticel_col, lenticel_mask);
 
-    let cavity = mix(0.62, 1.0, clamp(h * 1.7, 0.0, 1.0));
+    let cavity = mix(0.62, 1.0, f32::clamp(h * 1.7, 0.0, 1.0));
     base = [base[0] * cavity, base[1] * cavity, base[2] * cavity];
 
     let micro = bark_noise([p_grain[0] * 8.3 + 1.1, p_grain[1] * 8.3 + 4.4, p_grain[2] * 8.3 + 2.2]) * 0.06;
     base = [
-        clamp(base[0] + micro, 0.0, 1.0),
-        clamp(base[1] + micro, 0.0, 1.0),
-        clamp(base[2] + micro, 0.0, 1.0),
+        f32::clamp(base[0] + micro, 0.0, 1.0),
+        f32::clamp(base[1] + micro, 0.0, 1.0),
+        f32::clamp(base[2] + micro, 0.0, 1.0),
     ];
 
     // Final warm-brown darkening tint (flora.wgsl).
@@ -296,7 +296,7 @@ fn bark_albedo(p_grain: [f32; 3], h: f32, world_y: f32, g: &BarkGenes) -> [f32; 
 /// linear albedo then the tonemap/sRGB write happens downstream; for a flat
 /// preview we apply a plain sRGB encode so the swatch isn't gamma-dark).
 fn linear_to_srgb_u8(c: f32) -> u8 {
-    let c = clamp(c, 0.0, 1.0);
+    let c = f32::clamp(c, 0.0, 1.0);
     let s = if c <= 0.0031308 {
         c * 12.92
     } else {
@@ -345,7 +345,7 @@ pub fn bake_bark_swatch(g: &BarkGenes, size: u32) -> Vec<u8> {
             albedo = mix3(herb, albedo, g.woodiness);
             // shed under-bark overlay, gated by woodiness.
             let shed = bark_shed_field(p_grain, g.shed);
-            let ub_l = clamp(mix(0.10, 0.92, g.lightness) + 0.12, 0.0, 1.0);
+            let ub_l = f32::clamp(mix(0.10, 0.92, g.lightness) + 0.12, 0.0, 1.0);
             let ub_s = g.under_hue * 0.55;
             let ub_h = mix(0.09, 0.02, g.under_hue);
             let under = hsl2rgb(ub_h, ub_s, ub_l);

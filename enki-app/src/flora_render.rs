@@ -1415,18 +1415,13 @@ impl FloraRenderer {
     /// host-visible readback buffer. Recorded in the begin_frame→begin_rendering gap
     /// (outside any dynamic-rendering instance), like the shadow/scene passes — so
     /// it runs BEFORE (and independent of) the normal swapchain composite + egui.
-    /// The caller `wait_idle`s, then `read_capture_rgba`. Lazily (re)allocates the
-    /// capture target to the current extent. // ponytail: reusing `fs_output` + the
-    /// existing post descriptor set means a clean render with zero new shader/pipe.
-    pub fn record_capture(&mut self, rhi: &mut Rhi, fi: u32) -> Result<(), RhiError> {
-        self.begin_capture(rhi, fi)?;
-        self.end_capture(rhi, fi)
-    }
-
-    /// First half of `record_capture`: (re)allocate the capture target, barrier it
-    /// to COLOR, OPEN a single-sample rendering instance on it, and draw the
-    /// `fs_output` composite triangle. The rendering instance is LEFT OPEN so the
-    /// caller can draw egui on top (FLORA_SCREENSHOT_UI) before `end_capture`.
+    /// The caller `wait_idle`s, then `read_capture_rgba`.
+    ///
+    /// `begin_capture`: (re)allocate the capture target, barrier it to COLOR, OPEN
+    /// a single-sample rendering instance on it, and draw the `fs_output` composite
+    /// triangle. Paired with `end_capture`, which closes the instance + copies to
+    /// the readback buffer. // ponytail: reusing `fs_output` + the existing post
+    /// descriptor set means a clean render with zero new shader/pipe.
     pub fn begin_capture(&mut self, rhi: &mut Rhi, fi: u32) -> Result<(), RhiError> {
         let extent = self.post.targets.extent;
         // (Re)allocate the capture target if missing or resized.
@@ -1499,9 +1494,8 @@ impl FloraRenderer {
         Ok(())
     }
 
-    /// Second half of `record_capture`: CLOSE the capture rendering instance, then
-    /// barrier the image to TRANSFER_SRC and copy it into the readback buffer.
-    /// Call after `begin_capture` (and any in-pass egui draw).
+    /// CLOSE the capture rendering instance, then barrier the image to TRANSFER_SRC
+    /// and copy it into the readback buffer. Call after `begin_capture`.
     pub fn end_capture(&mut self, rhi: &mut Rhi, fi: u32) -> Result<(), RhiError> {
         let extent = self.post.targets.extent;
         let cap = self.capture.as_ref().unwrap();
@@ -1562,14 +1556,14 @@ impl FloraRenderer {
     }
 
     /// Read the captured frame back as tightly-packed RGBA8 bytes (BGRA→RGBA
-    /// swizzled). MUST be called after `record_capture` + a frame submit + a
-    /// `rhi.wait_idle()`. Returns (width, height, rgba). The image is B8G8R8A8_SRGB
+    /// swizzled). MUST be called after `begin_capture`/`end_capture` + a frame
+    /// submit + a `rhi.wait_idle()`. Returns (width, height, rgba). B8G8R8A8_SRGB
     /// so the bytes are already display-ready; we only reorder B↔R.
     pub fn read_capture_rgba(&self, rhi: &Rhi) -> Result<(u32, u32, Vec<u8>), RhiError> {
         let cap = self
             .capture
             .as_ref()
-            .ok_or_else(|| RhiError::Other("no capture target (record_capture not called)".into()))?;
+            .ok_or_else(|| RhiError::Other("no capture target (begin_capture not called)".into()))?;
         let mut bytes = rhi.read_buffer(cap.readback)?;
         let needed = (cap.extent.width * cap.extent.height * 4) as usize;
         bytes.truncate(needed);

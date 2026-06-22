@@ -90,11 +90,6 @@ pub fn bake_branch_mesh(bm: &BranchMesh, model_rot: Quat) -> ClusterAsset {
     ClusterAsset {
         clusters,
         patch_origin: DVec3::ZERO,
-        // Provenance fields are terrain quadtree coords; meaningless for a tree.
-        face: 0,
-        level: 0,
-        ix: 0,
-        iy: 0,
     }
 }
 

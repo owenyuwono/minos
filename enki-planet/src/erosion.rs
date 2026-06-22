@@ -1,9 +1,8 @@
 //! Global stream-power erosion field — the **B-path** (iterated uplift+erode loop).
 //!
 //! Pure port of the `if (opts.upliftForcing)` branch in `ki/src/planet/erosion.ts`
-//! (lines ~438-823 + the query samplers ~1605-1869). Mirrors the climate.rs
-//! bake/query split: `Erosion::new` bakes a 256²×6 cubemap once; `to_baked`/
-//! `from_baked` ship a sampler-only snapshot to workers (no re-simulation).
+//! (lines ~438-823 + the query samplers ~1605-1869): `Erosion::new` bakes a
+//! 256²×6 cubemap once, after which the struct is sampler-only.
 //!
 //! INTERNAL determinism only (not byte-match vs ki): we replicate ki's algorithm,
 //! iteration order, and tie-breaks so enki's two renderers agree on `height()`.
@@ -143,26 +142,6 @@ impl PartialOrd for HeapItem {
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Serialisable snapshot for zero-copy worker sharing (mirrors `ClimateBaked`).
-#[derive(Debug, Clone)]
-pub struct ErosionBaked {
-    pub res: usize,
-    /// 6*res²; normalized height delta (≤0 incision, ≥0 sediment).
-    pub erosion_delta: Vec<f32>,
-    /// 6*res²; normalized log discharge 0..1.
-    pub flow_accum: Vec<f32>,
-    /// 6*res²; world-space (un-normalized) downhill tangent components.
-    pub flow_dir_x: Vec<f32>,
-    pub flow_dir_y: Vec<f32>,
-    pub flow_dir_z: Vec<f32>,
-    /// 6*res²; basin spill elevation (metres); LAKE_SENTINEL where not a lake.
-    pub lake_level: Vec<f32>,
-    /// 6*res²; 1 inside a real lake basin, 0 elsewhere (safe to bilinear).
-    pub lake_mask: Vec<f32>,
-    /// Seed for query-time domain-warp noise (stream 10).
-    pub warp_seed: u32,
-}
-
 /// Bake-time inputs. `height_fn(dir, level)` returns normalized height in
 /// roughly `[-1,1]`; `moisture_fn(dir, h_norm)` returns precipitation in `[0,1]`.
 /// `ocean_coverage` is the sea-level percentile. When `tectonics` is `Some`,
@@ -179,16 +158,12 @@ where
     pub ocean_coverage: f64,
     /// Optional baked tectonics for hardness + uplift forcing.
     pub tectonics: Option<&'a Tectonics>,
-    // ki tuning overrides (None → defaults above)
+    /// Grid resolution override (None → `EROSION_RES`). Used by tests to bake a
+    /// tiny field fast; production always passes None.
     pub res: Option<usize>,
-    pub k0: Option<f64>,
-    pub m_exp: Option<f64>,
-    pub n_exp: Option<f64>,
-    pub talus: Option<f64>,
-    pub kw_min: Option<f64>,
-    pub deposition_g: Option<f64>,
+    /// B-path uplift+erode iteration count override (None → `B_STEPS_DEFAULT`).
+    /// Used by tests for a fast, low-step bake; production always passes None.
     pub b_steps: Option<usize>,
-    pub b_uplift_rate: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +180,6 @@ pub struct Erosion {
     flow_dir_z: Vec<f32>,
     lake_level: Vec<f32>,
     lake_mask: Vec<f32>,
-    warp_seed: u32,
     warp_noise: Noise3D,
 }
 
@@ -221,14 +195,14 @@ impl Erosion {
         M: Fn(DVec3, f64) -> f64,
     {
         let res = opts.res.unwrap_or(EROSION_RES);
-        let k0 = opts.k0.unwrap_or(DEFAULT_K0);
-        let m_exp = opts.m_exp.unwrap_or(DEFAULT_M_EXP);
-        let n_exp = opts.n_exp.unwrap_or(DEFAULT_N_EXP);
-        let talus = opts.talus.unwrap_or(DEFAULT_TALUS);
-        let kw_min = opts.kw_min.unwrap_or(DEFAULT_KW_MIN);
-        let deposition_g = opts.deposition_g.unwrap_or(DEFAULT_DEPOSITION_G);
+        let k0 = DEFAULT_K0;
+        let m_exp = DEFAULT_M_EXP;
+        let n_exp = DEFAULT_N_EXP;
+        let talus = DEFAULT_TALUS;
+        let kw_min = DEFAULT_KW_MIN;
+        let deposition_g = DEFAULT_DEPOSITION_G;
         let b_steps = opts.b_steps.unwrap_or(B_STEPS_DEFAULT);
-        let b_uplift_rate = opts.b_uplift_rate.unwrap_or(B_UPLIFT_RATE_DEFAULT);
+        let b_uplift_rate = B_UPLIFT_RATE_DEFAULT;
 
         // Stream 9 reserved (touch so stream-10 derivation stays stable), 10 = warp.
         let _ = derive_seed(opts.seed, 9);
@@ -604,43 +578,7 @@ impl Erosion {
             flow_dir_z,
             lake_level,
             lake_mask,
-            warp_seed,
             warp_noise,
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Serialisation (mirrors Climate::to_baked / from_baked)
-    // -----------------------------------------------------------------------
-
-    /// Snapshot this Erosion for zero-copy worker sharing.
-    pub fn to_baked(&self) -> ErosionBaked {
-        ErosionBaked {
-            res: self.res,
-            erosion_delta: self.erosion_delta.clone(),
-            flow_accum: self.flow_accum.clone(),
-            flow_dir_x: self.flow_dir_x.clone(),
-            flow_dir_y: self.flow_dir_y.clone(),
-            flow_dir_z: self.flow_dir_z.clone(),
-            lake_level: self.lake_level.clone(),
-            lake_mask: self.lake_mask.clone(),
-            warp_seed: self.warp_seed,
-        }
-    }
-
-    /// Reconstruct a sampler-only Erosion (no re-simulation).
-    pub fn from_baked(b: ErosionBaked) -> Self {
-        Erosion {
-            res: b.res,
-            erosion_delta: b.erosion_delta,
-            flow_accum: b.flow_accum,
-            flow_dir_x: b.flow_dir_x,
-            flow_dir_y: b.flow_dir_y,
-            flow_dir_z: b.flow_dir_z,
-            lake_level: b.lake_level,
-            lake_mask: b.lake_mask,
-            warp_seed: b.warp_seed,
-            warp_noise: Noise3D::new(b.warp_seed),
         }
     }
 
@@ -896,14 +834,7 @@ mod tests {
             ocean_coverage: 0.3,
             tectonics: None,
             res: Some(res),
-            k0: None,
-            m_exp: None,
-            n_exp: None,
-            talus: None,
-            kw_min: None,
-            deposition_g: None,
             b_steps: Some(4), // small step count: fast, still exercises the loop
-            b_uplift_rate: None,
         })
     }
 
@@ -945,24 +876,6 @@ mod tests {
         }
         for (x, y) in a.lake_level.iter().zip(b.lake_level.iter()) {
             assert_eq!(x.to_bits(), y.to_bits());
-        }
-    }
-
-    /// to_baked / from_baked round-trips the sampler bit-for-bit.
-    #[test]
-    fn baked_round_trip() {
-        let e = bake(16, sine_height);
-        let e2 = Erosion::from_baked(e.to_baked());
-        let dirs = [
-            DVec3::X,
-            DVec3::Y,
-            DVec3::new(0.3, -0.7, 0.6).normalize(),
-            DVec3::new(-1.0, 0.2, 0.1).normalize(),
-        ];
-        for dir in dirs {
-            assert_eq!(e.delta_at(dir).to_bits(), e2.delta_at(dir).to_bits());
-            assert_eq!(e.acc_at(dir).to_bits(), e2.acc_at(dir).to_bits());
-            assert_eq!(e.lake_at(dir).to_bits(), e2.lake_at(dir).to_bits());
         }
     }
 

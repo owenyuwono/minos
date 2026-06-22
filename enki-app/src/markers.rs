@@ -55,8 +55,7 @@ pub(crate) fn overlay_pipeline(
         samples,
         blend,
         fill: true,
-    });
-    let pipeline = pipeline?;
+    })?;
     rhi.destroy_shader_module(shader);
     Ok(pipeline)
 }

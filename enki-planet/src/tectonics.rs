@@ -1558,13 +1558,13 @@ const ARC_CRUST_WIDTH:  f64 = 0.090;
 pub struct Tectonics {
     pub plates: Vec<Plate>,
 
-    // Construction parameters (needed for TectonicsBaked round-trip).
+    // Construction parameters retained for reference / debug.
     seed: u32,
     arc_density: f64,
     hotspot_count: u32,
     hotspot_intensity: f64,
     /// Crust composition [0,1]: 0 = icy/sediment (soft), 1 = rocky/basaltic (hard).
-    /// Feeds Phase-1 substrate-hardness contrast; stored here for round-trip.
+    /// Feeds Phase-1 substrate-hardness contrast.
     composition: f64,
 
     // Cube-map tables (read-only after construction).
@@ -3456,72 +3456,6 @@ mod tests {
     // Phase 3 tests
     // ---------------------------------------------------------------------------
 
-    /// Round-trip: build → to_baked → from_baked → query results must be
-    /// bit-identical to the original for all 8 query fields plus
-    /// boundary_relief and volcano_elevation at ~30 sample directions.
-    #[test]
-    fn round_trip_baked_bit_identical() {
-        use crate::noise::ridged;
-
-        let original = Tectonics::new(0x9E37_79B9, 10, 1.0, 5, 1.0, 0.5);
-        let baked    = original.to_baked();
-        let restored = Tectonics::from_baked(&baked);
-
-        assert_eq!(original.plate_count(), restored.plate_count(),
-            "plate count changed after round-trip");
-
-        let ridged_noise = crate::noise::Noise3D::new(0xABCD);
-
-        // 30 deterministic directions covering the whole sphere.
-        let phi_gold = 0.618_033_988_75f64;
-        for i in 0..30usize {
-            let theta = std::f64::consts::PI * (i as f64 + 0.5) / 30.0;
-            let phi   = (2.0 * std::f64::consts::PI * (i as f64 * phi_gold))
-                         % (2.0 * std::f64::consts::PI);
-            let dir = DVec3::new(
-                theta.sin() * phi.cos(),
-                theta.cos(),
-                theta.sin() * phi.sin(),
-            ).normalize();
-
-            let q_orig = original.query(dir);
-            let q_rest = restored.query(dir);
-
-            // All 8 query fields must be bit-identical.
-            assert_eq!(q_orig.plate_id,     q_rest.plate_id,
-                "plate_id differs after round-trip at i={}", i);
-            assert_eq!(q_orig.neighbor_id,  q_rest.neighbor_id,
-                "neighbor_id differs after round-trip at i={}", i);
-            assert_eq!(q_orig.boundary_dist.to_bits(), q_rest.boundary_dist.to_bits(),
-                "boundary_dist differs after round-trip at i={}", i);
-            assert_eq!(q_orig.convergence.to_bits(), q_rest.convergence.to_bits(),
-                "convergence differs after round-trip at i={}", i);
-            assert_eq!(q_orig.shear.to_bits(), q_rest.shear.to_bits(),
-                "shear differs after round-trip at i={}", i);
-            assert_eq!(q_orig.crust_dist.to_bits(), q_rest.crust_dist.to_bits(),
-                "crust_dist differs after round-trip at i={}", i);
-            assert_eq!(q_orig.paleo_dist.to_bits(), q_rest.paleo_dist.to_bits(),
-                "paleo_dist differs after round-trip at i={}", i);
-            assert_eq!(q_orig.other_crust_dist.to_bits(), q_rest.other_crust_dist.to_bits(),
-                "other_crust_dist differs after round-trip at i={}", i);
-
-            // boundary_relief (passes plates by reference — must be identical).
-            let ridged_fn = |d: DVec3, freq: f64, oct: u32| {
-                ridged(&ridged_noise, d.x, d.y, d.z, oct, freq, 2.0, 0.5)
-            };
-            let br_orig = boundary_relief(&q_orig, &original.plates, dir, &ridged_fn, 0.0);
-            let br_rest = boundary_relief(&q_rest, &restored.plates, dir, &ridged_fn, 0.0);
-            assert_eq!(br_orig.to_bits(), br_rest.to_bits(),
-                "boundary_relief differs after round-trip at i={}", i);
-
-            // volcano_elevation (uses vol_noise internally — re-derived from seed).
-            let ve_orig = original.volcano_elevation(dir);
-            let ve_rest = restored.volcano_elevation(dir);
-            assert_eq!(ve_orig.to_bits(), ve_rest.to_bits(),
-                "volcano_elevation differs after round-trip at i={}", i);
-        }
-    }
-
     /// Confirm the full public surface is present (no todo!/unimplemented!).
     /// Simply calling all public methods constitutes the check.
     #[test]
@@ -3529,9 +3463,8 @@ mod tests {
         let t = Tectonics::new(0x1111, 6, 1.2, 3, 0.8, 0.5);
         let dir = DVec3::new(1.0, 0.0, 0.0);
 
-        // new + query + velocity_at + volcano_elevation
+        // new + query + volcano_elevation
         let q = t.query(dir);
-        let _ = t.velocity_at(dir);
         let _ = t.volcano_elevation(dir);
 
         // boundary_relief
@@ -3540,11 +3473,6 @@ mod tests {
         let _ = boundary_relief(&q, &t.plates, dir, &|d, freq, oct| {
             ridged(&rn, d.x, d.y, d.z, oct, freq, 2.0, 0.5)
         }, 0.0);
-
-        // to_baked + from_baked
-        let baked = t.to_baked();
-        let restored = Tectonics::from_baked(&baked);
-        let _ = restored.query(dir);
     }
 
     /// volcano_elevation must be deterministic and finite.

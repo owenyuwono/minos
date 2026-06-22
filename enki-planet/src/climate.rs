@@ -84,7 +84,7 @@ pub struct ClimateParams {
     /// Lapse rate: °C lost over full normalised height. Default 50.
     pub lapse_rate: Option<f64>,
 
-    // ---- Wind bake parameters (affect only bake_wind; from_baked stays unchanged) ----
+    // ---- Wind bake parameters (affect only bake_wind) ----
     /// Blend weight of vortex swirls vs base zonal flow. 0 = pure belts, 1 = full vortex. Default 0.6.
     pub swirl_strength: Option<f64>,
     /// Number of HIGH-pressure centres per hemisphere. Default 4.
@@ -122,30 +122,6 @@ pub struct WindSample {
     pub z: f32,
     /// Dimensionless wind speed ∈ [0,1] (1 = strongest band-boundary shear).
     pub speed: f32,
-}
-
-/// Serialisable snapshot for zero-copy worker sharing.
-/// Transfer `moisture_field` as raw bytes across worker boundaries.
-#[derive(Debug, Clone)]
-pub struct ClimateBaked {
-    /// Resolution used during the bake (= MOIST_RES = 128).
-    pub moist_res: usize,
-    /// Baked cube-map moisture field, length `6 * moist_res²`.
-    pub moisture_field: Vec<f32>,
-    /// Baked cube-map wind direction components, each length `6 * moist_res²`.
-    pub wind_x: Vec<f32>,
-    pub wind_y: Vec<f32>,
-    pub wind_z: Vec<f32>,
-    /// Baked cube-map wind speed ∈ [0,1], length `6 * moist_res²`.
-    pub wind_speed: Vec<f32>,
-    /// Scalar params needed to reconstruct the sampler.
-    pub base_temp: f64,
-    pub atmosphere: f64,
-    pub band_count: u32,
-    pub axial_tilt_rad: f64,
-    pub redistribution: f64,
-    pub greenhouse: f64,
-    pub lapse_rate: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -214,10 +190,8 @@ pub struct Climate {
     wind_y: Vec<f32>,
     wind_z: Vec<f32>,
     wind_speed: Vec<f32>,
-    // Stored for `to_baked` only:
     atmosphere: f64,
     axial_tilt_rad: f64,
-    redistribution: f64,
 }
 
 impl Climate {
@@ -239,7 +213,6 @@ impl Climate {
         let atmosphere = clamp01(params.atmosphere);
         let band_count = params.band_count.max(1);
         let axial_tilt_rad = params.axial_tilt_rad;
-        let redistribution = clamp01(params.redistribution.unwrap_or(1.0));
         let greenhouse = params.greenhouse.unwrap_or(0.0);
         let lapse_rate = params.lapse_rate.unwrap_or(LAPSE_PER_HEIGHT);
 
@@ -306,7 +279,6 @@ impl Climate {
             wind_speed,
             atmosphere,
             axial_tilt_rad,
-            redistribution,
         }
     }
 
@@ -351,64 +323,6 @@ impl Climate {
     /// [`Self::sample`]'s moisture half without the temperature evaluation.
     pub fn moisture(&self, dir: DVec3) -> f32 {
         sample_smooth(&self.moisture_field, dir, MOIST_RES).clamp(0.0, 1.0) as f32
-    }
-
-    // -----------------------------------------------------------------------
-    // Serialisation
-    // -----------------------------------------------------------------------
-
-    /// Snapshot this Climate for zero-copy worker sharing.
-    /// The caller owns the returned `ClimateBaked` (moisture_field is cloned).
-    pub fn to_baked(&self) -> ClimateBaked {
-        ClimateBaked {
-            moist_res: MOIST_RES,
-            moisture_field: self.moisture_field.clone(),
-            wind_x: self.wind_x.clone(),
-            wind_y: self.wind_y.clone(),
-            wind_z: self.wind_z.clone(),
-            wind_speed: self.wind_speed.clone(),
-            base_temp: self.base_temp,
-            atmosphere: self.atmosphere,
-            band_count: self.band_count,
-            axial_tilt_rad: self.axial_tilt_rad,
-            redistribution: self.redistribution,
-            greenhouse: self.greenhouse,
-            lapse_rate: self.lapse_rate,
-        }
-    }
-
-    /// Reconstruct a sampler-only Climate from a baked snapshot.
-    /// Does NOT call `bake_moisture` — uses the field from `b` directly.
-    pub fn from_baked(b: ClimateBaked) -> Self {
-        let atmosphere = b.atmosphere;
-        let axial_tilt_rad = b.axial_tilt_rad;
-        let invert_blend = smoothstep(TILT_INVERT_LO, TILT_INVERT_HI, axial_tilt_rad);
-        let gradient = EQUATOR_POLE_DELTA * (1.0 - 0.7 * atmosphere);
-        let lapse_factor = 0.3 + 0.7 * atmosphere;
-        let moist_gain = MOIST_GAIN * (0.34 + 1.1 * atmosphere);
-        let band_contrast = 1.30 - 0.55 * atmosphere;
-
-        Climate {
-            base_temp: b.base_temp,
-            greenhouse: b.greenhouse,
-            lapse_rate: b.lapse_rate,
-            invert_blend,
-            gradient,
-            lapse_factor,
-            moist_gain,
-            band_contrast,
-            band_count: b.band_count,
-            moisture_field: b.moisture_field,
-            // Wind fields are baked; from_baked replays no stream-201 noise (it's
-            // consumed at bake time only, never at query). ponytail: pure passthrough.
-            wind_x: b.wind_x,
-            wind_y: b.wind_y,
-            wind_z: b.wind_z,
-            wind_speed: b.wind_speed,
-            atmosphere,
-            axial_tilt_rad,
-            redistribution: b.redistribution,
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -888,30 +802,6 @@ mod tests {
     }
 
     #[test]
-    fn to_baked_from_baked_round_trip() {
-        let c = Climate::new(earth_like_params(), flat_height, half_inland);
-        let baked = c.to_baked();
-        let c2 = Climate::from_baked(baked);
-
-        // Both must produce identical sample outputs at several directions.
-        let dirs = [
-            DVec3::X,
-            DVec3::Y,
-            DVec3::Z,
-            DVec3::new(0.3, -0.7, 0.6).normalize(),
-            DVec3::new(-1.0, 0.0, 0.0),
-        ];
-        for dir in dirs {
-            let (t1, m1) = c.sample(dir, 0.2);
-            let (t2, m2) = c2.sample(dir, 0.2);
-            assert_eq!(t1.to_bits(), t2.to_bits(),
-                "temperature diverged after round-trip at {dir:?}");
-            assert_eq!(m1.to_bits(), m2.to_bits(),
-                "moisture diverged after round-trip at {dir:?}");
-        }
-    }
-
-    #[test]
     fn equator_warmer_than_pole() {
         let c = Climate::new(earth_like_params(), flat_height, half_inland);
         let (equator_temp, _) = c.sample(DVec3::X, 0.0);
@@ -996,23 +886,4 @@ mod tests {
         }
     }
 
-    #[test]
-    fn wind_round_trip() {
-        let c = Climate::new(earth_like_params(), flat_height, half_inland);
-        let c2 = Climate::from_baked(c.to_baked());
-        let dirs = [
-            DVec3::X,
-            DVec3::Y,
-            DVec3::new(0.3, -0.7, 0.6).normalize(),
-            DVec3::new(-1.0, 0.0, 0.0),
-        ];
-        for dir in dirs {
-            let a = c.wind_at(dir);
-            let b = c2.wind_at(dir);
-            assert_eq!(a.x.to_bits(), b.x.to_bits(), "wind.x diverged at {dir:?}");
-            assert_eq!(a.y.to_bits(), b.y.to_bits(), "wind.y diverged at {dir:?}");
-            assert_eq!(a.z.to_bits(), b.z.to_bits(), "wind.z diverged at {dir:?}");
-            assert_eq!(a.speed.to_bits(), b.speed.to_bits(), "wind.speed diverged at {dir:?}");
-        }
-    }
 }

@@ -12,12 +12,14 @@ use enki_render::{
     body_pass::BODY_WGSL,
     camera::Camera,
     frame::FrameUniforms,
-    geometry::placeholder_sphere,
+    geometry::sphere_inward,
     sky::SKY_SHELL_M,
     system::{BodyKind, SolarSystem},
 };
-use enki_rhi::{vk, BufferHandle, GraphicsPipelineDesc, PipelineHandle, Rhi, RhiError};
+use enki_rhi::{vk, BufferHandle, PipelineHandle, Rhi, RhiError};
 use glam::{Mat4, Quat, Vec3};
+
+use crate::markers::overlay_pipeline;
 
 /// Per-body push constant (96 B ≤ 128 B limit). Mirrors `Push` in body.wgsl.
 #[repr(C)]
@@ -44,31 +46,20 @@ impl BodyRenderer {
         color_format: vk::Format,
         samples: vk::SampleCountFlags,
     ) -> Result<Self, RhiError> {
-        let shader = rhi.create_shader_module(BODY_WGSL)?;
-        let pipeline = rhi.create_graphics_pipeline(&GraphicsPipelineDesc {
-            shader,
-            vs_entry: "vs_main",
-            fs_entry: "fs_main",
-            push_constant_size: std::mem::size_of::<BodyPush>() as u32,
-            set0_layout: rhi.set0_layout(),
+        let pipeline = overlay_pipeline(
+            rhi,
+            BODY_WGSL,
             color_format,
-            depth_format: vk::Format::D32_SFLOAT,
+            std::mem::size_of::<BodyPush>() as u32,
+            true, // alpha-blend, depth-write OFF
             samples,
-            blend: true, // alpha-blend, depth-write OFF
-            fill: true,
-        })?;
-        rhi.destroy_shader_module(shader);
+        )?;
 
-        // Unit sphere; reverse winding so cull-BACK keeps the camera-facing hemisphere
-        // (placeholder_sphere winds CW-from-outside).
-        let mesh = placeholder_sphere(1.0, 48);
-        let mut indices = mesh.indices.clone();
-        for tri in indices.chunks_exact_mut(3) {
-            tri.swap(0, 2);
-        }
+        // Unit sphere, inward-wound so cull-BACK keeps the camera-facing hemisphere.
+        let mesh = sphere_inward(1.0, 48);
         let pos = rhi.create_vertex_buffer(cast_slice(&mesh.positions))?;
         let nrm = rhi.create_vertex_buffer(cast_slice(&mesh.normals))?;
-        let idx = rhi.create_index_buffer(&indices)?;
+        let idx = rhi.create_index_buffer(&mesh.indices)?;
         Ok(Self { pipeline, pos, nrm, idx, count: mesh.indices.len() as u32 })
     }
 

@@ -14,8 +14,10 @@
 struct ResolveParams {
     cur_inv_view_proj: mat4x4<f32>, // clip -> world (current, un-jittered)
     prev_view_proj:    mat4x4<f32>, // world -> prev clip (un-jittered)
+    cur_view_proj:     mat4x4<f32>, // world -> clip (current, un-jittered) — shadow march
     texel:             vec4<f32>,   // 1/w, 1/h, w, h
     misc:              vec4<f32>,   // alpha, history_valid(0|1), _, _
+    sun:               vec4<f32>,   // xyz = sun dir (toward sun), w = shadow strength (0=off)
 };
 
 @group(0) @binding(0) var current_tex: texture_2d<f32>;
@@ -45,6 +47,41 @@ fn reconstruct_world(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let ndc = vec4<f32>(uv.x * 2.0 - 1.0, uv.y * 2.0 - 1.0, depth, 1.0);
     let world = params.cur_inv_view_proj * ndc;
     return world.xyz / world.w;
+}
+
+// ── Screen-space sun shadows (folded into the resolve) ───────────────────────
+// March from the shaded point toward the sun; if a stored depth sample is nearer
+// to the camera than the marched point (within a thickness slab), the sun is
+// occluded → shadow. Reuses this pass's depth + matrices, so it costs no extra
+// pass and shadows EVERYTHING in the depth buffer (character, trees, terrain).
+// Limitations: screen-space (off-screen casters miss; reach = SUN_SHADOW_LEN).
+const SUN_SHADOW_STEPS: i32 = 24;
+const SUN_SHADOW_LEN: f32 = 12.0;    // metres marched toward the sun
+const SUN_SHADOW_BIAS: f32 = 0.05;   // metres — avoid self-shadow acne
+const SUN_SHADOW_THICK: f32 = 6.0;   // metres — occluder must be within this slab
+const SUN_SHADOW_DARKEN: f32 = 0.55; // 1 = black core, 0 = none
+
+fn sun_shadow(world: vec3<f32>) -> f32 {
+    if (params.sun.w <= 0.0) { return 1.0; }
+    let sun = params.sun.xyz;
+    for (var i: i32 = 1; i <= SUN_SHADOW_STEPS; i = i + 1) {
+        let t = SUN_SHADOW_LEN * f32(i) / f32(SUN_SHADOW_STEPS);
+        let p = world + sun * t;
+        let clip = params.cur_view_proj * vec4<f32>(p, 1.0);
+        if (clip.w <= 0.0) { continue; }
+        let suv = (clip.xy / clip.w) * 0.5 + 0.5;
+        if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) { continue; }
+        // textureSampleLevel (not textureSample): the march is non-uniform control flow.
+        let sd = textureSampleLevel(depth_tex, samp, suv, 0.0).r;
+        if (sd <= 0.0) { continue; } // sky
+        let stored = reconstruct_world(suv, sd);
+        let dp = length(p);          // camera at origin (camera-relative)
+        let ds = length(stored);
+        if (ds < dp - SUN_SHADOW_BIAS && ds > dp - SUN_SHADOW_THICK) {
+            return 1.0 - params.sun.w * SUN_SHADOW_DARKEN;
+        }
+    }
+    return 1.0;
 }
 
 @fragment
@@ -89,6 +126,13 @@ fn fs_resolve(in: VsOut) -> @location(0) vec4<f32> {
                 }
             }
         }
+    }
+
+    // Screen-space sun shadow on the resolved color (after the history blend, so it
+    // recomputes fresh each frame on the current depth — stable, no ghosting).
+    let d_self = textureSampleLevel(depth_tex, samp, uv, 0.0).r;
+    if (d_self > 0.0) {
+        outc = outc * sun_shadow(reconstruct_world(uv, d_self));
     }
 
     return vec4<f32>(outc, 1.0);

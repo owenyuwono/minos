@@ -215,7 +215,6 @@ impl EguiState {
         markers_poles:     bool,
         markers_equator:   bool,
         rivers_enabled:    bool,
-        stress_stats:      Option<&str>,
         planet_stats:      Option<&PlanetViewStats>,
         load_stats:        Option<&LoadTimings>,
     ) -> UiOutput {
@@ -446,13 +445,6 @@ impl EguiState {
                                 "LOD levels: {}-{}",
                                 ps.min_lod_level, ps.max_lod_level
                             ));
-                        });
-                    }
-
-                    // ── Stress stats ─────────────────────────────────────────
-                    if let Some(stats) = stress_stats {
-                        CollapsingHeader::new("Stress").default_open(true).show(ui, |ui| {
-                            ui.label(stats);
                         });
                     }
 

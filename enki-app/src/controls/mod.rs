@@ -11,7 +11,7 @@
 //! 1. Calls `active_controller.update(dt)` with the elapsed time.
 //! 2. Reads the resulting `camera()` to obtain the new `Camera` for rendering.
 //! 3. Consults `NavState` to decide which controller is active and to perform
-//!    mode transitions (e.g. `begin_placement`, `point_picked`, `exit_first_person`).
+//!    mode transitions (e.g. `begin_placement`, `point_picked`, `exit_surface`).
 //!
 //! Example event routing (sketch only):
 //! ```text
