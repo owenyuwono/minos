@@ -106,6 +106,22 @@ impl SkyModel {
     pub fn lights(&self) -> Lights {
         Lights::from_sun(self.sun_dir().as_vec3(), self.sun_light_color())
     }
+
+    /// Heliocentric spin axis (north pole), tilted from the orbital normal (+Y) by the
+    /// axial tilt. Fixed in the heliocentric frame, so the sub-solar latitude migrates
+    /// over the orbit → seasons.
+    pub fn spin_axis(&self) -> DVec3 {
+        DVec3::new(self.axial_tilt_rad.sin(), self.axial_tilt_rad.cos(), 0.0).normalize()
+    }
+
+    /// Rotation taking a heliocentric direction into the focused planet's body-fixed
+    /// (rendered) frame. The planet spins +φ each day, so the sky + sun appear to rotate
+    /// −φ around the spin axis (sunrise → sunset). Apply to every rendered body
+    /// direction AND every light direction so the sky and lighting stay consistent.
+    pub fn helio_to_body(&self) -> glam::Quat {
+        let phi = (TAU * self.t_seconds / self.day_len_s) as f32;
+        glam::Quat::from_axis_angle(self.spin_axis().as_vec3(), -phi)
+    }
 }
 
 impl Default for SkyModel {

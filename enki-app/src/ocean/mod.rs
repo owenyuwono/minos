@@ -23,6 +23,7 @@ use std::thread::JoinHandle;
 use std::time::Instant;
 
 use bytemuck::{cast_slice, Pod, Zeroable};
+use enki_planet::height::HeightField;
 use enki_render::{
     camera::Camera, frame::FrameUniforms, geometry::placeholder_sphere, material::ChunkPush,
     water_pass::{OCEAN_SURFACE_WGSL, WATER_WGSL},
@@ -178,6 +179,12 @@ pub struct WaveSurface {
     proj_count: u32,
     proj_dyn:  Vec<BufferHandle>,
     proj_scratch: Vec<[f32; 3]>,
+    // Per-vertex wind strength (0..1), sampled from the planet each frame → drives
+    // wave height + intensity (binding 6, read by `vs_projected` via vertex_index).
+    // `None` until the heightfield finishes loading (then neutral 0.5 is used).
+    wind_src:  Option<Arc<dyn HeightField>>,
+    wind_dyn:  Vec<BufferHandle>,
+    wind_scratch: Vec<f32>,
     // ── Background FFT worker (keeps the heavy N=256×3 sim off the render thread) ──
     /// Latest completed field, written by the worker, copied to the GPU each frame.
     latest:        Arc<Mutex<Vec<OceanTexel>>>,
@@ -211,10 +218,13 @@ impl WaveSurface {
         let proj_idx = rhi.create_index_buffer(&proj_i)?;
         let proj_count = proj_i.len() as u32;
         let proj_scratch = vec![[0.0f32; 3]; proj_ndc.len()];
+        let wind_scratch = vec![0.0f32; proj_ndc.len()];
 
-        // ── Custom set 0: frame UBO + field storage + ocean UBO + scene refraction ──
+        // ── Custom set 0: frame UBO + field storage + ocean UBO + scene refraction
+        // + per-vertex wind (binding 6). ──
         let stages = vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT;
         let frag = vk::ShaderStageFlags::FRAGMENT;
+        let vert = vk::ShaderStageFlags::VERTEX;
         let layout_handle = rhi.create_descriptor_set_layout(&[
             BindingDesc { binding: 0, ty: vk::DescriptorType::UNIFORM_BUFFER, stages },
             BindingDesc { binding: 1, ty: vk::DescriptorType::STORAGE_BUFFER, stages },
@@ -222,6 +232,7 @@ impl WaveSurface {
             BindingDesc { binding: 3, ty: vk::DescriptorType::SAMPLED_IMAGE, stages: frag },
             BindingDesc { binding: 4, ty: vk::DescriptorType::SAMPLER, stages: frag },
             BindingDesc { binding: 5, ty: vk::DescriptorType::SAMPLED_IMAGE, stages: frag },
+            BindingDesc { binding: 6, ty: vk::DescriptorType::STORAGE_BUFFER, stages: vert },
         ])?;
         let sampler = rhi.create_sampler()?;
 
@@ -314,11 +325,15 @@ impl WaveSurface {
         let fif = rhi.frames_in_flight();
         let field_size = (FFT_N * FFT_N * N_CASCADES * std::mem::size_of::<OceanTexel>()) as u64;
         let proj_dyn_size = (proj_ndc.len() * std::mem::size_of::<[f32; 3]>()) as u64;
+        let wind_dyn_size = (proj_ndc.len() * std::mem::size_of::<f32>()) as u64;
         let mut frames = Vec::with_capacity(fif);
         let mut proj_dyn = Vec::with_capacity(fif);
+        let mut wind_dyn = Vec::with_capacity(fif);
         for _ in 0..fif {
-            // Mode C: host-visible vertex buffer rewritten with projected positions.
+            // host-visible vertex/storage buffers rewritten per frame (projected
+            // positions + per-vertex wind).
             proj_dyn.push(rhi.create_gpu_buffer(proj_dyn_size, true, vk::BufferUsageFlags::VERTEX_BUFFER)?);
+            let wind_buf = rhi.create_gpu_buffer(wind_dyn_size, true, vk::BufferUsageFlags::STORAGE_BUFFER)?;
             let frame_ubo = rhi.create_gpu_buffer(
                 std::mem::size_of::<FrameUniforms>() as u64, true, vk::BufferUsageFlags::UNIFORM_BUFFER,
             )?;
@@ -331,13 +346,16 @@ impl WaveSurface {
             rhi.write_storage_binding(set, 1, field_buf)?;
             rhi.write_uniform_binding(set, 2, ocean_ubo)?;
             rhi.write_sampler_binding(set, 4, sampler);
+            rhi.write_storage_binding(set, 6, wind_buf)?;
             // Binding 3 (scene color) is written per-frame in `record` (it ping-pongs).
             frames.push(WaveFrame { frame_ubo, ocean_ubo, field_buf, set });
+            wind_dyn.push(wind_buf);
         }
 
         Ok(Self {
             proj_pipeline, layout, sampler,
             proj_ndc, proj_idx, proj_count, proj_dyn, proj_scratch,
+            wind_src: None, wind_dyn, wind_scratch,
             latest, shared_params, active, running, worker: Some(worker),
             length_scales, cascade_count,
             params: WaveParams::default(), debug_intensity: false, frames, base_radius,
@@ -418,7 +436,8 @@ impl WaveSurface {
         };
         rhi.write_storage_bytes(f.ocean_ubo, bytemuck::bytes_of(&params))?;
 
-        // Project the NDC lattice onto the sea sphere (CPU f64), upload, draw.
+        // Project the NDC lattice onto the sea sphere (CPU f64) + sample planet wind
+        // at each vertex (drives wave height/intensity), upload, draw.
         let fwd = (camera.orientation * Vec3::NEG_Z).as_dvec3();
         let rgt = (camera.orientation * Vec3::X).as_dvec3();
         let upc = (camera.orientation * Vec3::Y).as_dvec3();
@@ -428,15 +447,21 @@ impl WaveSurface {
         {
             let ndc = &self.proj_ndc;
             let scratch = &mut self.proj_scratch;
+            let wscratch = &mut self.wind_scratch;
+            let wind_src = &self.wind_src;
             for (i, p) in ndc.iter().enumerate() {
                 let dir = fwd
                     + rgt * (p[0] as f64 * tan_half * aspect)
                     + upc * (p[1] as f64 * tan_half);
-                let h = mesh::project_to_sphere(dir, center, sea_radius, 0.5).as_vec3();
+                let hit = mesh::project_to_sphere(dir, center, sea_radius, 0.5); // cam-relative
+                let wdir = (hit + camera_pos).normalize(); // world surface direction
+                wscratch[i] = wind_src.as_ref().map_or(0.5, |h| h.wind_speed_at(wdir));
+                let h = hit.as_vec3();
                 scratch[i] = [h.x, h.y, h.z];
             }
         }
         rhi.write_storage_bytes(self.proj_dyn[fi as usize], cast_slice(&self.proj_scratch))?;
+        rhi.write_storage_bytes(self.wind_dyn[fi as usize], cast_slice(&self.wind_scratch))?;
         let pd = self.proj_dyn[fi as usize];
         rhi.cmd_bind_descriptor_set(fi, vk::PipelineBindPoint::GRAPHICS, self.layout, 0, f.set);
         rhi.cmd_bind_pipeline(fi, vk::PipelineBindPoint::GRAPHICS, self.proj_pipeline)?;
@@ -444,6 +469,12 @@ impl WaveSurface {
         rhi.bind_index_buffer(fi, self.proj_idx)?;
         rhi.draw_indexed(fi, self.proj_count);
         Ok(())
+    }
+
+    /// Supply the planet as the wind source once it has finished loading; until
+    /// then waves use a neutral wind. Drives per-vertex wave height + intensity.
+    pub fn set_wind_source(&mut self, hf: Arc<dyn HeightField>) {
+        self.wind_src = Some(hf);
     }
 
     /// Free the caller-owned sampler. Call once before RHI teardown (buffers,

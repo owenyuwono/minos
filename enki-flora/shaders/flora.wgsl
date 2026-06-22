@@ -121,8 +121,12 @@ fn env_brdf_approx(roughness: f32, ndv: f32) -> vec2<f32> {
 // term only, used by DAPPLED mode to trim the sky/ambient fill in shadowed
 // regions so the real PCF sun-spots punch through instead of being filled back in
 // by un-shadowed IBL. OFF passes 1.0 here → byte-identical to the old shading.
+// `crack_ao` (default 1.0 = no-op): bark furrow ambient-occlusion. Deep furrows are
+// in self-shadow → darken the indirect (IBL) fully and the direct diffuse partly, so
+// the fissures stay dark under any light angle (dryad FRAG_AO_REPLACEMENT). 1.0 = the
+// old shading (leaves pass 1.0).
 fn pbr_shade(n: vec3<f32>, v: vec3<f32>, albedo: vec3<f32>, roughness: f32,
-             shadow_f: f32, ao: f32, ind_shadow: f32) -> vec3<f32> {
+             shadow_f: f32, ao: f32, ind_shadow: f32, crack_ao: f32) -> vec3<f32> {
     let F0 = vec3<f32>(0.04);
     let ndv = max(dot(n, v), 1e-4);
 
@@ -158,7 +162,8 @@ fn pbr_shade(n: vec3<f32>, v: vec3<f32>, albedo: vec3<f32>, roughness: f32,
     // dryad: reflectedLight.indirectDiffuse *= mix(1.0, vAo, 0.85) — AO floored
     // at 15% and applied to the INDIRECT (IBL/SH) term ONLY, never the direct sun.
     let ao_indirect = mix(1.0, ao, 0.85);
-    return direct + fill + (diff_ibl + spec_ibl) * ao_indirect * ind_shadow;
+    // Crack AO: direct diffuse partly darkened (mix→0.7), indirect fully.
+    return direct * mix(1.0, crack_ao, 0.7) + fill + (diff_ibl + spec_ibl) * ao_indirect * ind_shadow * crack_ao;
 }
 
 // dryad shadow.bias = -0.0005 (NDC depth units). enki is reversed-Z (GREATER,
@@ -358,14 +363,18 @@ var<immediate> branch_pc: BranchPush;
 struct BranchVsIn {
     @location(0) position : vec3<f32>,
     @location(1) normal   : vec3<f32>,
-    @location(2) uv       : vec3<f32>,  // .xy = (angle, world arc-length); .z = tube radius
+    @location(2) uv       : vec3<f32>,  // .xy = (angle, GLOBAL arc-length); .z = tube radius
     @location(3) attr     : vec3<f32>,  // .x = baked AO; .y = wind boneIndex; .z = boneFraction
+    // Branch FRAME (parallel-transported, inherited across forks) for the seamless
+    // bark coordinate: tangent = branch axis, frame_u = a cross-section basis vector.
+    @location(4) tangent  : vec3<f32>,
+    @location(5) frame_u  : vec3<f32>,
 }
 
 struct BranchVsOut {
     @builtin(position) clip_pos     : vec4<f32>,
     @location(0)       world_normal : vec3<f32>,
-    @location(1)       uv           : vec3<f32>,  // .xy = (angle, arc-len); .z = tube radius
+    @location(1)       uv           : vec3<f32>,  // .xy = (angle, GLOBAL arc-len); .z = tube radius
     @location(2)       ao           : f32,
     @location(3)       obj_pos      : vec3<f32>,  // object-space pos (bark samples this)
     // Tree-LOCAL world position (NOT camera-relative) for the shadow lookup: the
@@ -375,6 +384,12 @@ struct BranchVsOut {
     // CAMERA-RELATIVE world position — camera is at the origin in this space, so
     // the view dir is normalize(-view_pos). Needed for the PBR specular/Fresnel.
     @location(5)       view_pos     : vec3<f32>,
+    // OBJECT-space normal + branch frame — the bark derives a SEAMLESS around-the-
+    // branch angle from these (radial normal · frame), and orients its furrow FBM
+    // to the branch axis. World-space axis for the normal tilt = m3 · tangent (FS).
+    @location(6)       obj_normal   : vec3<f32>,
+    @location(7)       tangent      : vec3<f32>,  // object-space branch axis
+    @location(8)       frame_u      : vec3<f32>,  // object-space cross-section basis
 }
 
 // Branch SKIN evaluated in TREE-LOCAL space. The bone matrices are tree-local
@@ -412,6 +427,10 @@ fn vs_branch(v: BranchVsIn) -> BranchVsOut {
     out.shadow_pos = local;
     // Camera-relative world pos (camera at origin) for the PBR view vector.
     out.view_pos = world_pos.xyz;
+    // Object-space normal + carried branch frame for the seamless bark coordinate.
+    out.obj_normal = v.normal;
+    out.tangent = v.tangent;
+    out.frame_u = v.frame_u;
     return out;
 }
 
@@ -439,6 +458,24 @@ const BARK_SHED_LIFT          : f32 = 0.35;
 const BARK_Y_STRETCH          : f32 = 3.0;
 const BARK_BUMP_MIN           : f32 = 0.18;
 const BARK_BUMP_MAX           : f32 = 0.80;
+
+// ── FURROW-GUIDED FBM bark (dryad barkMaterial.js, the voronoi→furrow rewrite). The
+// relief is a ridged multifractal GUIDED by flow-line furrows running up the branch;
+// the lines orient it, the FBM IS the texture. Seamless on all axes (cylinder embed
+// around + carried frame across forks + global arc along). ──
+const BARK_VERT_STRETCH       : f32 = 3.5;  // along-axis stretch: >1 → vertical furrows
+const BARK_FURROW_MIN         : f32 = 8.0;  // furrow count at barkScale 0
+const BARK_FURROW_MAX         : f32 = 30.0; // furrow count at barkScale 1 (integer → seamless wrap)
+const BARK_FURROW_MEANDER_FREQ: f32 = 0.9;  // meander freq along the branch
+const BARK_FURROW_WANDER      : f32 = 0.22; // side-to-side meander amplitude (furrow-band units)
+const BARK_FURROW_ALONG_FREQ  : f32 = 2.0;  // FBM vertical-detail freq in furrow-flow space
+const BARK_FURROW_WARP        : f32 = 0.8;  // domain-warp amplitude → furrows wander/merge organically
+const BARK_FURROW_DEPTH       : f32 = 0.06; // furrow relief depth = normal-tilt strength
+const BARK_XCRACK_AROUND      : f32 = 0.9;  // around-axis radius of the horizontal cross-cracks
+const BARK_XCRACK_FREQ        : f32 = 1.8;  // vertical stacking freq of the cross-cracks
+const BARK_XCRACK_DEPTH       : f32 = 0.6;  // how deep the cross-cracks cut ridge crests
+const BARK_CRACK_DARKEN       : f32 = 0.85; // furrow albedo darkening (0..1)
+const BARK_CRACK_AO           : f32 = 0.80; // ambient-occlusion darkening in the furrows (0..1)
 
 // GLSL mod(x,y) for the hsl2rgb hue wrap (WGSL % differs for negatives).
 fn bark_mod6(x: vec3<f32>) -> vec3<f32> {
@@ -509,7 +546,41 @@ fn ridgedFBM(pw: vec3<f32>, freq_in: f32, fw: f32) -> f32 {
         amp   = amp * 0.52;
     }
     let h = clamp(total / norm, 0.0, 1.0);
-    return pow(h, 0.65);       // h>=0 guaranteed by clamp
+    return pow(h, 0.5);        // dryad retune (0.65→0.5); h>=0 guaranteed by clamp
+}
+
+// Furrow density (integer count) from the barkScale gene. Rounded → seamless wrap.
+fn barkFurrowCount(scale: f32) -> f32 {
+    return floor(mix(BARK_FURROW_MIN, BARK_FURROW_MAX, scale) + 0.5);
+}
+
+// FLOW-LINE FURROW HEIGHT — THE bark relief (drives normal, colour, AO). Furrows are
+// lines of ~constant angle running ALONG the branch, meandering as they climb; returns
+// surface HEIGHT in [0,1] (1 = ridge crest, 0 = furrow floor). 1:1 dryad barkFurrowHeight.
+//   around       — SEAMLESS angle around the branch [0,1) (radial normal · branch frame)
+//   along_arc    — global arc up the branch (uv.y) — drives the grain frequency
+//   along_global — object height — drives the meander (global → no fork seam in the wobble)
+fn barkFurrowHeight(around: f32, along_arc: f32, along_global: f32, count: f32, relief: f32, plates: f32) -> f32 {
+    let ang0    = around * 6.2831853;
+    let meander = sin(along_global * BARK_FURROW_MEANDER_FREQ + ang0) * BARK_FURROW_WANDER;
+    let ang     = ang0 + meander * (6.2831853 / count);
+    let rn      = count / 6.2831853;
+    // CYLINDER embedding: sample the FBM on a CLOSED circle (count furrows) → seamless wrap.
+    var fp = vec3<f32>(cos(ang) * rn, along_arc * BARK_FURROW_ALONG_FREQ, sin(ang) * rn);
+    fp = fp + vec3<f32>(
+        barkNoise(fp * 0.5 + vec3<f32>(1.7)),
+        barkNoise(fp * 0.5 + vec3<f32>(8.3)),
+        barkNoise(fp * 0.5 + vec3<f32>(4.2)),
+    ) * BARK_FURROW_WARP;
+    var h = ridgedFBM(fp, 1.0, 0.0);
+    // S1 — horizontal cross-fractures: chop the vertical ridges into stacked oak scales,
+    // on the SAME seamless cylinder. Cuts only ridge CRESTS (smoothstep gate). plates×relief
+    // drives it: 0 = strict no-op (continuous ridges), ~0.45 = moderate scaling.
+    let xc = vec3<f32>(cos(ang) * BARK_XCRACK_AROUND, along_arc * BARK_XCRACK_FREQ, sin(ang) * BARK_XCRACK_AROUND);
+    var crack = 1.0 - abs(barkNoise(xc + vec3<f32>(7.0)));
+    crack = crack * crack * crack;
+    h = h - relief * plates * BARK_XCRACK_DEPTH * crack * smoothstep(0.45, 0.78, h);
+    return clamp(h, 0.0, 1.0);
 }
 
 // Orientation gain: 1.0 at barkOrient default (legacy byte-identity coord).
@@ -620,9 +691,13 @@ fn barkLenticel(p_grain: vec3<f32>, prominence: f32) -> f32 {
 // lichen, blotch, micro-variation are independent colour features.
 fn barkAlbedo(p_grain: vec3<f32>, h: f32, worldY: f32,
               barkHue: f32, barkLightness: f32, barkLenticels: f32) -> vec3<f32> {
-    let bL = mix(0.10, 0.92, barkLightness);   // dryad barkMaterial.js:359 (verbatim)
+    // dryad NEW bark albedo: FLAT base + colour-only features. The fracture PATTERN
+    // (furrows/ridges/cracks) lives ENTIRELY in the normal map + crack AO now, NOT in
+    // albedo — so no warm-brown hack needed (the old ×(0.27,0.23,0.19) cut is GONE;
+    // the dark furrows come from the furrow-aligned colour split + crack AO instead).
+    let bL = mix(0.24, 0.92, barkLightness); // floor raised 0.10→0.24 (dark genes not near-black)
     let bS = barkHue * 0.55;
-    let bH = mix(0.09, 0.02, barkHue);
+    let bH = mix(0.095, 0.035, barkHue);     // tan/yellow-brown → warm brown
 
     let paletteRidge  = hsl2rgb(bH, bS,        clamp(bL + 0.07, 0.0, 1.0));
     let paletteFurrow = hsl2rgb(bH, bS * 1.15, clamp(bL - 0.20, 0.0, 1.0));
@@ -630,17 +705,19 @@ fn barkAlbedo(p_grain: vec3<f32>, h: f32, worldY: f32,
     let paletteBlotchWarm = hsl2rgb(clamp(bH - 0.015, 0.0, 1.0), bS,       clamp(bL - 0.05, 0.0, 1.0));
     let paletteBlotchCool = hsl2rgb(clamp(bH + 0.05, 0.0, 1.0),  bS * 0.7, clamp(bL - 0.07, 0.0, 1.0));
 
-    let baseSat = bS * 0.58;
-    let baseHue = mix(bH, 0.065, 0.35);   // dryad barkMaterial.js:378 (verbatim)
+    let baseSat = bS * 0.52;
+    let baseHue = mix(bH, 0.08, 0.5);    // pull firmly toward tan, away from red/maroon
     var baseCol = hsl2rgb(baseHue, baseSat, bL);
 
-    // ponytail: height-coupled furrow tone (dryad barkMaterial.js:380-387). This was
-    // missing — without it our flat base read as a single pale tan with no ridge↔furrow
-    // colour contrast, so the lit trunk washed to cream. Blend toward a darker, slightly
-    // warmer furrow tone as h falls (h = ridge height, low = furrow).
-    let furrowT  = clamp((0.45 - h) * 2.0, 0.0, 1.0);
-    let furrowCol = hsl2rgb(clamp(bH - 0.005, 0.0, 1.0), bS * 0.72, clamp(bL - 0.20, 0.0, 1.0));
-    baseCol = mix(baseCol, furrowCol, furrowT * 0.55);
+    // Crack-aligned tone: dark recessed furrows (low h) vs lighter block faces.
+    let furrowT  = clamp((0.5 - h) * 2.2, 0.0, 1.0);
+    let furrowCol = hsl2rgb(clamp(bH - 0.005, 0.0, 1.0), clamp(bS * 1.1, 0.0, 1.0), clamp(bL - 0.34, 0.0, 1.0));
+    baseCol = mix(baseCol, furrowCol, furrowT * BARK_CRACK_DARKEN);
+
+    // Pale weathered ridge CRESTS (high h) — the light half of the light/dark split.
+    let ridgeT  = smoothstep(0.6, 0.92, h);
+    let ridgeCol = hsl2rgb(baseHue, baseSat * 0.6, clamp(bL + 0.26, 0.0, 1.0));
+    baseCol = mix(baseCol, ridgeCol, ridgeT * 0.6);
 
     // Lichen: deep crevices, biased to the trunk base.
     let lichenCrevice = clamp((0.22 - h) * 6.0, 0.0, 1.0);
@@ -652,9 +729,7 @@ fn barkAlbedo(p_grain: vec3<f32>, h: f32, worldY: f32,
     let blotch = barkNoise(p_grain * 0.18 + vec3<f32>(5.5, 1.3, 3.7)) * 0.5 + 0.5;
     baseCol = mix(baseCol, mix(paletteBlotchCool, paletteBlotchWarm, blotch), 0.22);
 
-    // ponytail: oxidation / rust weathering patches (dryad barkMaterial.js:404-410). Was
-    // missing — adds scattered warm, saturated brown zones so the bark reads earthy rather
-    // than uniform tan.
+    // Oxidation / rust weathering patches.
     var oxide = barkNoise(p_grain * 0.22 + vec3<f32>(9.2, 0.8, 6.4)) * 0.5 + 0.5;
     oxide = smoothstep(0.40, 0.78, oxide);
     let oxideCol = hsl2rgb(clamp(bH - 0.01, 0.0, 1.0), clamp(bS * 1.4, 0.0, 1.0), clamp(bL - 0.05, 0.0, 1.0));
@@ -665,29 +740,14 @@ fn barkAlbedo(p_grain: vec3<f32>, h: f32, worldY: f32,
     let lenticelCol  = mix(paletteRidge, paletteFurrow * 0.55, 0.75);
     baseCol = mix(baseCol, lenticelCol, lenticelMask);
 
-    // ponytail: cavity darkening (dryad barkMaterial.js:420-424). THE key missing
-    // darkener — deep furrows accumulate shadow/dirt → darker intrinsic albedo. Ramps
-    // from 1.0 at ridge crests down to 0.62 in deep furrows. Mean ~0.84x over the trunk;
-    // this is what pulls the lit bark off pale cream and onto dryad's warm mid-brown
-    // WITHOUT touching the global exposure (ground/leaves untouched).
-    let cavity = mix(0.62, 1.0, clamp(h * 1.7, 0.0, 1.0));
+    // Cavity darkening — milder now (0.82, was 0.62): the crack-aligned split carries
+    // the strong fissure colour; this just keeps the block faces from reading flat.
+    let cavity = mix(0.82, 1.0, clamp(h * 1.7, 0.0, 1.0));
     baseCol = baseCol * cavity;
 
     // Micro variation.
     baseCol = clamp(baseCol + vec3<f32>(barkNoise(p_grain * 8.3 + vec3<f32>(1.1, 4.4, 2.2)) * 0.06),
                     vec3<f32>(0.0), vec3<f32>(1.0));
-
-    // ponytail: final WARM-BROWN darkening tint. The lit trunk read as pale cream/pink:
-    // not a hue error (in linear light the bark already sits at a correct ~26deg brown) but
-    // a BRIGHTNESS one — the intensity-3.0 sun + IBL drove the matte bark deep into the ACES
-    // shoulder, where output is near-flat vs input: a brown there reads as washed salmon, and
-    // gentle (~0.6x) albedo cuts barely moved the displayed pixel. Scaling base+features
-    // individually also fought the blotch/oxide/lichen mixes (they re-lift toward their own
-    // lightness). So darken the FINAL albedo once and HARD enough to clear the shoulder, with
-    // a touch more cut on G/B than R to keep it warm. The strong factor is the price of NOT
-    // touching the (correct) global exposure — ground + leaves use other shaders, unchanged.
-    // Parametric: applies uniformly so every bark gene still drives the result.
-    baseCol = baseCol * vec3<f32>(0.27, 0.23, 0.19);
     return baseCol;
 }
 
@@ -734,24 +794,40 @@ fn fs_branch(in: BranchVsOut) -> @location(0) vec4<f32> {
     let barkUnderHue  = branch_pc.bark2.x;
     let woodiness     = branch_pc.bark2.y;
 
-    // ── Bark coordinate stack (object space, Y-up). ──
-    // featureScale = TRUE local tube radius (packed into uv.z by the mesher), so
-    // furrows size to actual thickness. orient tilts the grain (gain==1 at the
-    // 0.70 default → legacy vec3(x, 3y, z) coord byte-for-byte).
+    // ── Branch FRAME (object space) — orthonormalised from the carried attributes
+    //    (parallel-transported, inherited across forks). Falls back to a world-Y
+    //    frame if absent. The bark pattern follows the branch axis T, so streaks run
+    //    along angled branches and flow across forks with no seam. ──
+    var frameT = in.tangent;
+    let axisLen = length(frameT);
+    let hasFrame = axisLen > 0.5;
+    frameT = select(vec3<f32>(0.0, 1.0, 0.0), frameT / max(axisLen, 1e-6), hasFrame);
+    var frameU = select(vec3<f32>(1.0, 0.0, 0.0), in.frame_u, hasFrame);
+    frameU = frameU - frameT * dot(frameT, frameU);                  // orthonormalise
+    frameU = select(vec3<f32>(1.0, 0.0, 0.0), normalize(frameU), length(frameU) > 1e-3);
+    let frameW = cross(frameT, frameU);
+
+    // featureScale = TRUE local tube radius (uv.z). pGrain = object pos in the branch
+    // frame (T→Y) with vertical anisotropy (around freq > along → furrows run UP the
+    // branch); the orient gene scales the stretch.
     let featureScale = clamp(in.uv.z, 0.14, 0.55);
     let orientGain   = barkAnisoGain(barkOrient);
-    let pGrain       = barkAnisoCoord(vec3<f32>(in.obj_pos.x, in.obj_pos.y * BARK_Y_STRETCH, in.obj_pos.z), orientGain);
-    let barkFw       = max(max(fwidth(pGrain.x), fwidth(pGrain.y)), fwidth(pGrain.z));
+    let pLocal = vec3<f32>(dot(in.obj_pos, frameU), dot(in.obj_pos, frameT), dot(in.obj_pos, frameW));
+    let vstretch = BARK_VERT_STRETCH * orientGain;
+    let pGrain = vec3<f32>(pLocal.x, pLocal.y / vstretch, pLocal.z);
 
-    // Height field (for albedo lichen pooling) flattened toward smooth as relief→0.
-    var barkH = barkHeightField(pGrain, featureScale, barkFw, barkScale);
-    barkH = mix(0.55, barkH, mix(0.25, 1.0, barkRelief));
+    // SEAMLESS around-the-branch angle from the radial normal projected on the frame
+    // (no UV wrap-seam; consistent across forks). FURROW height = THE bark relief.
+    let bn = normalize(in.obj_normal);
+    let barkAngle = atan2(dot(bn, frameW), dot(bn, frameU)) / 6.2831853 + 0.5;
+    let fCount = barkFurrowCount(barkScale);
+    let furrowH = barkFurrowHeight(barkAngle, in.uv.y, in.obj_pos.y, fCount, barkRelief, barkPlates);
 
-    // ── Albedo: procedural bark, blended toward a herbaceous green by woodiness.
-    var albedo = barkAlbedo(pGrain, barkH, in.obj_pos.y, barkHue, barkLightness, barkLenticels);
-    let herbAlbedo = mix(vec3<f32>(0.16, 0.34, 0.12), vec3<f32>(0.30, 0.52, 0.20), barkH);
+    // ── Albedo: flat base + furrow/ridge colour split + features (pattern is in the
+    //    normal + crack AO, not painted). Blended toward herbaceous green by woodiness.
+    var albedo = barkAlbedo(pGrain, furrowH, in.obj_pos.y, barkHue, barkLightness, barkLenticels);
+    let herbAlbedo = mix(vec3<f32>(0.16, 0.34, 0.12), vec3<f32>(0.30, 0.52, 0.20), furrowH);
     albedo = mix(herbAlbedo, albedo, woodiness);
-
     // Shed under-bark overlay (recolour by barkUnderHue), gated by woodiness.
     let shedAmt = barkShedField(pGrain, barkShed);
     let ubL = clamp(mix(0.10, 0.92, barkLightness) + 0.12, 0.0, 1.0);
@@ -760,28 +836,43 @@ fn fs_branch(in: BranchVsOut) -> @location(0) vec4<f32> {
     let underCol = hsl2rgb(ubH, ubS, ubL);
     albedo = mix(albedo, underCol, shedAmt * woodiness);
     albedo = clamp(albedo, vec3<f32>(0.0), vec3<f32>(1.0));
+    // enki PER-MATERIAL EXPOSURE compensation: dryad's flat bark albedo is tuned for
+    // three.js's ACESFilmic; enki's sun(×3)+IBL + Narkowicz-ACES (+post prescale)
+    // over-drive matte bark into the tonemap shoulder, where it washes to pale salmon.
+    // A uniform warm scale (NOT a pattern — leaves barkAlbedo dryad-faithful) lands it
+    // back on dryad's warm mid-brown. Slightly less cut on R keeps it warm. // ponytail:
+    // calibration knob; the clean fix is a true per-material exposure in the post pass.
+    albedo = albedo * vec3<f32>(0.50, 0.44, 0.38);
 
-    // ── Normal: perturb the world normal by the relief gradient. featureScale is
-    // scaled by woodiness so herbaceous stems stay smooth.
-    let n = barkPerturbNormal(pGrain, normalize(in.world_normal),
-                              featureScale * woodiness, barkFw,
-                              barkScale, barkRelief, barkPlates, barkShed);
+    // ── FURROW NORMAL — finite-difference the furrow height in (around, along) and
+    //    tilt the WORLD normal in the circumferential + axial directions (furrow walls
+    //    + grain). World branch axis = m3 · object tangent. Gated by woodiness so
+    //    herbaceous stems stay smooth. Replaces the FBM-gradient perturb normal. ──
+    let baseN = normalize(in.world_normal);
+    let m3n = mat3x3<f32>(branch_pc.model[0].xyz, branch_pc.model[1].xyz, branch_pc.model[2].xyz);
+    let fEpsA = 0.15 / max(fCount, 1.0);
+    let fHa = barkFurrowHeight(barkAngle + fEpsA, in.uv.y, in.obj_pos.y, fCount, barkRelief, barkPlates);
+    let fHl = barkFurrowHeight(barkAngle, in.uv.y + 0.04, in.obj_pos.y, fCount, barkRelief, barkPlates);
+    let fdHda = (fHa - furrowH) / fEpsA;        // slope across furrows (circumferential)
+    let fdHdl = (fHl - furrowH) / 0.04;         // slope along furrows (grain)
+    let fCirc = 6.2831853 * max(in.uv.z, 0.05); // circumference → world scale
+    let fAxis = normalize(m3n * frameT);
+    let fCircDir = normalize(cross(fAxis, baseN));
+    let fGrad = ((fdHda / fCirc) * fCircDir + fdHdl * fAxis) * BARK_FURROW_DEPTH * woodiness;
+    let n = normalize(baseN - fGrad);
 
     // ── Debug render modes (spare push lane). All arms return → naga-safe. ──
     let mode = u32(branch_pc.bark2.z + 0.5);
     if (mode == 1u) { return vec4<f32>(albedo, 1.0); }              // unlit
-    if (mode == 2u) { return vec4<f32>(n * 0.5 + 0.5, 1.0); }       // normals (perturbed)
+    if (mode == 2u) { return vec4<f32>(n * 0.5 + 0.5, 1.0); }       // normals
     if (mode == 3u) { let a = clamp(in.ao, 0.0, 1.0); return vec4<f32>(a, a, a, 1.0); } // ao
 
-    // ── Cook-Torrance PBR (dryad bark MeshStandardMaterial, metalness 0). ──
-    // Per-pixel roughness from dryad's FRAG_ROUGHNESS_REPLACEMENT: furrows
-    // mix(0.86,0.96,relief), ridge tops mix(0.74,0.86,relief), blended by barkH;
-    // herbaceous (woodiness→0) → 0.78. + Toksvig specular-AA compensation.
+    // ── Roughness (dryad): furrows mix(0.86,0.96,relief), ridge tops mix(0.74,0.86,
+    //    relief), blended by furrowH; herbaceous→0.78. + Toksvig specular-AA. ──
     let rough_furrow = mix(0.86, 0.96, barkRelief);
     let rough_ridge  = mix(0.74, 0.86, barkRelief);
-    var roughness = mix(rough_furrow, rough_ridge, clamp(barkH, 0.0, 1.0));
+    var roughness = mix(rough_furrow, rough_ridge, clamp(furrowH, 0.0, 1.0));
     roughness = mix(0.78, roughness, woodiness);
-    // Toksvig: widen roughness where the perturbed normal varies fast (anti-alias).
     roughness = roughness + clamp(length(fwidth(n)) * 4.0, 0.0, 0.3);
     roughness = clamp(roughness, 0.04, 1.0);
 
@@ -791,13 +882,15 @@ fn fs_branch(in: BranchVsOut) -> @location(0) vec4<f32> {
     let shadow_f = sample_shadow(in.shadow_pos, n, ndl0);
 
     // DAPPLED: trim the bark's INDIRECT (sky/IBL) fill in shadowed regions so the
-    // canopy's sun-spots read on the trunk too. mix(0.55,1.0,shadow_f) keeps a
-    // dappled-shade floor (55% ambient in full shadow) so the trunk doesn't go
-    // black. OFF → 1.0 (byte-identical).
+    // canopy's sun-spots read on the trunk too. OFF → 1.0 (byte-identical).
     let dappled = shadow.params.w > 0.5;
     let ind_shadow = select(1.0, mix(0.55, 1.0, shadow_f), dappled);
 
-    let lit = pbr_shade(n, v, albedo, roughness, shadow_f, ao, ind_shadow);
+    // CRACK AO — the KEY dark-fissure cue (dryad FRAG_AO_REPLACEMENT): deep furrows
+    // (low furrowH) are self-shadowed → darken indirect fully + direct partly. Gated
+    // by relief so smooth-bark genes aren't darkened.
+    let crack_ao = 1.0 - (1.0 - furrowH) * (BARK_CRACK_AO * barkRelief);
+    let lit = pbr_shade(n, v, albedo, roughness, shadow_f, ao, ind_shadow, crack_ao);
     // Viewer path: LINEAR HDR out (the flora OutputPass applies ACES once on
     // scene+bloom). In-scene path (bark2.w > 0.5): there is no flora post pass, so
     // apply the SAME ACES as terrain.wgsl here → flora sits in the ground's exposure.
@@ -1145,7 +1238,7 @@ fn fs_leaf(in: LeafVsOut, @builtin(front_facing) front: bool) -> @location(0) ve
     // punch through instead of being filled back in by un-shadowed IBL. Floor 0.4
     // keeps shaded interior leaves from going black. OFF → 1.0 (byte-identical).
     let ind_shadow = select(1.0, mix(0.4, 1.0, shadow_f), dappled);
-    let pbr = pbr_shade(n, v, albedo, roughness, shadow_f, ao_leaf, ind_shadow);
+    let pbr = pbr_shade(n, v, albedo, roughness, shadow_f, ao_leaf, ind_shadow, 1.0);
 
     // ── Backlit / transmission (dryad two-lobe): wrap-diffuse + forward scatter.
     // ponytail: the OLD weights stacked the bright key sun (intensity ~3.0) onto
@@ -1220,8 +1313,18 @@ struct BranchDepthPush {
 }
 var<immediate> branch_depth_pc: BranchDepthPush;
 
+// The depth caster binds only the 4-stream branch layout (it doesn't sample bark),
+// so it has its OWN input struct WITHOUT the frame attrs (locations 4,5) — declaring
+// them here would require the 6-stream pipeline (a Vulkan input-location mismatch).
+struct BranchDepthVsIn {
+    @location(0) position : vec3<f32>,
+    @location(1) normal   : vec3<f32>,
+    @location(2) uv       : vec3<f32>,
+    @location(3) attr     : vec3<f32>,  // .y = wind boneIndex; .z = boneFraction
+}
+
 @vertex
-fn vs_branch_depth(v: BranchVsIn) -> @builtin(position) vec4<f32> {
+fn vs_branch_depth(v: BranchDepthVsIn) -> @builtin(position) vec4<f32> {
     // IDENTICAL skin to the lit branch (so the cast silhouette sways in lockstep):
     // skin the rest pos by its bone matrix FIRST, then apply the model rotation
     // (here the quaternion form of m3). strength==0 → skinned == rest.

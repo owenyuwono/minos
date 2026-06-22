@@ -28,7 +28,7 @@ use std::sync::Arc;
 use crate::height::HeightField;
 use crate::noise::Noise3D;
 use crate::tectonics::{Tectonics, boundary_relief};
-use crate::climate::{Climate, ClimateParams};
+use crate::climate::{Climate, ClimateParams, WindSample};
 use crate::erosion::{Erosion, ErosionOpts};
 
 /// ki `_deriveSeed` — child seed from (master, stream). Verbatim port:
@@ -485,6 +485,14 @@ impl HeightField for TectonicHeightField {
         let river = smoothstep(RIVER_LO, RIVER_HI, erosion.acc_at(dir));
         let lake = erosion.lake_mask_at(dir);
         river.max(lake).clamp(0.0, 1.0) as f32
+    }
+
+    fn wind_speed_at(&self, dir: DVec3) -> f32 {
+        self.climate.wind_speed_at(dir)
+    }
+
+    fn wind_at(&self, dir: DVec3) -> WindSample {
+        self.climate.wind_at(dir)
     }
 }
 

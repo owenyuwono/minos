@@ -226,10 +226,16 @@ impl FirstPersonController {
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-/// Terrain surface radius (m) along unit `dir`, matching the rendered bake
-/// (level 0). The single source of the feet-on-ground invariant — both the
-/// first-person and third-person walkers ride this so they never drift from
-/// the visible terrain. `dir` must be unit length.
+/// **Analytic** terrain radius (m) along unit `dir`: `base_radius + hf.height·scale`
+/// — the smooth procedural curve at full detail.
+///
+/// This is NOT the rendered surface. The drawn mesh is flat triangles between grid
+/// vertices, and this curve carries sub-cell detail those triangles never show, so
+/// grounding a visible object on it makes the object dive into bumps that aren't
+/// drawn. Do NOT use it for grounding — use
+/// [`crate::controls::terrain_grid::ground_radius`] (the single source of truth)
+/// for anything that sits on the ground. Kept as a conservative "is this above
+/// ground" probe and for the dormant first-person walker. `dir` must be unit length.
 pub(crate) fn surface_radius(
     hf: &dyn HeightField,
     base_radius: f64,

@@ -24,7 +24,8 @@
 use std::time::Instant;
 
 use enki_app::flora_render::{FloraRenderer, ShadowUniforms};
-use enki_app::flora_view::{FloraView, LeafMode, LeafTuning, RenderMode};
+use enki_app::flora_view::{FloraView, LeafLod, LeafMode, LeafTuning, RenderMode, TreeSpec};
+use enki_app::fps::FpsMeter;
 #[cfg(all(feature = "flora", feature = "nanite"))]
 use enki_app::flora_nanite::FloraNanite;
 use enki_app::staging::Staging;
@@ -177,7 +178,12 @@ const LEAVES_SLIDERS: &[GeneSlider] = &[
     g("frondFan", "Frond fan", 0.0, 1.0),
     g("tipTuft", "Tip tuft", 0.0, 1.0),
     g("appendageBreadth", "Appendage breadth", 0.0, 1.0),
-    g("appendageDensity", "Leaf density", 0.0, 1.5),
+    // appendageDensity feeds round(12·d·tipBoost) clusters/seg, so the usable band
+    // is ~0.02 (first leaves) .. ~0.3 (very dense); below ~0.02 it rounds to bare.
+    // The old 0.0..1.5 range crammed that whole band into the bottom ~13% (and
+    // saturated the MAX_LEAVES budget well before 1.5). 0.0..0.3 puts the realistic
+    // range across the full slider so the cliff at ~0.02 is easy to navigate.
+    g("appendageDensity", "Leaf density", 0.0, 0.3),
     g("pigment", "Pigment", 0.0, 1.0),
     g("jitter", "Jitter", 0.0, 1.5),
 ];
@@ -505,6 +511,7 @@ impl FloraGui {
         bloom_on: &mut bool,
         bloom_strength: &mut f32,
         dappled: &mut bool,
+        leaf_opt: &mut bool,
         flora: Option<&FloraView>,
         stats: &Stats,
     ) -> PanelOut {
@@ -878,6 +885,41 @@ impl FloraGui {
                     // rebuild — a checkbox alone leaves `out.rebuild` unset; it just
                     // flips ShadowUniforms.params.w next frame).
                     ui.checkbox(dappled, "Dappled shadows");
+                    ui.separator();
+                    // LEAF OPTIMIZATION master toggle (distance LOD: card subsample +
+                    // leaf-shadow drop + impostor far-tier). Render-side, no rebuild.
+                    // At the default close framing it's a no-op (NEAR band), so on/off
+                    // here is identical — ZOOM OUT to see the live readout below move.
+                    ui.checkbox(leaf_opt, "Leaf optimization");
+                    // LIVE readout so the LOD is observable (this is why it can look
+                    // like "nothing" up close — it's full-quality until you zoom out).
+                    let dim = egui::Color32::from_rgb(150, 160, 175);
+                    if *leaf_opt {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "  cards {}/{} ({:.0}%) · shadows {} · impostor {:.0}%",
+                                stats.leaf_cards_drawn,
+                                stats.leaf_cards_total,
+                                stats.leaf_density * 100.0,
+                                if stats.leaf_shadows { "on" } else { "off" },
+                                stats.leaf_impostor * 100.0,
+                            ))
+                            .small()
+                            .color(dim),
+                        );
+                        ui.label(
+                            egui::RichText::new("  (zoom out — thins as the tree shrinks)")
+                                .small()
+                                .italics()
+                                .color(dim),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new(format!("  full: {} cards, every frame", stats.leaf_cards_total))
+                                .small()
+                                .color(dim),
+                        );
+                    }
                 });
 
             // ── (D) INSPECTOR dock — dryad inspectorPanels port. A scrollable
@@ -1093,6 +1135,15 @@ struct Stats {
     bones: u32,
     /// Swapchain resolution (width, height).
     resolution: (u32, u32),
+    /// Leaf-optimization live readout (so the LOD is OBSERVABLE — it's a no-op at
+    /// close framing by design). `opt_on` = master toggle; `cards_drawn/total` =
+    /// the density-LOD prefix; `density`/`impostor` are the current LOD fractions;
+    /// `shadows` = whether leaves still cast.
+    leaf_cards_drawn: u32,
+    leaf_cards_total: u32,
+    leaf_density: f32,
+    leaf_impostor: f32,
+    leaf_shadows: bool,
 }
 
 /// Auto-fit framing derived from the branch-mesh AABB.
@@ -1363,6 +1414,9 @@ struct App {
     /// Active left-panel CAS tab (Climate / Trunk / Branches / Leaves / Root).
     tab: Tab,
     last_frame: Instant,
+    /// Smoothed/throttled FPS meter (≈2 Hz display refresh) — same as the main
+    /// `enki` app, so the readout doesn't flicker every frame.
+    fps: FpsMeter,
     minimized: bool,
     /// Triangle/leaf/bone/draw-call counts from the last rebuild (cheap to cache).
     last_stats: (u32, u32, u32, u32),
@@ -1391,6 +1445,13 @@ struct App {
     /// `ShadowUniforms.params.w` and uploaded per-frame — OFF is byte-identical to
     /// today's look. `FLORA_DAPPLED=1` seeds it on for headless captures.
     dappled: bool,
+    /// "Leaf optimization" master toggle (default ON): the distance-driven leaf
+    /// LOD stack — card-count subsample, leaf-shadow drop, instanced draw, and the
+    /// billboard impostor far-tier. OFF forces the full per-card path at every
+    /// distance (the reference look). At the default close framing the toggle is a
+    /// no-op (NEAR band), so on/off there is pixel-identical. `FLORA_LEAFOPT=0|1`
+    /// seeds it for headless captures.
+    leaf_opt: bool,
     /// ponytail: HEADLESS SCREENSHOT mode. `Some(path)` when `FLORA_SCREENSHOT` is
     /// set → hide the egui panel, render a few warm-up frames, then capture the
     /// final composited frame into a PNG at `path` and exit 0. `frame_count` ticks
@@ -1415,20 +1476,24 @@ const SCREENSHOT_WARMUP_FRAMES: u32 = 45;
 
 impl App {
     fn new() -> Self {
-        let env = Env::default();
+        // The viewer's startup tree is the CANONICAL default — the SAME [`TreeSpec`]
+        // the in-planet app builds from — so the viewer and the planet agree. The
+        // FLORA_* env vars below only OVERRIDE this canonical base for headless
+        // capture; the interactive defaults all come from the spec.
+        let spec = TreeSpec::default_specimen();
+        let env = spec.env;
         // ponytail: FLORA_SEED (when set) picks a varied specimen via the SAME
         // random_genome(env, seed) path the panel/Space use, so a captured seed
-        // matches the interactive view. With NO FLORA_SEED we instead start from
-        // dryad's curated TREE_DEFAULT (brown furrowed bark + full green canopy)
-        // rather than random_genome(0) — whose raw `pigment` draw rolls a RANDOM
-        // hue (often blue/cyan) and density, giving a sparse oddly-colored default.
+        // matches the interactive view. With NO FLORA_SEED we start from the
+        // canonical spec genome (dryad's curated TREE_DEFAULT) rather than
+        // random_genome(0) — whose raw `pigment` draw rolls a random hue/density.
         let seed_env = std::env::var("FLORA_SEED")
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok());
         let seed = seed_env.unwrap_or(0);
         let genome = match seed_env {
             Some(s) => random_genome(&env, s),
-            None => presets::TREE_DEFAULT,
+            None => spec.genome,
         };
         // Screenshot mode: FLORA_SCREENSHOT=<output path> → headless capture + exit.
         let screenshot = std::env::var("FLORA_SCREENSHOT")
@@ -1486,18 +1551,19 @@ impl App {
             genome,
             env,
             mode,
-            // Initial leaf mode from FLORA_LEAFMODE (default Cluster), so a
-            // headless screenshot can capture the Single fan without the panel.
-            leaf_mode: LeafMode::from_env(),
-            // FLORA_LEAFDENSITY overrides the 0.7 default for headless capture of
-            // the smooth sparse→full range (slider still drives it interactively).
+            // Initial leaf mode = the canonical spec default (FLORA_LEAFMODE
+            // overrides it for headless capture). Tracks TreeSpec, not a hardcode.
+            leaf_mode: LeafMode::from_env_or(spec.leaf_mode),
+            // Render tuning from the canonical spec; FLORA_LEAFDENSITY overrides the
+            // density for headless capture (slider still drives it interactively).
             leaf_tuning: {
-                let mut t = LeafTuning::default();
+                let mut t = spec.leaf_tuning;
                 t.density = LeafTuning::density_from_env(t.density);
                 t
             },
             tab: Tab::Climate,
             last_frame: Instant::now(),
+            fps: FpsMeter::new(),
             minimized: false,
             last_stats: (0, 0, 0, 0),
             // Wind ON by default at a gentle strength (strength 0 = exact static).
@@ -1519,6 +1585,11 @@ impl App {
             dappled: std::env::var("FLORA_DAPPLED")
                 .map(|v| v != "0")
                 .unwrap_or(false),
+            // Leaf optimization ON by default; FLORA_LEAFOPT=0 forces the reference
+            // (full per-card) path for A/B capture.
+            leaf_opt: std::env::var("FLORA_LEAFOPT")
+                .map(|v| v != "0")
+                .unwrap_or(true),
             screenshot,
             screenshot_ui,
             frame_count: 0,
@@ -1764,10 +1835,21 @@ impl App {
             return;
         }
 
-        // Frame timing for the FPS stat.
+        // Frame timing. Raw `dt` drives motion/wind; the FPS readout is fed through
+        // the throttled FpsMeter (≈2 Hz avg) so it doesn't flicker every frame —
+        // same as the main `enki` app.
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32();
         self.last_frame = now;
+        self.fps.tick(dt);
+        let ft = self.fps.frame_time_s();
+        let (fps_val, frame_ms_val) = if ft > 0.0 {
+            (1.0 / ft, ft * 1000.0)
+        } else if dt > 0.0 {
+            (1.0 / dt, dt * 1000.0) // pre-first-window fallback
+        } else {
+            (0.0, 0.0)
+        };
 
         // Advance the wind clock from frame dt (accumulator, NOT wall-clock). Only
         // ticks while wind is animating, so toggling off freezes the phase too.
@@ -1782,14 +1864,31 @@ impl App {
                 (e.width, e.height)
             })
             .unwrap_or((0, 0));
+        // Leaf-optimization LIVE readout so the LOD is observable (it's a no-op at
+        // close framing by design → looks like "nothing" without this). Recompute
+        // the same LeafLod the render uses, from the orbit camera.
+        let (leaf_cards_total, leaf_lod_now) = match self.flora.as_ref() {
+            Some(f) => (
+                f.leaf_card_count(),
+                f.leaf_lod(self.orbit.camera().position, self.leaf_opt),
+            ),
+            None => (0, LeafLod::FULL),
+        };
+        let leaf_cards_drawn =
+            (leaf_lod_now.density_frac.clamp(0.0, 1.0) * leaf_cards_total as f32).round() as u32;
         let stats = Stats {
-            fps: if dt > 0.0 { 1.0 / dt } else { 0.0 },
-            frame_ms: dt * 1000.0,
+            fps: fps_val,
+            frame_ms: frame_ms_val,
             triangles: self.last_stats.0,
             draw_calls: self.last_stats.3,
             leaves: self.last_stats.1,
             bones: self.last_stats.2,
             resolution,
+            leaf_cards_drawn,
+            leaf_cards_total,
+            leaf_density: leaf_lod_now.density_frac,
+            leaf_impostor: leaf_lod_now.impostor_blend,
+            leaf_shadows: leaf_lod_now.cast_leaf_shadows,
         };
 
         // ── Build the egui panel BEFORE begin_frame (texture upload one-shots
@@ -1821,6 +1920,7 @@ impl App {
                 &mut self.bloom_on,
                 &mut self.bloom_strength,
                 &mut self.dappled,
+                &mut self.leaf_opt,
                 self.flora.as_ref(),
                 &stats,
             );
@@ -1862,6 +1962,15 @@ impl App {
         let wind_strength = if self.wind_on { self.wind_strength } else { 0.0 };
         let wind_d = Vec3::new(self.wind_dir.x, 0.0, self.wind_dir.z).normalize_or(Vec3::X);
         let wind = [self.wind_clock, wind_strength, wind_d.x, wind_d.z];
+
+        // Distance-driven leaf LOD for this frame (the "Leaf optimization" toggle).
+        // Computed once and shared by the shadow caster + lit pass so the cast
+        // silhouette tracks the drawn cards. FULL when there's no tree / toggle off.
+        let leaf_lod = self
+            .flora
+            .as_ref()
+            .map(|f| f.leaf_lod(camera_world_pos, self.leaf_opt))
+            .unwrap_or(LeafLod::FULL);
 
         // ── Sun shadow light matrix + uniforms. The sun is FrameUniforms.sun0
         //    (dryad's shadow-casting DirectionalLight); fit the ortho frustum to
@@ -1966,7 +2075,7 @@ impl App {
             (self.flora_renderer.as_mut(), self.flora.as_ref(), light_vp)
         {
             renderer.begin_shadow_pass(rhi, fi);
-            if let Err(e) = flora.record_shadow(rhi, renderer, fi, lvp, wind) {
+            if let Err(e) = flora.record_shadow(rhi, renderer, fi, lvp, wind, leaf_lod) {
                 log::error!("FloraView::record_shadow error: {e}");
             }
             renderer.end_shadow_pass(rhi, fi);
@@ -2041,7 +2150,7 @@ impl App {
             (self.flora_renderer.as_ref(), self.flora.as_mut())
         {
             // Same `wind` vec4 the shadow caster used → cast silhouette matches.
-            if let Err(e) = flora.record(rhi, renderer, fi, camera_world_pos, wind) {
+            if let Err(e) = flora.record(rhi, renderer, fi, camera_world_pos, wind, leaf_lod) {
                 log::error!("FloraView::record error: {e}");
             }
         }
@@ -2050,8 +2159,24 @@ impl App {
             (self.flora_renderer.as_ref(), self.flora.as_mut())
         {
             // Same `wind` vec4 the shadow caster used → cast silhouette matches.
-            if let Err(e) = flora.record(rhi, renderer, fi, camera_world_pos, wind) {
+            if let Err(e) = flora.record(rhi, renderer, fi, camera_world_pos, wind, leaf_lod) {
                 log::error!("FloraView::record error: {e}");
+            }
+        }
+        // ── LEAF IMPOSTOR far-tier (#3): a camera-facing billboard that crossfades
+        //    in as the cards thin out with distance (LeafLod::impostor_blend).
+        //    Alpha-blended, drawn AFTER the tree so it composites over the (now
+        //    sparse) canopy. Camera basis from the orbit so the quad faces us. ──
+        if leaf_lod.impostor_blend > 0.0 {
+            if let (Some(renderer), Some(flora)) =
+                (self.flora_renderer.as_ref(), self.flora.as_ref())
+            {
+                let (cam_right, cam_up, _) = self.orbit.basis();
+                if let Err(e) = flora.record_impostor(
+                    rhi, renderer, fi, camera_world_pos, cam_right, cam_up, leaf_lod.impostor_blend,
+                ) {
+                    log::error!("FloraView::record_impostor error: {e}");
+                }
             }
         }
         // ── WIND GIZMO: a flora-owned unlit arrow at the tree base pointing along

@@ -39,6 +39,7 @@ pub mod third_person;
 pub mod terrain_grid;
 pub mod surface_picker;
 pub mod nav_mode;
+pub mod space;
 
 // Re-export the main public surface.
 // `#[allow(unused_imports)]` silences warnings when main.rs has not yet wired

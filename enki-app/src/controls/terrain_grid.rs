@@ -23,6 +23,21 @@ use enki_planet::face_bases::{cube_to_sphere, FACE_BASES};
 use enki_planet::height::HeightField;
 use glam::DVec3;
 
+use super::PLANET_RADIUS;
+
+/// **The single source of truth for grounding.** The radius of the *rendered*
+/// (grid-faceted) terrain along `dir`, at the canonical planet radius + Nanite
+/// bake resolution. Everything that sits on the ground — the character's feet,
+/// scattered trees, future props — must ride THIS, so they agree with each other
+/// and with the drawn mesh. Wraps [`grid_surface_radius`] (the parameterized impl;
+/// tests/tools that need a custom radius or resolution call that directly).
+///
+/// Grounding against the analytic field instead (`first_person::surface_radius`)
+/// makes objects dive into sub-cell detail the mesh never draws — see module docs.
+pub fn ground_radius(hf: &dyn HeightField, height_scale: f64, dir: DVec3) -> f64 {
+    grid_surface_radius(hf, PLANET_RADIUS, height_scale, crate::NANITE_BAKE_RES, dir)
+}
+
 /// Radius (m) of the rendered terrain mesh along unit `dir`, reproducing the
 /// Nanite tessellator at `grid_res` quads per face side (level 0).
 pub fn grid_surface_radius(

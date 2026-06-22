@@ -2,6 +2,8 @@
 
 use glam::DVec3;
 
+use crate::climate::WindSample;
+
 /// Provides elevation and biome data for any point on the planet surface.
 ///
 /// Implementors must be `Send + Sync` so they can be shared across worker threads.
@@ -32,5 +34,18 @@ pub trait HeightField: Send + Sync {
     /// Volcano-cone influence 0..1 (arc + hotspot) — debug "volcano" view. Default 0.0.
     fn volcanism(&self, _dir: DVec3) -> f32 {
         0.0
+    }
+
+    /// Baked wind speed 0..1 along `dir` (drives ocean wave height/intensity).
+    /// Default 0.5 (neutral) for height fields without a climate bake.
+    fn wind_speed_at(&self, _dir: DVec3) -> f32 {
+        0.5
+    }
+
+    /// Baked wind velocity sample (tangent-plane direction + speed) along `dir`.
+    /// Drives the wind-streakline overlay. Default neutral (zero) — no flow shown
+    /// for height fields without a climate bake.
+    fn wind_at(&self, _dir: DVec3) -> WindSample {
+        WindSample::default()
     }
 }

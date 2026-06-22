@@ -63,12 +63,31 @@ pub struct UiOutput {
     pub wave_choppiness: f32,
     /// Jacobian value below which whitecap foam forms.
     pub wave_foam: f32,
+    /// Show procedural trees on the surface (Phase B flora).
+    pub flora_enabled: bool,
+    /// Fraction of candidate cells that get a tree (0..1).
+    pub flora_density: f32,
     /// Cycle nav mode (same as Tab).
     pub cycle_nav: bool,
     /// Exit the surface walker back to orbit (same as Esc).
     pub exit_surface: bool,
     /// User dismissed the load-stats popup this frame.
     pub dismiss_load_stats: bool,
+    /// Sim time scale (sim-seconds per real-second) — drives orbits + day/night.
+    pub time_scale: f64,
+    /// Pause sim time (orbits + day/night freeze).
+    pub paused: bool,
+    /// Draw the wind streakline overlay.
+    pub wind_enabled: bool,
+    /// Wind overlay tunables (speed / width / altitude / gust / intensity).
+    pub wind: crate::wind::WindParams,
+    /// Draw the atmosphere shell.
+    pub atmo_enabled: bool,
+    /// Atmosphere tunables (height + density).
+    pub atmo: crate::atmosphere::AtmoParams,
+    /// Reference markers: pole spikes / equator ring.
+    pub markers_poles: bool,
+    pub markers_equator: bool,
 }
 
 // ── EguiState ─────────────────────────────────────────────────────────────
@@ -176,6 +195,17 @@ impl EguiState {
         wave_enabled:      bool,
         wave_choppiness:   f32,
         wave_foam:         f32,
+        flora_available:   bool,
+        flora_enabled:     bool,
+        flora_density:     f32,
+        time_scale:        f64,
+        paused:            bool,
+        wind_enabled:      bool,
+        wind:              crate::wind::WindParams,
+        atmo_enabled:      bool,
+        atmo:              crate::atmosphere::AtmoParams,
+        markers_poles:     bool,
+        markers_equator:   bool,
         stress_stats:      Option<&str>,
         planet_stats:      Option<&PlanetViewStats>,
         load_stats:        Option<&LoadTimings>,
@@ -193,6 +223,16 @@ impl EguiState {
             wave_enabled,
             wave_choppiness,
             wave_foam,
+            flora_enabled,
+            flora_density,
+            time_scale,
+            paused,
+            wind_enabled,
+            wind,
+            atmo_enabled,
+            atmo,
+            markers_poles,
+            markers_equator,
             cycle_nav: false,
             exit_surface: false,
             dismiss_load_stats: false,
@@ -226,6 +266,16 @@ impl EguiState {
                     CollapsingHeader::new("Performance").default_open(true).show(ui, |ui| {
                         let fps = if frame_time_s > 0.0 { 1.0 / frame_time_s } else { 0.0 };
                         ui.label(format!("FPS: {fps:.0}   ({:.2} ms)", frame_time_s * 1000.0));
+                    });
+
+                    // ── Time (orbits + day/night speed) ──────────────────────
+                    CollapsingHeader::new("Time").default_open(false).show(ui, |ui| {
+                        ui.checkbox(&mut out.paused, "Pause");
+                        ui.add(
+                            egui::Slider::new(&mut out.time_scale, 60.0..=300_000.0)
+                                .logarithmic(true)
+                                .text("Sim speed (×real)"),
+                        );
                     });
 
                     // ── View ─────────────────────────────────────────────────
@@ -279,6 +329,51 @@ impl EguiState {
                             out.wave_enabled,
                             egui::Slider::new(&mut out.wave_foam, 0.0..=1.0).text("Foam amount"),
                         );
+                    });
+
+                    // ── Wind ─────────────────────────────────────────────────
+                    CollapsingHeader::new("Wind").default_open(true).show(ui, |ui| {
+                        ui.checkbox(&mut out.wind_enabled, "Show wind streaks");
+                        ui.add_enabled(out.wind_enabled,
+                            egui::Slider::new(&mut out.wind.speed, 0.0..=0.4).text("Speed"));
+                        ui.add_enabled(out.wind_enabled,
+                            egui::Slider::new(&mut out.wind.width, 0.0005..=0.006).text("Streak width"));
+                        ui.add_enabled(out.wind_enabled,
+                            egui::Slider::new(&mut out.wind.altitude, 0.0..=8000.0).text("Altitude (m)"));
+                        ui.add_enabled(out.wind_enabled,
+                            egui::Slider::new(&mut out.wind.gust, 0.0..=1.5).text("Gust"));
+                        ui.add_enabled(out.wind_enabled,
+                            egui::Slider::new(&mut out.wind.intensity, 0.0..=2.0).text("Intensity"));
+                    });
+
+                    // ── Atmosphere ───────────────────────────────────────────
+                    CollapsingHeader::new("Atmosphere").default_open(true).show(ui, |ui| {
+                        ui.checkbox(&mut out.atmo_enabled, "Show atmosphere");
+                        ui.add_enabled(out.atmo_enabled,
+                            egui::Slider::new(&mut out.atmo.height, 200.0..=8000.0).text("Height (m)"));
+                        ui.add_enabled(out.atmo_enabled,
+                            egui::Slider::new(&mut out.atmo.density, 0.0..=2.0).text("Density"));
+                    });
+
+                    // ── Reference markers ────────────────────────────────────
+                    CollapsingHeader::new("Reference").default_open(false).show(ui, |ui| {
+                        ui.checkbox(&mut out.markers_equator, "Equator");
+                        ui.checkbox(&mut out.markers_poles, "Poles + axis");
+                    });
+
+                    // ── Trees (flora) ────────────────────────────────────────
+                    CollapsingHeader::new("Trees").default_open(true).show(ui, |ui| {
+                        ui.add_enabled_ui(flora_available, |ui| {
+                            ui.checkbox(&mut out.flora_enabled, "Show trees (surface)");
+                            ui.add_enabled(
+                                out.flora_enabled,
+                                egui::Slider::new(&mut out.flora_density, 0.0..=1.0)
+                                    .text("Density"),
+                            );
+                        });
+                        if !flora_available {
+                            ui.small("Built without the `flora` feature.");
+                        }
                     });
 
                     // ── Nanite ───────────────────────────────────────────────

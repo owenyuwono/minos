@@ -31,3 +31,8 @@ pub mod flora_nanite;
 // Lives behind `flora` alongside flora_view; deleting flora drops both.
 #[cfg(feature = "flora")]
 pub mod staging;
+
+// Smoothed/throttled FPS meter, shared with the `flora_viewer` binary so its
+// Stats readout refreshes ~2 Hz instead of flickering every frame (same as the
+// main `enki` app). Generic (no flora dep).
+pub mod fps;

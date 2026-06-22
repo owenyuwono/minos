@@ -111,11 +111,19 @@ pub enum LeafMode {
 
 impl LeafMode {
     /// Parse `FLORA_LEAFMODE` (screenshot env). `single` ⇒ Single, anything else
-    /// (incl. unset/`cluster`) ⇒ Cluster.
+    /// (incl. unset/`cluster`) ⇒ Cluster. Prefer [`from_env_or`] so the unset
+    /// default comes from the canonical [`TreeSpec`], not a hardcoded Cluster.
     pub fn from_env() -> Self {
+        Self::from_env_or(LeafMode::Cluster)
+    }
+
+    /// Parse `FLORA_LEAFMODE`, falling back to `default` when the var is unset (so
+    /// the viewer's startup leaf mode tracks the canonical [`TreeSpec`] default).
+    pub fn from_env_or(default: Self) -> Self {
         match std::env::var("FLORA_LEAFMODE").ok().as_deref() {
             Some(v) if v.eq_ignore_ascii_case("single") => LeafMode::Single,
-            _ => LeafMode::Cluster,
+            Some(v) if v.eq_ignore_ascii_case("cluster") => LeafMode::Cluster,
+            _ => default,
         }
     }
 }
@@ -179,9 +187,67 @@ impl Default for LeafTuning {
             // ponytail: smaller default leaf reads proportional to the tree.
             size: 1.0,
             // ponytail: render-side subsample default (smooth, not the gene cliff).
-            density: 0.7,
+            // 0.7 read too dense on top of the gene; 0.55 thins to a natural canopy.
+            density: 0.55,
         }
     }
+}
+
+/// Distance-driven leaf level-of-detail — the "Leaf optimization" toggle. Every
+/// field collapses to the full-quality path when `enabled == false` (or the tree
+/// is close), so toggling at close range is pixel-identical: the volumetric
+/// per-card canopy is preserved exactly where you can actually see it, and the
+/// cheaper representations only kick in with distance.
+///
+/// Computed by [`FloraView::leaf_lod`] from the camera distance in units of the
+/// tree's bounding radius. Drives: card-count subsample (#2), leaf-shadow drop
+/// (#4), and the impostor crossfade (#3). Instancing (#1) is orthogonal (a draw
+/// path, not a quality knob) and gated by the same master `enabled`.
+#[derive(Clone, Copy, Debug)]
+pub struct LeafLod {
+    /// Fraction of leaf cards to draw: 1.0 = all (near) → `MIN_DENSITY` (far).
+    pub density_frac: f32,
+    /// Whether leaves still cast shadows (dropped past mid distance — a tiny
+    /// distant tree's leaf shadows are sub-pixel, so the cost is pure waste).
+    pub cast_leaf_shadows: bool,
+    /// Impostor crossfade: 0 = cards only (near) → 1 = billboard only (far).
+    pub impostor_blend: f32,
+}
+
+impl LeafLod {
+    /// The full-quality path (toggle OFF / near): all cards, shadows on, no
+    /// impostor. Byte-identical to the pre-optimization render.
+    pub const FULL: LeafLod = LeafLod { density_frac: 1.0, cast_leaf_shadows: true, impostor_blend: 0.0 };
+}
+
+/// Scalar smoothstep (glam only has the vector form). Hermite ease on `[e0,e1]`.
+#[inline]
+fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0).max(1e-6)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Indices per leaf card = `SEG`(6) segments × 6 (two CCW tris). The density-LOD
+/// prefix-draw works in whole cards, so it needs this to map a card count to an
+/// index count. `build_leaf_mesh` asserts `SEG*6 == LEAF_INDICES_PER_CARD`.
+const LEAF_INDICES_PER_CARD: u32 = 36;
+
+/// Build the unit impostor quad (±1 in xy, z=0) in the 4×vec3 layout. uv spans
+/// [0,1]² (the FS reads it for the radial canopy blob); nrm/attr are dummies.
+fn build_impostor_quad(rhi: &mut Rhi) -> Result<GpuMesh, RhiError> {
+    let pos: [f32; 12] = [-1.0, -1.0, 0.0, 1.0, -1.0, 0.0, -1.0, 1.0, 0.0, 1.0, 1.0, 0.0];
+    let nrm: [f32; 12] = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0];
+    let uv: [f32; 12] = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
+    let attr: [f32; 12] = [0.0; 12];
+    let idx: [u32; 6] = [0, 1, 2, 2, 1, 3];
+    Ok(GpuMesh {
+        pos: rhi.create_vertex_buffer(bytemuck::cast_slice(&pos))?,
+        nrm: rhi.create_vertex_buffer(bytemuck::cast_slice(&nrm))?,
+        uv: rhi.create_vertex_buffer(bytemuck::cast_slice(&uv))?,
+        attr: rhi.create_vertex_buffer(bytemuck::cast_slice(&attr))?,
+        idx: rhi.create_index_buffer(&idx)?,
+        index_count: 6,
+    })
 }
 
 /// `BranchPush` mirror (flora.wgsl) — 128 bytes: model + wind + 3 bark vec4s.
@@ -222,6 +288,15 @@ struct LeafPush {
     wind: [f32; 4],
 }
 
+/// `ImpostorPush` mirror (staging.wgsl) — 80 bytes: camera-facing billboard model
+/// + (rgb canopy pigment, crossfade alpha). Drawn alpha-blended in the scene pass.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct ImpostorPush {
+    model: [[f32; 4]; 4],
+    color: [f32; 4], // rgb = pigment (linear HDR); w = crossfade alpha
+}
+
 /// One uploaded indexed mesh in the 4×vec3 layout (positions/normals/uv3/attr3).
 struct GpuMesh {
     pos: BufferHandle,
@@ -245,7 +320,15 @@ pub struct FloraView {
     mode: RenderMode,
     leaf_mode: LeafMode,
     branch: GpuMesh,
+    /// Branch frame streams (locations 4,5) for the seamless bark coordinate —
+    /// bound only on the lit branch draw. `aTangent` = branch axis, `aFrameU` =
+    /// cross-section basis (parallel-transported, inherited across forks).
+    branch_tangent: BufferHandle,
+    branch_frame_u: BufferHandle,
     leaf: Option<GpuMesh>, // None when the tree has zero leaf cards
+    /// Unit quad (±1 in xy) for the far-distance impostor billboard. Built once;
+    /// `record_impostor` orients/scales it camera-facing per frame.
+    impostor_quad: GpuMesh,
     origin: DVec3,
     bark0: [f32; 4],          // (bark_hue, bark_lightness, bark_relief, bark_lenticels)
     bark1: [f32; 4],          // (bark_scale, bark_orient, bark_plates, bark_shed)
@@ -265,7 +348,126 @@ pub struct FloraView {
     wind_scratch: Vec<f32>,
 }
 
+/// The curated default specimen (dryad `TREE_DEFAULT`): brown furrowed bark + a
+/// full green canopy. Lives here (not the viewer's `presets`) so BOTH the
+/// standalone viewer and the in-planet app draw the exact same default tree; the
+/// viewer's `presets` re-exports this and spreads its other presets from it.
+pub const TREE_DEFAULT: Genome = Genome {
+    branchiness: 0.92,
+    branch_factor_n: 0.65,
+    tillering: 0.0,
+    radial_order: 0.55,
+    appendage_breadth: 0.45,
+    appendage_density: 0.15,  // realistic full canopy; 0.99 saturated the leaf budget into a solid blob
+    segmentation: 0.35,
+    succulence: 0.12,
+    stem_girth: 0.68,
+    taper: 0.72,
+    rigidity: 0.40,
+    verticality: 0.50,
+    ribbing: 0.0,
+    spininess: 0.0,
+    branch_angle: 0.60,
+    length_ratio: 0.70,
+    apical_bias: 0.75,
+    droop_bias: 0.0,
+    pigment: 0.33,
+    leaf_size: 1.0,
+    jitter: 1.0,
+    leaf_width: 0.50,
+    leaf_length: 0.45,
+    leaf_tip: 0.40,
+    leaf_serration: 0.0,
+    leaf_lobing: 0.0,
+    leaf_skew: 0.50,
+    bark_hue: 1.0,
+    bark_lightness: 0.22,
+    bark_relief: 1.0,
+    bark_lenticels: 0.0,
+    bark_scale: 0.50,
+    bark_orient: 0.70,
+    bark_plates: 0.45,
+    bark_shed: 0.0,
+    bark_under_hue: 0.75,
+    weep: 0.0,
+    trunk_height: 0.50,
+    flatness: 0.0,
+    stem_spread: 0.0,
+    rosette: 0.0,
+    woodiness: 1.0,
+    whorl: 0.0,
+    crown_start: 1.0,
+    tip_tuft: 0.0,
+    leaf_division: 0.0,
+    frond_fan: 0.0,
+    phototropism: 1.0,
+    trunk_taper: 0.0,
+    structural_seed: 1337,
+    root_count: 0.50,
+    root_depth: 0.40,
+    root_spread: 0.55,
+    root_flare: 0.35,
+    root_buttress: 0.10,
+    root_branchiness: 0.45,
+    root_taper: 0.50,
+};
+
+/// The canonical default tree SPECIFICATION — genome + climate env + leaf mode +
+/// render tuning. The SINGLE SOURCE OF TRUTH for "the default specimen": both the
+/// standalone `flora_viewer` (its startup tree) and the in-planet `enki-app` (its
+/// scattered trees) build from this, so they can't diverge. Change a default here
+/// → both follow. All fields are `Copy`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TreeSpec {
+    pub genome: Genome,
+    pub env: Env,
+    pub leaf_mode: LeafMode,
+    pub leaf_tuning: LeafTuning,
+}
+
+impl TreeSpec {
+    /// The curated default specimen: [`TREE_DEFAULT`] genome, neutral climate,
+    /// CLUSTERED leaves (`LeafMode::default()` — dryad's default + the viewer's
+    /// startup mode), default render tuning. (The in-planet path used `Single`
+    /// before — unified to Cluster here so the planet matches the viewer.)
+    pub fn default_specimen() -> Self {
+        Self {
+            genome: TREE_DEFAULT,
+            env: Env::default(),
+            leaf_mode: LeafMode::default(),
+            leaf_tuning: LeafTuning::default(),
+        }
+    }
+}
+
+impl Default for TreeSpec {
+    fn default() -> Self {
+        Self::default_specimen()
+    }
+}
+
 impl FloraView {
+    /// Build the canonical default specimen ([`TreeSpec::default_specimen`]) at
+    /// `origin`. The in-planet app AND the viewer's startup BOTH go through this
+    /// (via [`TreeSpec`]), so the planet tree and the viewer's initial tree are
+    /// guaranteed identical.
+    pub fn default_specimen(rhi: &mut Rhi, origin: DVec3) -> Result<Self, RhiError> {
+        Self::from_spec(rhi, &TreeSpec::default_specimen(), origin)
+    }
+
+    /// Build a tree from a [`TreeSpec`] at `origin` — the ONE entry point both the
+    /// viewer and the in-planet app use for the default tree, so they can't drift.
+    pub fn from_spec(rhi: &mut Rhi, spec: &TreeSpec, origin: DVec3) -> Result<Self, RhiError> {
+        Self::from_genome_with_mode_tuned(
+            rhi,
+            &spec.genome,
+            &spec.env,
+            origin,
+            spec.leaf_mode,
+            spec.leaf_tuning,
+        )
+    }
+
     /// Build the one tree: resolve `seed`, mesh it, upload buffers. `origin` is
     /// the tree's f64 world position (surface point). Pipelines live in the
     /// flora-owned `FloraRenderer`, not here.
@@ -417,6 +619,12 @@ impl FloraView {
             idx: rhi.create_index_buffer(&bm.indices)?,
             index_count: bm.indices.len() as u32,
         };
+        // Branch FRAME streams (locations 4,5) for the seamless bark coordinate:
+        // aTangent = branch axis, aFrameU = cross-section basis (both already vec3-
+        // packed by the mesher). Bound only on the LIT branch draw (the depth caster
+        // doesn't sample bark, stays 4-stream).
+        let branch_tangent = rhi.create_vertex_buffer(bytemuck::cast_slice(&bm.tangents))?;
+        let branch_frame_u = rhi.create_vertex_buffer(bytemuck::cast_slice(&bm.frame_us))?;
         let bounds = (bm.bounds.min, bm.bounds.max);
         let bone_count = resolved.graph.bones.len() as u32;
 
@@ -498,11 +706,18 @@ impl FloraView {
         //    module only meshes + uploads + holds the per-tree appearance genes;
         //    `record` borrows the renderer's pipelines. ──
 
+        // Impostor billboard: a unit quad (±1 in xy), 4×vec3 layout. Oriented +
+        // scaled camera-facing per frame in `record_impostor`.
+        let impostor_quad = build_impostor_quad(rhi)?;
+
         Ok(Self {
             mode: RenderMode::default(),
             leaf_mode,
             branch,
+            branch_tangent,
+            branch_frame_u,
             leaf,
+            impostor_quad,
             origin,
             bark0,
             bark1,
@@ -549,12 +764,24 @@ impl FloraView {
     /// (before the shadow + scene passes) and pass the result to
     /// `FloraRenderer::set_bone_matrices`.
     pub fn solve_wind(&mut self, wind: [f32; 4]) -> &[f32] {
+        // The branch skin applies each bone matrix in TREE-LOCAL space and THEN
+        // rotates by the model basis m3 (vs_branch: `m3 * windSkinPosition(...)`).
+        // The solver builds its sway axis = cross(+Y, windDir) from the dir we
+        // pass, so that dir must be in TREE-LOCAL coords — otherwise m3 swings the
+        // branches off-axis from the world wind. (Leaves dodged this because they
+        // add their gust in WORLD space, after m3 — which is exactly why leaves
+        // followed the wind but branches didn't.) Rotate world windDir → local by
+        // m3⁻¹ so that after m3 the branch sway lands on the world wind direction.
+        // ponytail: drops any local-Y component (only nonzero if the tree is tilted
+        // on a planet surface); exact when up=+Y, which is the viewer's placement.
+        let world_dir = Vec3::new(wind[2], 0.0, wind[3]);
+        let local_dir = self.rotation_quat().inverse() * world_dir;
         self.wind_solver.solve_into(
             &mut self.wind_scratch,
             wind[0] as f64,
             wind[1] as f64,
-            wind[2] as f64,
-            wind[3] as f64,
+            local_dir.x as f64,
+            local_dir.z as f64,
         );
         &self.wind_scratch
     }
@@ -584,6 +811,13 @@ impl FloraView {
         self.leaf_count
     }
 
+    /// Number of leaf CARDS actually in the built mesh (after twigs-only + the
+    /// render-side density subsample). The density-LOD draws a prefix of these;
+    /// the viewer reports `drawn = density_frac * this` so the LOD is observable.
+    pub fn leaf_card_count(&self) -> u32 {
+        self.leaf.as_ref().map(|l| l.index_count / LEAF_INDICES_PER_CARD).unwrap_or(0)
+    }
+
     /// Skeleton bone count.
     pub fn bone_count(&self) -> u32 {
         self.bone_count
@@ -600,6 +834,38 @@ impl FloraView {
     /// to frame the tree (auto-fit the orbit distance to the mesh extent).
     pub fn local_bounds(&self) -> ([f32; 3], [f32; 3]) {
         self.bounds
+    }
+
+    /// Characteristic radius (half the local AABB diagonal) — the unit the leaf
+    /// LOD measures camera distance in, so the bands are tree-size-relative.
+    pub fn bounding_radius(&self) -> f32 {
+        let (mn, mx) = self.bounds;
+        let (dx, dy, dz) = (mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]);
+        0.5 * (dx * dx + dy * dy + dz * dz).sqrt()
+    }
+
+    /// Distance-driven leaf LOD for this frame (the "Leaf optimization" master
+    /// toggle). `enabled == false` forces [`LeafLod::FULL`] (byte-identical to the
+    /// pre-optimization render). Distance is in tree-radii so the bands hold for
+    /// any species size; tuned so the viewer's default auto-fit framing sits in
+    /// the full-quality NEAR band (toggle is a no-op there — look preserved).
+    pub fn leaf_lod(&self, camera_world_pos: DVec3, enabled: bool) -> LeafLod {
+        if !enabled {
+            return LeafLod::FULL;
+        }
+        let dist = (self.origin - camera_world_pos).length() as f32;
+        let d = dist / self.bounding_radius().max(1e-3); // distance in tree-radii
+        const NEAR: f32 = 5.0; // full detail within this many radii
+        const MID: f32 = 10.0; // leaf shadows drop beyond this
+        const FAR: f32 = 22.0; // density floor / impostor crossover beyond this
+        const MIN_DENSITY: f32 = 0.12;
+        let impostor_blend = smoothstep(FAR, FAR * 1.7, d);
+        // Cards thin with distance AND fade out as the impostor fades in, so the
+        // crossfade conserves coverage (no double-drawn canopy, no gap).
+        let density_frac =
+            (1.0 - smoothstep(NEAR, FAR, d) * (1.0 - MIN_DENSITY)) * (1.0 - impostor_blend);
+        let cast_leaf_shadows = d < MID;
+        LeafLod { density_frac, cast_leaf_shadows, impostor_blend }
     }
 
     /// The branch-mesh AABB in the tree-LOCAL WORLD frame (after the model
@@ -646,14 +912,16 @@ impl FloraView {
         fi: u32,
         camera_world_pos: DVec3,
         wind: [f32; 4],
+        lod: LeafLod,
     ) -> Result<(), RhiError> {
         self.record_branch(rhi, renderer, fi, camera_world_pos, wind)?;
-        self.record_leaves(rhi, renderer, fi, camera_world_pos, wind)
+        self.record_leaves(rhi, renderer, fi, camera_world_pos, wind, lod)
     }
 
     /// Record ONLY the branch mesh through the plain flora branch pipeline. Split
     /// out of `record` so the Nanite branch path can draw the branches itself (its
     /// own cull+draw) while the leaves still render as cards via `record_leaves`.
+    /// Draws at the tree's own surface-placed model (`self.origin`).
     pub fn record_branch(
         &mut self,
         rhi: &mut Rhi,
@@ -666,6 +934,54 @@ impl FloraView {
         // translate by (origin - camera) in f64 then cast f32 (no big-coord f32
         // cancellation). ponytail: surface normal = radial (planet-centred) dir.
         let model = self.model(camera_world_pos);
+        self.draw_branch(rhi, renderer, fi, model, wind)
+    }
+
+    /// Record ONLY the leaf cards. Used both by `record` (full tree) and by the
+    /// Nanite branch path (which draws the branches via Nanite, then the leaves
+    /// here unchanged — Nanite is for the branch geometry only).
+    pub fn record_leaves(
+        &mut self,
+        rhi: &mut Rhi,
+        renderer: &FloraRenderer,
+        fi: u32,
+        camera_world_pos: DVec3,
+        wind: [f32; 4],
+        lod: LeafLod,
+    ) -> Result<(), RhiError> {
+        let model = self.model(camera_world_pos);
+        self.draw_leaves(rhi, renderer, fi, model, wind, lod)
+    }
+
+    /// Draw the whole tree (branch + leaves) at an EXPLICIT camera-relative model.
+    /// The scatter path uses this to place ONE shared species mesh at many
+    /// (origin, yaw, scale) without per-instance geometry. `model`'s 3×3 must be a
+    /// similarity (orthonormal basis × uniform scale) — `fs_branch` normalizes the
+    /// transformed normal, so uniform scale is safe.
+    pub fn record_at(
+        &self,
+        rhi: &mut Rhi,
+        renderer: &FloraRenderer,
+        fi: u32,
+        model: Mat4,
+        wind: [f32; 4],
+    ) -> Result<(), RhiError> {
+        self.draw_branch(rhi, renderer, fi, model, wind)?;
+        // Scatter path: full-quality leaves for now (per-instance LOD is a forest
+        // concern handled by the scatter, not the single-tree toggle).
+        self.draw_leaves(rhi, renderer, fi, model, wind, LeafLod::FULL)
+    }
+
+    /// Branch draw at a given camera-relative `model` (shared by `record_branch`
+    /// and `record_at`).
+    fn draw_branch(
+        &self,
+        rhi: &mut Rhi,
+        renderer: &FloraRenderer,
+        fi: u32,
+        model: Mat4,
+        wind: [f32; 4],
+    ) -> Result<(), RhiError> {
         let wire = self.mode.is_wireframe();
         let dbg = self.mode.debug_mode();
 
@@ -684,9 +1000,16 @@ impl FloraView {
             bark1: self.bark1,
             bark2,
         };
-        rhi.bind_vertex_buffers(
+        rhi.bind_vertex_buffers_slice(
             fi,
-            &[self.branch.pos, self.branch.nrm, self.branch.uv, self.branch.attr],
+            &[
+                self.branch.pos,
+                self.branch.nrm,
+                self.branch.uv,
+                self.branch.attr,
+                self.branch_tangent, // location 4: aTangent (branch axis)
+                self.branch_frame_u, // location 5: aFrameU (cross-section basis)
+            ],
         )?;
         rhi.bind_index_buffer(fi, self.branch.idx)?;
         renderer.push(rhi, fi, bytemuck::bytes_of(&bpush));
@@ -694,22 +1017,31 @@ impl FloraView {
         Ok(())
     }
 
-    /// Record ONLY the leaf cards. Used both by `record` (full tree) and by the
-    /// Nanite branch path (which draws the branches via Nanite, then the leaves
-    /// here unchanged — Nanite is for the branch geometry only).
-    pub fn record_leaves(
-        &mut self,
+    /// Leaf draw at a given camera-relative `model` (shared by `record_leaves` and
+    /// `record_at`). `lod` applies the distance density subsample (#2): it draws a
+    /// PREFIX of the leaf index buffer, whose card blocks are hash-shuffled at
+    /// build, so a prefix is a spatially-uniform subset (not "one branch thins
+    /// first"). `density_frac == 1.0` ⇒ the full count ⇒ byte-identical canopy.
+    fn draw_leaves(
+        &self,
         rhi: &mut Rhi,
         renderer: &FloraRenderer,
         fi: u32,
-        camera_world_pos: DVec3,
+        model: Mat4,
         wind: [f32; 4],
+        lod: LeafLod,
     ) -> Result<(), RhiError> {
-        let model = self.model(camera_world_pos);
         let wire = self.mode.is_wireframe();
         let dbg = self.mode.debug_mode();
 
         if let Some(leaf) = &self.leaf {
+            // Density-LOD: convert the fraction into a whole-card prefix length.
+            let card_count = leaf.index_count / LEAF_INDICES_PER_CARD;
+            let cards = (lod.density_frac.clamp(0.0, 1.0) * card_count as f32).round() as u32;
+            let draw_idx = (cards * LEAF_INDICES_PER_CARD).min(leaf.index_count);
+            if draw_idx == 0 {
+                return Ok(()); // fully thinned (or impostor covers) → no card draw
+            }
             let leaf_pipe = if wire { FloraPipeline::LeafWire } else { FloraPipeline::Leaf };
             renderer.bind(rhi, fi, leaf_pipe);
             rhi.set_viewport_scissor_full(fi);
@@ -728,7 +1060,7 @@ impl FloraView {
             rhi.bind_vertex_buffers(fi, &[leaf.pos, leaf.nrm, leaf.uv, leaf.attr])?;
             rhi.bind_index_buffer(fi, leaf.idx)?;
             renderer.push(rhi, fi, bytemuck::bytes_of(&lpush));
-            rhi.draw_indexed(fi, leaf.index_count);
+            rhi.draw_indexed(fi, draw_idx);
         }
         Ok(())
     }
@@ -758,12 +1090,13 @@ impl FloraView {
         fi: u32,
         light_view_proj: Mat4,
         wind: [f32; 4],
+        lod: LeafLod,
     ) -> Result<(), RhiError> {
         let rot = self.rotation_quat();
         let lvp = light_view_proj.to_cols_array_2d();
         let rot4 = [rot.x, rot.y, rot.z, rot.w];
 
-        // ── Branch depth caster ──
+        // ── Branch depth caster ── (branches always cast; they're the trunk)
         renderer.bind_depth(rhi, fi, FloraPipeline::BranchDepth);
         let bpush = BranchDepthPush {
             light_view_proj: lvp,
@@ -779,21 +1112,91 @@ impl FloraView {
         rhi.draw_indexed(fi, self.branch.index_count);
 
         // ── Leaf depth caster (alpha-tested cutout silhouette) ──
-        if let Some(leaf) = &self.leaf {
-            renderer.bind_depth(rhi, fi, FloraPipeline::LeafDepth);
-            let lpush = LeafDepthPush {
-                light_view_proj: lvp,
-                rot: rot4,
-                wind,
-                leaf_params: self.leaf_params,
-                leaf_params2: self.leaf_params2,
-            };
-            rhi.bind_vertex_buffers(fi, &[leaf.pos, leaf.nrm, leaf.uv, leaf.attr])?;
-            rhi.bind_index_buffer(fi, leaf.idx)?;
-            renderer.push(rhi, fi, bytemuck::bytes_of(&lpush));
-            rhi.draw_indexed(fi, leaf.index_count);
+        // Fragment trim (#4): once the tree is far enough that its leaf shadows are
+        // sub-pixel (`!cast_leaf_shadows`), skip the leaf caster entirely — it's a
+        // pure alpha-test overdraw cost with no visible payoff. Otherwise match the
+        // lit pass's density prefix so the cast silhouette tracks the drawn cards.
+        if let (Some(leaf), true) = (&self.leaf, lod.cast_leaf_shadows) {
+            let card_count = leaf.index_count / LEAF_INDICES_PER_CARD;
+            let cards = (lod.density_frac.clamp(0.0, 1.0) * card_count as f32).round() as u32;
+            let draw_idx = (cards * LEAF_INDICES_PER_CARD).min(leaf.index_count);
+            if draw_idx > 0 {
+                renderer.bind_depth(rhi, fi, FloraPipeline::LeafDepth);
+                let lpush = LeafDepthPush {
+                    light_view_proj: lvp,
+                    rot: rot4,
+                    wind,
+                    leaf_params: self.leaf_params,
+                    leaf_params2: self.leaf_params2,
+                };
+                rhi.bind_vertex_buffers(fi, &[leaf.pos, leaf.nrm, leaf.uv, leaf.attr])?;
+                rhi.bind_index_buffer(fi, leaf.idx)?;
+                renderer.push(rhi, fi, bytemuck::bytes_of(&lpush));
+                rhi.draw_indexed(fi, draw_idx);
+            }
         }
 
+        Ok(())
+    }
+
+    /// Draw the far-distance leaf IMPOSTOR billboard (#3): one camera-facing quad
+    /// painted as a soft canopy blob in the per-tree pigment, alpha = `blend` (the
+    /// `LeafLod::impostor_blend` crossfade). A no-op at `blend <= 0`. `cam_right` /
+    /// `cam_up` are the camera basis vectors (the billboard faces the camera). Must
+    /// be recorded INSIDE the scene pass, AFTER the tree (it's alpha-blended).
+    pub fn record_impostor(
+        &self,
+        rhi: &mut Rhi,
+        renderer: &FloraRenderer,
+        fi: u32,
+        camera_world_pos: DVec3,
+        cam_right: Vec3,
+        cam_up: Vec3,
+        blend: f32,
+    ) -> Result<(), RhiError> {
+        if blend <= 0.0 {
+            return Ok(());
+        }
+        // Canopy centre from the local AABB, biased up into the crown; transform to
+        // camera-relative via the same model() the tree uses.
+        let (mn, mx) = self.bounds;
+        let cx = 0.5 * (mn[0] + mx[0]);
+        let cz = 0.5 * (mn[2] + mx[2]);
+        let dy = mx[1] - mn[1];
+        let local_center = Vec3::new(cx, mn[1] + 0.62 * dy, cz);
+        let center = self.model(camera_world_pos).transform_point3(local_center);
+        // Blob radius: cover the crown (a bit under the full half-height), floored
+        // by the bounding radius so squat crowns still read.
+        let radius = (0.55 * dy).max(0.6 * self.bounding_radius());
+        // Camera-facing billboard: local quad x→cam_right, y→cam_up, scaled.
+        let fwd = cam_right.cross(cam_up).normalize_or(Vec3::Z);
+        let model = Mat4::from_cols(
+            (cam_right * radius).extend(0.0),
+            (cam_up * radius).extend(0.0),
+            fwd.extend(0.0),
+            center.extend(1.0),
+        );
+        let color = [
+            self.leaf_pigment[0],
+            self.leaf_pigment[1],
+            self.leaf_pigment[2],
+            blend.clamp(0.0, 1.0),
+        ];
+        renderer.bind(rhi, fi, FloraPipeline::Impostor);
+        rhi.set_viewport_scissor_full(fi);
+        let push = ImpostorPush { model: model.to_cols_array_2d(), color };
+        rhi.bind_vertex_buffers(
+            fi,
+            &[
+                self.impostor_quad.pos,
+                self.impostor_quad.nrm,
+                self.impostor_quad.uv,
+                self.impostor_quad.attr,
+            ],
+        )?;
+        rhi.bind_index_buffer(fi, self.impostor_quad.idx)?;
+        renderer.push(rhi, fi, bytemuck::bytes_of(&push));
+        rhi.draw_indexed(fi, self.impostor_quad.index_count);
         Ok(())
     }
 
@@ -1113,6 +1516,9 @@ fn build_leaf_mesh(
     let mut uv = Vec::with_capacity(n * ROWS * 2 * 3);
     let mut attr = Vec::with_capacity(n * ROWS * 2 * 3);
     let mut idx = Vec::with_capacity(n * SEG * 6);
+    // Per-card base vertex, collected then hash-shuffled before index emission so a
+    // density-LOD prefix draw is a spatially-uniform subset of the canopy.
+    let mut card_bases: Vec<u32> = Vec::with_capacity(n);
 
     // dryad canopyBlend = 0.8 (uWeep=0): shading normal is 80% canopy-sphere
     // normal, 20% card face normal — a soft volume, but the card keeps a little
@@ -1346,6 +1752,25 @@ fn build_leaf_mesh(
                 attr.extend_from_slice(&[age, exposure, seed]);
             }
         }
+        // Record this card's base vertex; indices are emitted AFTER the loop in a
+        // hash-shuffled card order (see below) so a density-LOD prefix draw is a
+        // spatially-uniform subsample.
+        card_bases.push(base);
+    }
+
+    // Hash-shuffle the card order, then emit 36 indices per card. The shuffle makes
+    // "draw the first K cards" a uniform random subset of the canopy (not "thin one
+    // branch first"); it's free for the FULL draw because alpha-cutout + depth-write
+    // leaves are order-independent. Deterministic (no rng) → no per-frame flicker.
+    debug_assert_eq!(SEG as u32 * 6, LEAF_INDICES_PER_CARD);
+    card_bases.sort_by_key(|&b| {
+        // Integer finalizer (splitmix-ish) → a well-mixed permutation key.
+        let mut x = b.wrapping_mul(2_654_435_761);
+        x ^= x >> 15;
+        x = x.wrapping_mul(2_246_822_519);
+        x ^ (x >> 13)
+    });
+    for base in card_bases {
         // SEG segments, 2 CCW tris each. Row r: a=2r,b=2r+1,c=2r+2,d=2r+3.
         for r in 0..SEG as u32 {
             let a = base + 2 * r;

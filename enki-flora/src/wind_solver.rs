@@ -358,6 +358,41 @@ mod tests {
     }
 
     #[test]
+    fn tip_displacement_is_parallel_to_wind_dir() {
+        // The solver rotates each bone about axis = cross(+Y, windDir), so a point
+        // ABOVE a bone's pivot must displace ALONG windDir (a vertical bob aside).
+        // This is the invariant flora_view::solve_wind relies on: it pre-rotates
+        // the world wind dir into the tree-local frame (m3⁻¹·worldDir) so that,
+        // after the model basis m3 is applied in the vertex shader, the branch
+        // sway lands back on the WORLD wind direction. (The bug: feeding the world
+        // dir straight in made branches sway m3·worldDir ≈ 90° off — leaves were
+        // fine only because they add their gust in world space, after m3.)
+        let bones = vec![
+            WindBone { parent: -1, pivot: [0.0, 0.0, 0.0], axis: [0.0, 1.0, 0.0], stiffness: 0.0, branch_level: 0, is_rigid: 1 },
+            WindBone { parent: 0,  pivot: [0.0, 1.0, 0.0], axis: [0.0, 1.0, 0.0], stiffness: 1.0, branch_level: 1, is_rigid: 0 },
+        ];
+        let mut solver = WindSolver::new(&bones);
+        for &(dx, dz) in &[(1.0_f32, 0.0_f32), (0.0, 1.0), (0.7, -0.3), (-0.4, -0.9)] {
+            // time 0.6 → bone 1's angle is non-zero, so it actually moves.
+            let out = solver.solve(0.6, 1.0, dx as f64, dz as f64);
+            let m = &out[16..32]; // bone 1's mat4 (column-major); parent is identity.
+            // A point on the bone, above its pivot (0,1,0).
+            let (px, py, pz) = (0.0_f32, 1.5, 0.0);
+            let tx = m[0] * px + m[4] * py + m[8] * pz + m[12];
+            let ty = m[1] * px + m[5] * py + m[9] * pz + m[13];
+            let tz = m[2] * px + m[6] * py + m[10] * pz + m[14];
+            let (hx, hz) = (tx - px, tz - pz); // horizontal displacement
+            let _ = ty;
+            let hmag = (hx * hx + hz * hz).sqrt();
+            assert!(hmag > 1e-4, "bone should sway for dir ({dx},{dz}); got hmag={hmag}");
+            // Parallel to (dx,dz): the 2D cross product is ~0.
+            let dmag = (dx * dx + dz * dz).sqrt();
+            let cross = (hx * dz - hz * dx) / (hmag * dmag);
+            assert!(cross.abs() < 1e-4, "sway not parallel to wind dir ({dx},{dz}); cross={cross}");
+        }
+    }
+
+    #[test]
     #[should_panic(expected = "parent < child")]
     fn forward_parent_panics() {
         let bad = vec![

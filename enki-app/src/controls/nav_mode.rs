@@ -27,6 +27,8 @@ pub enum NavMode {
     /// Walking on the planet surface (third-person chase cam, with a 1st-person
     /// view toggle). Hosts the `ThirdPersonController`.
     Surface,
+    /// Free-flight through interplanetary space (`FreeCam`). Toggled from Globe.
+    Space,
 }
 
 // ── State machine ─────────────────────────────────────────────────────────
@@ -86,6 +88,18 @@ impl NavState {
             self.saved_globe_camera.take()
         } else {
             None
+        }
+    }
+
+    /// `Globe → Space` / `Space → Globe`: toggle free-flight.
+    pub fn enter_space(&mut self) {
+        if self.mode == NavMode::Globe {
+            self.mode = NavMode::Space;
+        }
+    }
+    pub fn exit_space(&mut self) {
+        if self.mode == NavMode::Space {
+            self.mode = NavMode::Globe;
         }
     }
 

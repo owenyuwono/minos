@@ -60,3 +60,8 @@ lru = "0.12"
 rustfft = "6"
 raw-window-handle = "0.6"
 winit = "0.30"
+
+[dev-dependencies]
+# Headless WGSL validation for the wind overlay shader (the flora build pulls
+# naga in as a normal dep; tests need it in the default build too).
+naga = { version = "29.0.3", features = ["wgsl-in"] }

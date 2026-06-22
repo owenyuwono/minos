@@ -99,6 +99,9 @@ pub enum FloraPipeline {
     Shadow,
     /// Wind-direction debug gizmo (unlit solid-color arrow). Uses `ArrowPush`.
     Arrow,
+    /// Far-distance leaf billboard (the LOD impostor). Uses `ImpostorPush`,
+    /// alpha-blended, drawn in the scene pass after the tree.
+    Impostor,
     BranchDepth,
     LeafDepth,
 }
@@ -275,6 +278,7 @@ pub struct FloraRenderer {
     sky: OwnedPipeline,
     shadow: OwnedPipeline,
     arrow: OwnedPipeline,
+    impostor: OwnedPipeline,
     branch_depth: OwnedPipeline,
     leaf_depth: OwnedPipeline,
 
@@ -427,8 +431,18 @@ impl FloraRenderer {
                 depth_test,
             )
         };
-        let branch = mk(flora_module, "vs_branch", "fs_branch", false, true, true)?;
-        let branch_wire = mk(flora_module, "vs_branch", "fs_branch", false, false, true)?;
+        // BRANCH uses a 6-stream vertex layout (pos/nrm/uv/attr + aTangent/aFrameU
+        // for the seamless bark frame); everything else stays 4-stream. Built via
+        // build_pipeline_culled directly (BACK cull, like build_pipeline's default)
+        // to pass n_streams = 6.
+        let branch = build_pipeline_culled(
+            &device, pipeline_layout, flora_module, "vs_branch", "fs_branch",
+            color_format, samples, false, true, true, vk::CullModeFlags::BACK, 6,
+        )?;
+        let branch_wire = build_pipeline_culled(
+            &device, pipeline_layout, flora_module, "vs_branch", "fs_branch",
+            color_format, samples, false, false, true, vk::CullModeFlags::BACK, 6,
+        )?;
         let leaf = mk(flora_module, "vs_leaf", "fs_leaf", false, true, true)?;
         let leaf_wire = mk(flora_module, "vs_leaf", "fs_leaf", false, false, true)?;
         // GROUND: a single y=0 world quad. Build it CULL-NONE (double-sided) so it
@@ -436,7 +450,7 @@ impl FloraRenderer {
         // floor plane should never vanish to back-face culling. // ponytail.
         let ground = build_pipeline_culled(
             &device, pipeline_layout, staging_module, "vs_ground", "fs_ground",
-            color_format, samples, false, true, true, vk::CullModeFlags::NONE,
+            color_format, samples, false, true, true, vk::CullModeFlags::NONE, 4,
         )?;
         // SKY: depth_test=false (see build_pipeline) — fills the background instead
         // of being depth-rejected by the reversed-Z cleared-to-0 GREATER buffer.
@@ -448,7 +462,14 @@ impl FloraRenderer {
         // box reads from any orbit angle. Depth-tested against ground+tree.
         let arrow = build_pipeline_culled(
             &device, pipeline_layout, staging_module, "vs_arrow", "fs_arrow",
-            color_format, samples, false, true, true, vk::CullModeFlags::NONE,
+            color_format, samples, false, true, true, vk::CullModeFlags::NONE, 4,
+        )?;
+        // IMPOSTOR: alpha-blended (blend:true → depth-write OFF) camera-facing
+        // billboard, CULL-NONE (built CPU-side facing the camera, but a flat quad
+        // can present either winding). Depth-TESTED so nearer geometry occludes it.
+        let impostor = build_pipeline_culled(
+            &device, pipeline_layout, staging_module, "vs_impostor", "fs_impostor",
+            color_format, samples, true, true, true, vk::CullModeFlags::NONE, 4,
         )?;
 
         // ── DEPTH CASTER pipelines: depth-only (no color attachment), single
@@ -665,6 +686,7 @@ impl FloraRenderer {
             sky,
             shadow,
             arrow,
+            impostor,
             branch_depth,
             leaf_depth,
             pool,
@@ -1568,6 +1590,7 @@ impl FloraRenderer {
             FloraPipeline::Sky => &self.sky,
             FloraPipeline::Shadow => &self.shadow,
             FloraPipeline::Arrow => &self.arrow,
+            FloraPipeline::Impostor => &self.impostor,
             FloraPipeline::BranchDepth => &self.branch_depth,
             FloraPipeline::LeafDepth => &self.leaf_depth,
         }
@@ -1588,6 +1611,7 @@ impl FloraRenderer {
                 &self.sky,
                 &self.shadow,
                 &self.arrow,
+                &self.impostor,
                 &self.branch_depth,
                 &self.leaf_depth,
             ] {
@@ -1886,7 +1910,7 @@ fn build_pipeline(
     };
     build_pipeline_culled(
         device, layout, module, vs_entry, fs_entry, color_format, samples, blend,
-        fill, depth_test, default_cull,
+        fill, depth_test, default_cull, 4,
     )
 }
 
@@ -1905,6 +1929,10 @@ fn build_pipeline_culled(
     fill: bool,
     depth_test: bool,
     cull_mode: vk::CullModeFlags,
+    // Number of separate vec3<f32> vertex streams. 4 for everything (pos/nrm/uv/
+    // attr); 6 for the branch lit pipeline (+ aTangent/aFrameU for the seamless
+    // bark frame). Each stream is its own binding=location, stride 12, vertex-rate.
+    n_streams: u32,
 ) -> Result<OwnedPipeline, RhiError> {
     let vs_name = CString::new(vs_entry).unwrap();
     let fs_name = CString::new(fs_entry).unwrap();
@@ -1919,20 +1947,25 @@ fn build_pipeline_culled(
             .name(&fs_name),
     ];
 
-    // 4 separate vec3<f32> bindings (pos / normal / uv / attr), stride 12.
-    let bindings: [vk::VertexInputBindingDescription; 4] = std::array::from_fn(|i| {
-        vk::VertexInputBindingDescription::default()
-            .binding(i as u32)
-            .stride(12)
-            .input_rate(vk::VertexInputRate::VERTEX)
-    });
-    let attributes: [vk::VertexInputAttributeDescription; 4] = std::array::from_fn(|i| {
-        vk::VertexInputAttributeDescription::default()
-            .location(i as u32)
-            .binding(i as u32)
-            .format(vk::Format::R32G32B32_SFLOAT)
-            .offset(0)
-    });
+    // `n_streams` separate vec3<f32> bindings (pos / normal / uv / attr [+ tangent /
+    // frameU]), stride 12, one binding == one location.
+    let bindings: Vec<vk::VertexInputBindingDescription> = (0..n_streams)
+        .map(|i| {
+            vk::VertexInputBindingDescription::default()
+                .binding(i)
+                .stride(12)
+                .input_rate(vk::VertexInputRate::VERTEX)
+        })
+        .collect();
+    let attributes: Vec<vk::VertexInputAttributeDescription> = (0..n_streams)
+        .map(|i| {
+            vk::VertexInputAttributeDescription::default()
+                .location(i)
+                .binding(i)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(0)
+        })
+        .collect();
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_binding_descriptions(&bindings)
         .vertex_attribute_descriptions(&attributes);

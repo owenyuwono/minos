@@ -8,68 +8,10 @@
 
 use enki_flora::genome::Genome;
 
-/// The base every preset spreads from (dryad `TREE_DEFAULT`). Public so the
-/// viewer can use it as the curated startup specimen (no FLORA_SEED) — brown
-/// furrowed bark + a full green canopy, vs. random_genome's random hue/density.
-pub const TREE_DEFAULT: Genome = Genome {
-    branchiness: 0.92,
-    branch_factor_n: 0.65,
-    tillering: 0.0,
-    radial_order: 0.55,
-    appendage_breadth: 0.45,
-    appendage_density: 0.99,
-    segmentation: 0.35,
-    succulence: 0.12,
-    stem_girth: 0.68,
-    taper: 0.72,
-    rigidity: 0.40,
-    verticality: 0.50,
-    ribbing: 0.0,
-    spininess: 0.0,
-    branch_angle: 0.60,
-    length_ratio: 0.70,
-    apical_bias: 0.75,
-    droop_bias: 0.0,
-    pigment: 0.33,
-    leaf_size: 1.0,
-    jitter: 1.0,
-    leaf_width: 0.50,
-    leaf_length: 0.45,
-    leaf_tip: 0.40,
-    leaf_serration: 0.0,
-    leaf_lobing: 0.0,
-    leaf_skew: 0.50,
-    bark_hue: 1.0,
-    bark_lightness: 0.22,
-    bark_relief: 1.0,
-    bark_lenticels: 0.0,
-    bark_scale: 0.50,
-    bark_orient: 0.70,
-    bark_plates: 0.45,
-    bark_shed: 0.0,
-    bark_under_hue: 0.75,
-    weep: 0.0,
-    trunk_height: 0.50,
-    flatness: 0.0,
-    stem_spread: 0.0,
-    rosette: 0.0,
-    woodiness: 1.0,
-    whorl: 0.0,
-    crown_start: 1.0,
-    tip_tuft: 0.0,
-    leaf_division: 0.0,
-    frond_fan: 0.0,
-    phototropism: 1.0,
-    trunk_taper: 0.0,
-    structural_seed: 1337,
-    root_count: 0.50,
-    root_depth: 0.40,
-    root_spread: 0.55,
-    root_flare: 0.35,
-    root_buttress: 0.10,
-    root_branchiness: 0.45,
-    root_taper: 0.50,
-};
+// The base every preset spreads from (dryad `TREE_DEFAULT`) now lives in the lib
+// (`flora_view`) so the in-planet app draws the exact same default specimen.
+// Re-exported here unchanged, so the presets below + the panel keep using it.
+pub use enki_app::flora_view::TREE_DEFAULT;
 
 /// Broad dome (dryad OAK).
 const OAK: Genome = Genome {

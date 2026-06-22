@@ -42,9 +42,15 @@ mod gui;
 mod fps;
 mod loading;
 mod ocean;
+mod wind;
+mod atmosphere;
+mod markers;
+mod solar;
 mod planet_view;
 mod scene;
 mod stress;
+#[cfg(feature = "flora")]
+mod flora_scatter;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -52,7 +58,7 @@ use std::time::Instant;
 use enki_planet::climate::ClimateParams;
 use enki_planet::height::HeightField;
 use enki_planet::lod::{LodCamera, LodConfig};
-use enki_render::{camera::Camera, frame::FrameUniforms, lights::Lights, projection::reversed_z_perspective};
+use enki_render::{camera::Camera, frame::FrameUniforms, lights::Lights, projection::reversed_z_perspective, sky::SkyModel, system::SolarSystem};
 use enki_rhi::{Rhi, RhiConfig, RhiError};
 use glam::DVec3;
 use winit::{
@@ -81,6 +87,11 @@ use controls::{
 use gui::EguiState;
 use fps::FpsMeter;
 use ocean::{Ocean, WaveSurface};
+use wind::WindOverlay;
+use atmosphere::{Atmosphere, AtmoParams};
+use markers::Markers;
+use solar::BodyRenderer;
+use controls::space::FreeCam;
 use planet_view::{PlanetConfig, PlanetView, PlanetViewStats, RhiUploaderDummy, planet_view_from_hf};
 use scene::Scene;
 use stress::StressHarness;
@@ -120,8 +131,22 @@ struct App {
     planet_view:  Option<PlanetView<RhiUploaderDummy>>,
     /// Translucent sea-level shell for the live Planet path (built once at startup).
     ocean:        Option<Ocean>,
+    /// Solar clock: focused-planet spin → day/night + seasons.
+    sky:          SkyModel,
+    /// The solar system: f64 heliocentric bodies + orbits.
+    system:       SolarSystem,
+    /// Solar-system body renderer (sun + distant planets as lit spheres).
+    bodies:       Option<BodyRenderer>,
+    /// Free-flight space camera (Some only in NavMode::Space).
+    freecam:      Option<FreeCam>,
     /// FFT spectral wave surface (camera-anchored), drawn near the surface.
     wave:         Option<WaveSurface>,
+    /// Wind streakline overlay (particles riding the baked wind field).
+    wind:         Option<WindOverlay>,
+    /// Translucent atmosphere shell (halo + the wind's home altitude).
+    atmosphere:   Option<Atmosphere>,
+    /// Equator + pole reference markers.
+    markers:      Option<Markers>,
     scene:        Option<Scene>,
     stress:       Option<StressHarness>,
     /// CPU-skinned humanoid drawn in third-person surface mode (built at startup
@@ -134,11 +159,28 @@ struct App {
     // spawned near the player in Surface mode. Scatter/LOD is a later slice.
     #[cfg(feature = "flora")]
     flora_renderer: Option<FloraRenderer>,
+    /// The single shared species mesh (the prototype default specimen). Drawn at
+    /// many camera-relative models — one per scattered instance — via `record_at`.
     #[cfg(feature = "flora")]
     flora_tree:   Option<FloraView>,
+    /// Deterministic scatter of trees within `RADIUS_M` of the player. Rebuilt
+    /// only when the player moves past a threshold or the density changes.
+    #[cfg(feature = "flora")]
+    flora_instances: Vec<flora_scatter::TreeInstance>,
+    /// Player ground position at the last scatter rebuild (the throttle anchor).
+    #[cfg(feature = "flora")]
+    flora_scatter_center: Option<DVec3>,
+    /// Density used at the last scatter rebuild (rebuild on change).
+    #[cfg(feature = "flora")]
+    flora_last_density: f32,
     /// Wind animation clock (seconds), advanced each Surface frame trees draw.
     #[cfg(feature = "flora")]
     flora_clock:  f32,
+    /// Show trees on the surface (GUI toggle; feature-agnostic so the panel
+    /// compiles without `flora` — the draw is what's gated).
+    flora_enabled: bool,
+    /// Fraction of candidate cells that get a tree (GUI slider, 0..1).
+    flora_density: f32,
     /// Stage-2 cluster streaming: the deep per-face DAGs (held in RAM) + the
     /// residency selector that streams only the near-cut subset to the GPU pool.
     #[cfg(feature = "nanite")]
@@ -198,6 +240,15 @@ struct App {
     nanite_tau:        f32,
     /// Draw the translucent ocean shell over the planet.
     ocean_enabled:     bool,
+    /// Draw the wind streakline overlay.
+    wind_enabled:      bool,
+    /// Draw the atmosphere shell.
+    atmo_enabled:      bool,
+    /// Atmosphere tunables (height + density).
+    atmo_params:       AtmoParams,
+    /// Reference marker toggles (pole spikes / equator ring).
+    markers_poles:     bool,
+    markers_equator:   bool,
     /// Draw the FFT spectral wave surface (camera-anchored detail).
     wave_enabled:      bool,
     /// Wave choppiness (horizontal displacement gain) — GUI-tunable.
@@ -247,7 +298,14 @@ impl App {
             egui:          None,
             planet_view:   None,
             ocean:         None,
+            sky:           SkyModel::earth(),
+            system:        SolarSystem::nms_default(),
+            bodies:        None,
+            freecam:       None,
             wave:          None,
+            wind:          None,
+            atmosphere:    None,
+            markers:       None,
             scene:         None,
             stress:        None,
             character:     None,
@@ -256,7 +314,15 @@ impl App {
             #[cfg(feature = "flora")]
             flora_tree:    None,
             #[cfg(feature = "flora")]
+            flora_instances: Vec::new(),
+            #[cfg(feature = "flora")]
+            flora_scatter_center: None,
+            #[cfg(feature = "flora")]
+            flora_last_density: -1.0,
+            #[cfg(feature = "flora")]
             flora_clock:   0.0,
+            flora_enabled: true,
+            flora_density: 0.5,
             #[cfg(feature = "nanite")]
             nanite:        None,
             #[cfg(feature = "nanite")]
@@ -290,6 +356,11 @@ impl App {
             nanite_enabled:    true,
             nanite_tau:        1.0,
             ocean_enabled:     true,
+            wind_enabled:      true,
+            atmo_enabled:      true,
+            atmo_params:       AtmoParams::default(),
+            markers_poles:     false,
+            markers_equator:   false,
             wave_enabled:      true,
             wave_choppiness:   1.3,
             wave_foam:         0.4,
@@ -319,6 +390,11 @@ impl App {
                 .as_ref()
                 .map(|tpc| tpc.camera())
                 .unwrap_or_else(|| self.globe.camera()),
+            NavMode::Space => self
+                .freecam
+                .as_ref()
+                .map(|f| f.camera(self.system.focused().world_pos))
+                .unwrap_or_else(|| self.globe.camera()),
         }
     }
 
@@ -329,6 +405,11 @@ impl App {
                 .surface
                 .as_ref()
                 .map(|tpc| tpc.feet_position().length() - PLANET_RADIUS)
+                .unwrap_or_else(|| self.globe.altitude()),
+            NavMode::Space => self
+                .freecam
+                .as_ref()
+                .map(|f| (f.position - self.system.focused().world_pos).length() - PLANET_RADIUS)
                 .unwrap_or_else(|| self.globe.altitude()),
         }
     }
@@ -349,6 +430,12 @@ impl App {
             }
             NavMode::Surface => {
                 self.exit_surface("Tab");
+            }
+            NavMode::Space => {
+                self.nav.exit_space();
+                self.freecam = None;
+                self.release_cursor();
+                log::info!("Nav: Space → Globe");
             }
         }
     }
@@ -544,6 +631,22 @@ impl App {
                     }
                     // Camera-relative WASD; remember the speed for the gait.
                     self.surface_speed = tpc.on_move(self.move_keys, dt);
+                    // Advance the smoothed camera collision for this frame.
+                    tpc.update(dt);
+                }
+            }
+            NavMode::Space => {
+                if let Some(fc) = self.freecam.as_mut() {
+                    if dx.abs() > 0.01 || dy.abs() > 0.01 {
+                        fc.look(dx, dy);
+                    }
+                    if self.scroll.abs() > 0.01 {
+                        fc.adjust_speed(self.scroll);
+                    }
+                    let fwd = (self.move_keys.forward as i32 - self.move_keys.backward as i32) as f32;
+                    let rgt = (self.move_keys.right as i32 - self.move_keys.left as i32) as f32;
+                    let boost = if self.move_keys.sprint { 6.0 } else { 1.0 };
+                    fc.fly(fwd, rgt, boost, dt);
                 }
             }
         }
@@ -673,6 +776,26 @@ impl ApplicationHandler for App {
                 match WaveSurface::new(&mut rhi, color_format, samples, PLANET_RADIUS) {
                     Ok(w)  => self.wave = Some(w),
                     Err(e) => log::error!("WaveSurface::new failed: {e}"),
+                }
+                // Wind streakline overlay (rides the baked wind field).
+                match WindOverlay::new(&mut rhi, color_format, samples, PLANET_RADIUS) {
+                    Ok(w)  => self.wind = Some(w),
+                    Err(e) => log::error!("WindOverlay::new failed: {e}"),
+                }
+                // Atmosphere shell (halo + the altitude the wind rides in).
+                match Atmosphere::new(&mut rhi, color_format, samples, PLANET_RADIUS) {
+                    Ok(a)  => self.atmosphere = Some(a),
+                    Err(e) => log::error!("Atmosphere::new failed: {e}"),
+                }
+                // Equator + pole reference markers.
+                match Markers::new(&mut rhi, color_format, samples, PLANET_RADIUS) {
+                    Ok(m)  => self.markers = Some(m),
+                    Err(e) => log::error!("Markers::new failed: {e}"),
+                }
+                // Solar-system bodies (sun + distant planets as lit spheres).
+                match BodyRenderer::new(&mut rhi, color_format, samples) {
+                    Ok(b)  => self.bodies = Some(b),
+                    Err(e) => log::error!("BodyRenderer::new failed: {e}"),
                 }
                 // Third-person character (drawn only while walking the surface).
                 match Character::new(&mut rhi, color_format, samples) {
@@ -878,7 +1001,7 @@ impl ApplicationHandler for App {
         event:       DeviceEvent,
     ) {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
-            if self.nav.mode() == NavMode::Surface {
+            if matches!(self.nav.mode(), NavMode::Surface | NavMode::Space) {
                 self.mouse_delta.0 += dx as f32;
                 self.mouse_delta.1 += dy as f32;
             }
@@ -971,6 +1094,25 @@ impl App {
                         }
                     }
 
+                    // ── Toggle free-flight space camera (Globe ↔ Space) ───────
+                    KeyCode::KeyF if pressed => match self.nav.mode() {
+                        NavMode::Globe => {
+                            let terra = self.system.focused().world_pos;
+                            let helio = terra + self.globe.camera().position;
+                            self.freecam = Some(FreeCam::looking_at(helio, terra));
+                            self.nav.enter_space();
+                            self.grab_cursor();
+                            log::info!("Nav: Globe → Space (free flight — WASD + mouse, scroll = speed)");
+                        }
+                        NavMode::Space => {
+                            self.nav.exit_space();
+                            self.freecam = None;
+                            self.release_cursor();
+                            log::info!("Nav: Space → Globe");
+                        }
+                        _ => {}
+                    },
+
                     // ── View mode cycle ───────────────────────────────────────
                     KeyCode::KeyM if pressed => {
                         #[cfg(feature = "nanite")]
@@ -991,7 +1133,7 @@ impl App {
                     // ── Wireframe toggle ──────────────────────────────────────
                     // Use W in Globe/Placement mode for wireframe; on the surface
                     // W is forward movement.
-                    KeyCode::KeyW if pressed && self.nav.mode() != NavMode::Surface => {
+                    KeyCode::KeyW if pressed && matches!(self.nav.mode(), NavMode::Globe | NavMode::Placement) => {
                         self.wireframe = !self.wireframe;
                         log::info!("Wireframe → {}", self.wireframe);
                     }
@@ -1060,6 +1202,8 @@ impl App {
         let dt  = now.duration_since(self.last_tick).as_secs_f32().min(0.1);
         // Smoothed/throttled frame time for the egui FPS readout (raw dt drives motion).
         self.fps.tick(dt);
+        self.sky.tick(dt);
+        self.system.advance(self.sky.t_seconds);
         let frame_time = self.fps.frame_time_s();
         self.last_tick = now;
 
@@ -1078,6 +1222,13 @@ impl App {
                         }
                         // Keep a handle to the terrain so the FPS controller can ride it.
                         self.height_field = Some(Arc::clone(&out.hf));
+                        // Feed the planet's wind field to the ocean (wave height/intensity).
+                        if let Some(w) = self.wave.as_mut() {
+                            w.set_wind_source(Arc::clone(&out.hf));
+                        }
+                        if let Some(w) = self.wind.as_mut() {
+                            w.set_wind_source(Arc::clone(&out.hf));
+                        }
                         self.terrain_height_scale = cfg.lod.height_scale;
                         self.planet_view = Some(planet_view_from_hf(cfg, out.hf));
                     }
@@ -1158,10 +1309,18 @@ impl App {
             let nanite_enabled    = self.nanite_enabled;
             let nanite_tau        = self.nanite_tau;
             let ocean_enabled     = self.ocean_enabled;
+            let wind_enabled      = self.wind_enabled;
+            let atmo_enabled      = self.atmo_enabled;
+            let atmo_params       = self.atmo_params;
+            let markers_poles     = self.markers_poles;
+            let markers_equator   = self.markers_equator;
+            let wind_params       = self.wind.as_ref().map(|w| w.params).unwrap_or_default();
             let sea_level_m       = self.sea_level_m;
             let wave_enabled      = self.wave_enabled;
             let wave_choppiness   = self.wave_choppiness;
             let wave_foam         = self.wave_foam;
+            let flora_enabled     = self.flora_enabled;
+            let flora_density      = self.flora_density;
             // LoadTimings is Copy — snapshot it out so the popup can borrow it while
             // egui mutably borrows self. Only passed while the popup is showing.
             let load_stats        = if self.show_load_stats { self.load_timings } else { None };
@@ -1174,6 +1333,10 @@ impl App {
                 window, rhi, nav_mode, altitude, frame_time, view_mode, wireframe, taa_on,
                 nanite_enabled, nanite_tau, cfg!(feature = "nanite"),
                 ocean_enabled, sea_level_m, wave_enabled, wave_choppiness, wave_foam,
+                cfg!(feature = "flora"), flora_enabled, flora_density,
+                self.sky.time_scale, self.sky.paused,
+                wind_enabled, wind_params,
+                atmo_enabled, atmo_params, markers_poles, markers_equator,
                 None, planet_stats.as_ref(), load_stats.as_ref(),
             ))
         } else {
@@ -1202,6 +1365,18 @@ impl App {
             self.wave_enabled      = out.wave_enabled;
             self.wave_choppiness   = out.wave_choppiness;
             self.wave_foam         = out.wave_foam;
+            self.flora_enabled     = out.flora_enabled;
+            self.flora_density     = out.flora_density;
+            self.wind_enabled      = out.wind_enabled;
+            if let Some(w) = self.wind.as_mut() {
+                w.params = out.wind;
+            }
+            self.atmo_enabled      = out.atmo_enabled;
+            self.atmo_params       = out.atmo;
+            self.markers_poles     = out.markers_poles;
+            self.markers_equator   = out.markers_equator;
+            self.sky.time_scale    = out.time_scale;
+            self.sky.paused        = out.paused;
             if out.cycle_nav {
                 self.cycle_nav_mode();
             }
@@ -1255,7 +1430,18 @@ impl App {
                 // Build frame uniforms with rotation-only camera-relative view,
                 // as documented in FrameUniforms::new. With TAA on, jitter the
                 // projection sub-pixel (terrain + Nanite both read this view-proj).
-                let lights = Lights::demiurge_default();
+                // Sun direction from the focused body's heliocentric position. The
+                // planet-spin (day/night) applies ONLY when on/orbiting the planet; in
+                // free space the sun is FIXED (heliocentric), so spin = identity.
+                let spin = if nav_mode == NavMode::Space {
+                    glam::Quat::IDENTITY
+                } else {
+                    self.sky.helio_to_body()
+                };
+                let sun_dir_body = spin
+                    .mul_vec3(self.system.sun_dir_focused().as_vec3())
+                    .normalize_or_zero();
+                let lights = Lights::from_sun(sun_dir_body, self.sky.sun_light_color());
                 let fu     = if taa_on {
                     FrameUniforms::new_jittered(
                         &camera, aspect, &lights, jitter_px, aspect * screen_h_px, screen_h_px,
@@ -1368,27 +1554,29 @@ impl App {
                     }
                 }
 
-                // Flora (procedural trees): spawn one walk-up tree lazily, then
-                // upload its frame/wind uniforms and keep the shadow map valid.
-                // All OUTSIDE begin_rendering (host-visible uploads + a depth-only
-                // pass), mirroring Character::update + the Nanite cull dispatch.
+                // Flora (procedural trees): build the shared species mesh once,
+                // (re)scatter a grove around the player, then upload frame/wind
+                // uniforms + keep the shadow map valid. All OUTSIDE begin_rendering
+                // (host-visible uploads + a depth-only pass), mirroring
+                // Character::update + the Nanite cull dispatch.
                 #[cfg(feature = "flora")]
-                let draw_trees = nav_mode == NavMode::Surface && self.flora_renderer.is_some();
+                let draw_trees =
+                    nav_mode == NavMode::Surface && self.flora_enabled && self.flora_renderer.is_some();
                 #[cfg(feature = "flora")]
                 if draw_trees {
-                    // Lazy spawn: one tree ~6 m in front of the player, grounded.
+                    // 1. Build the species mesh once from the CANONICAL TreeSpec —
+                    //    the SAME default the standalone flora_viewer starts from, so
+                    //    the planet tree and the viewer tree are identical. Drawn at
+                    //    many models — its stored origin is unused.
                     if self.flora_tree.is_none() {
                         if let (Some(tpc), Some(hf)) =
                             (self.surface.as_ref(), self.height_field.as_ref())
                         {
-                            let dir = (tpc.feet_position()
-                                + tpc.facing().as_dvec3() * 6.0)
-                                .normalize();
-                            let r = controls::first_person::surface_radius(
-                                hf.as_ref(), controls::PLANET_RADIUS,
-                                self.terrain_height_scale, dir,
+                            let dir = tpc.feet_position().normalize();
+                            let r = controls::terrain_grid::ground_radius(
+                                hf.as_ref(), self.terrain_height_scale, dir,
                             );
-                            match FloraView::new(rhi, 0x00C0FFEE, dir * r) {
+                            match FloraView::default_specimen(rhi, dir * r) {
                                 Ok(tree) => {
                                     let single = matches!(tree.leaf_mode(), LeafMode::Single);
                                     if let Some(rend) = self.flora_renderer.as_mut() {
@@ -1398,10 +1586,37 @@ impl App {
                                     }
                                     self.flora_tree = Some(tree);
                                 }
-                                Err(e) => log::error!("FloraView::new failed: {e}"),
+                                Err(e) => log::error!("FloraView::default_single failed: {e}"),
                             }
                         }
                     }
+                    // 2. (Re)scatter when the player moved past half a cell or the
+                    //    density changed (deterministic, so this never reshuffles).
+                    if let (Some(tpc), Some(hf)) =
+                        (self.surface.as_ref(), self.height_field.as_ref())
+                    {
+                        let center = tpc.feet_position();
+                        let moved = self
+                            .flora_scatter_center
+                            .map_or(true, |p| {
+                                (p - center).length() > flora_scatter::SPACING_M * 0.5
+                            });
+                        let density_changed =
+                            (self.flora_density - self.flora_last_density).abs() > 1e-3;
+                        if moved || density_changed {
+                            self.flora_instances = flora_scatter::scatter(
+                                hf.as_ref(), self.terrain_height_scale, center, self.flora_density,
+                            );
+                            self.flora_scatter_center = Some(center);
+                            self.flora_last_density = self.flora_density;
+                        }
+                    }
+                    // 3. Frame uniforms + ONE wind solve (shared by every instance —
+                    //    same genome → same bones) + shadow-map validity (shadows off
+                    //    in-scene: enabled (params.z) = 0 → fs skips the sample; the
+                    //    empty depth pass just keeps set1's shadow map in SHADER_READ).
+                    //    ponytail: the 2048² clear each frame is cheap; init once if
+                    //    it ever shows on a profile.
                     self.flora_clock += dt;
                     if let (Some(rend), Some(tree)) =
                         (self.flora_renderer.as_mut(), self.flora_tree.as_mut())
@@ -1409,11 +1624,6 @@ impl App {
                         let wind = [self.flora_clock, 0.6, 1.0, 0.0];
                         let _ = rend.set_frame_uniforms(rhi, fi, &fu);
                         let _ = rend.set_bone_matrices(rhi, fi, tree.solve_wind(wind));
-                        // Shadows off in-scene: enabled (params.z) = 0 → fs_branch
-                        // skips the sample. The empty depth pass below just keeps
-                        // the set1 shadow map in SHADER_READ so the descriptor stays
-                        // valid. ponytail: re-running the 2048² clear each frame is
-                        // cheap; init once if it ever shows on a profile.
                         let su = ShadowUniforms {
                             light_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
                             params: [1.0 / rend.shadow_map_size() as f32, 0.0, 0.0, 0.0],
@@ -1443,6 +1653,37 @@ impl App {
                     }
                 }
 
+                // Solar-system bodies (sun + distant planets) as lit spheres on the sky
+                // shell; drawn after opaque terrain so reversed-Z lets the focused planet
+                // limb eclipse them, before the near translucent layers.
+                if let Some(bodies) = self.bodies.as_ref() {
+                    if let Err(e) = bodies.record(rhi, fi, &fu, &camera, &self.system, spin) {
+                        log::error!("BodyRenderer::record error: {e}");
+                    }
+                }
+
+                // Atmosphere shell — after bodies, behind the foreground (the limb
+                // halo against space + a soft silhouette).
+                if self.atmo_enabled {
+                    if let Some(a) = self.atmosphere.as_ref() {
+                        if let Err(e) = a.record(rhi, fi, &fu, camera_world_pos, self.atmo_params) {
+                            log::error!("Atmosphere::record error: {e}");
+                        }
+                    }
+                }
+
+                // Reference markers (equator ring + pole spikes), depth-tested so
+                // the globe occludes the far side.
+                if self.markers_poles || self.markers_equator {
+                    let (poles, eq, sea) =
+                        (self.markers_poles, self.markers_equator, self.sea_level_m);
+                    if let Some(m) = self.markers.as_mut() {
+                        if let Err(e) = m.record(rhi, fi, &fu, camera_world_pos, sea, poles, eq) {
+                            log::error!("Markers::record error: {e}");
+                        }
+                    }
+                }
+
                 // Character (after terrain/Nanite, before the translucent ocean).
                 if draw_character {
                     if let (Some(ch), Some(tpc)) =
@@ -1458,14 +1699,21 @@ impl App {
 
                 // Procedural trees: drawn inside the opaque pass, after the
                 // character, before the translucent ocean (shares reversed-Z depth).
+                // One shared species mesh, one draw pair per scattered instance.
                 #[cfg(feature = "flora")]
                 if draw_trees {
                     if let (Some(rend), Some(tree)) =
-                        (self.flora_renderer.as_ref(), self.flora_tree.as_mut())
+                        (self.flora_renderer.as_ref(), self.flora_tree.as_ref())
                     {
                         let wind = [self.flora_clock, 0.6, 1.0, 0.0];
-                        if let Err(e) = tree.record(rhi, rend, fi, camera_world_pos, wind) {
-                            log::error!("FloraView::record error: {e}");
+                        for inst in &self.flora_instances {
+                            let model = flora_scatter::instance_model(
+                                inst.origin, inst.yaw, inst.scale, camera_world_pos,
+                            );
+                            if let Err(e) = tree.record_at(rhi, rend, fi, model, wind) {
+                                log::error!("FloraView::record_at error: {e}");
+                                break;
+                            }
                         }
                     }
                 }
@@ -1474,12 +1722,14 @@ impl App {
                 // shell + FFT waves render in one refractive 1× pass (matching colour,
                 // depth-darkening, and refraction). Without TAA, fall back to the
                 // simple alpha-blended shell in the MSAA pass.
+                let mut water_split = false;
                 if self.ocean_enabled {
                     let sea = self.sea_level_m;
                     // The expensive FFT patch is drawn only near the surface; the shell
                     // covers the rest. begin_water_pass returns false when TAA is off.
                     let draw_waves = self.wave_enabled && altitude < 20_000.0;
                     let split = self.wave.is_some() && rhi.begin_water_pass(fi).unwrap_or(false);
+                    water_split = split;
                     if split {
                         let scene_view = rhi.refraction_src_view();
                         let scene_depth = rhi.refraction_depth_view();
@@ -1497,6 +1747,20 @@ impl App {
                     } else if let Some(o) = self.ocean.as_ref() {
                         if let Err(e) = o.record(rhi, fi, &fu, camera_world_pos, sea) {
                             log::error!("Ocean::record error: {e}");
+                        }
+                    }
+                }
+
+                // Wind streakline overlay — drawn LAST so the opaque sea can't paint
+                // over it (the streaks ride ~1.5 km up, the top atmosphere layer). In
+                // the water-split 1× instance when TAA is on, else the MSAA pass.
+                if self.wind_enabled {
+                    let sea = self.sea_level_m;
+                    if let Some(w) = self.wind.as_mut() {
+                        if let Err(e) =
+                            w.record(rhi, fi, &fu, camera_world_pos, sea, water_split)
+                        {
+                            log::error!("WindOverlay::record error: {e}");
                         }
                     }
                 }

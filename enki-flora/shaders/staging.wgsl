@@ -519,3 +519,50 @@ fn fs_arrow(in: ArrowVsOut) -> @location(0) vec4<f32> {
     // LINEAR HDR out — the flora OutputPass applies ACES ONCE on scene+bloom.
     return arrow_pc.color;
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// (5) IMPOSTOR — far-distance LEAF BILLBOARD (the leaf-LOD impostor far-tier).
+//
+// Once a tree is tiny on screen, its thousands of alpha-cutout leaf cards are
+// pure overdraw for a few pixels. The leaf LOD crossfades the cards OUT and this
+// IN: ONE camera-facing quad (built CPU-side — model cols = right·r, up·r) painted
+// as a soft canopy blob in the per-tree pigment. Alpha-blended, so the crossfade
+// is just `alpha = coverage * blend`. // ponytail: a procedural round blob, NOT a
+// baked octahedral atlas — at the impostor distance the tree is ~10 px, so the
+// missing view-dependent parallax is invisible. Upgrade to a multi-view baked
+// atlas only if trees ever get large enough on screen to show it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// model + (rgb pigment, crossfade alpha). Mirrors `ImpostorPush` in flora_view.rs.
+struct ImpostorPush {
+    model : mat4x4<f32>,
+    color : vec4<f32>,   // rgb = canopy pigment (linear HDR); w = crossfade alpha
+}
+var<immediate> impostor_pc: ImpostorPush;
+
+struct ImpostorVsOut {
+    @builtin(position) clip_pos : vec4<f32>,
+    @location(0)       uv       : vec2<f32>,
+}
+
+@vertex
+fn vs_impostor(v: StageVsIn) -> ImpostorVsOut {
+    var out: ImpostorVsOut;
+    let world_pos = impostor_pc.model * vec4<f32>(v.position, 1.0);
+    out.clip_pos = frame.view_proj * world_pos;
+    out.uv = v.uv.xy;
+    return out;
+}
+
+@fragment
+fn fs_impostor(in: ImpostorVsOut) -> @location(0) vec4<f32> {
+    // Radial canopy blob: dense core, feathered rim (uv centre 0.5,0.5).
+    let r = length(in.uv - vec2<f32>(0.5, 0.5)) * 2.0;
+    let cov = 1.0 - smoothstep(0.55, 1.0, r);            // soft round silhouette
+    if (cov < 0.01) { discard; }
+    // Cheap round shading: brighten the top, darken the underside, so the blob
+    // reads as a lit canopy sphere, not a flat disc. uv.y=1 is the screen top.
+    let lift = clamp(0.55 + 0.6 * (in.uv.y - 0.5) + 0.2 * (0.5 - in.uv.x), 0.30, 1.25);
+    let col = impostor_pc.color.rgb * lift;
+    return vec4<f32>(col, cov * impostor_pc.color.w);   // LINEAR HDR; ACES later
+}

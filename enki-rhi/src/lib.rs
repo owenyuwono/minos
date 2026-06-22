@@ -1340,6 +1340,29 @@ impl Rhi {
         Ok(())
     }
 
+    /// Bind `N` vertex buffers (bindings `0..N`) — the variadic form of
+    /// [`bind_vertex_buffers`]. The flora branch LIT pipeline uses 6 streams
+    /// (pos/nrm/uv/attr + aTangent/aFrameU for the seamless bark frame); the
+    /// fixed-4 helper above stays for everything else.
+    pub fn bind_vertex_buffers_slice(
+        &mut self,
+        fi: u32,
+        handles: &[BufferHandle],
+    ) -> Result<(), RhiError> {
+        let cmd = self.commands.frames[fi as usize].buffer;
+        let mut vk_bufs = Vec::with_capacity(handles.len());
+        for &h in handles {
+            vk_bufs.push(self.resolve_buffer(h)?);
+        }
+        let offsets = vec![0u64; handles.len()];
+        unsafe {
+            self.device
+                .handle
+                .cmd_bind_vertex_buffers(cmd, 0, &vk_bufs, &offsets);
+        }
+        Ok(())
+    }
+
     /// Bind the index buffer (u32 indices).
     ///
     /// Handles may come from either the static `BufferStore` (M1) or the

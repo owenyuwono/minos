@@ -55,8 +55,7 @@ struct Ocean {
 @group(0) @binding(3) var scene_tex: texture_2d<f32>;
 @group(0) @binding(4) var scene_samp: sampler;
 @group(0) @binding(5) var scene_depth: texture_2d<f32>;
-
-const WARP_M: f32 = 55.0; // domain-warp magnitude (m) — breaks tile repetition
+@group(0) @binding(6) var<storage, read> wind: array<f32>;  // per-vertex wind 0..1
 
 // ── Cascade field sampling (bilinear, wrapping) ────────────────────────────────
 
@@ -86,35 +85,61 @@ fn sample_cascade(c: i32, uv: vec2<f32>) -> OceanTexel {
     return o;
 }
 
-// ── World-anchored noise (amplitude field + domain warp) ───────────────────────
+// ── Tile blending — breaks the FFT tile repeat without distorting waves ─────────
+// Each blend cell rotates + offsets the sample coordinate; 4 cells are bilinearly
+// blended (and the returned horizontal vectors rotated back into the grid frame),
+// so no region reads as a single repeating tile, and the rotations read as
+// crossing / multi-directional seas.
 
-fn hash3(p: vec3<f32>) -> f32 {
-    return fract(sin(dot(p, vec3<f32>(12.9898, 78.233, 37.719))) * 43758.5453);
+const BLEND_M: f32 = 240.0; // blend-cell size (m); randomised rotation/offset per cell
+
+fn hash2(p: vec2<f32>) -> vec2<f32> {
+    let q = vec2<f32>(dot(p, vec2<f32>(127.1, 311.7)), dot(p, vec2<f32>(269.5, 183.3)));
+    return fract(sin(q) * 43758.5453);
 }
 
-fn vnoise3(p: vec3<f32>) -> f32 {
-    let i = floor(p); let f = fract(p); let u = f * f * (3.0 - 2.0 * f);
-    let c000 = hash3(i + vec3<f32>(0.0, 0.0, 0.0)); let c100 = hash3(i + vec3<f32>(1.0, 0.0, 0.0));
-    let c010 = hash3(i + vec3<f32>(0.0, 1.0, 0.0)); let c110 = hash3(i + vec3<f32>(1.0, 1.0, 0.0));
-    let c001 = hash3(i + vec3<f32>(0.0, 0.0, 1.0)); let c101 = hash3(i + vec3<f32>(1.0, 0.0, 1.0));
-    let c011 = hash3(i + vec3<f32>(0.0, 1.0, 1.0)); let c111 = hash3(i + vec3<f32>(1.0, 1.0, 1.0));
-    let x00 = mix(c000, c100, u.x); let x10 = mix(c010, c110, u.x);
-    let x01 = mix(c001, c101, u.x); let x11 = mix(c011, c111, u.x);
-    return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
+fn cell_rot(cell: vec2<f32>) -> mat2x2<f32> {
+    let a = hash2(cell).x * 6.2831853;
+    let c = cos(a); let s = sin(a);
+    return mat2x2<f32>(c, s, -s, c);
 }
 
-fn fbm3(p: vec3<f32>) -> f32 {
-    var v = 0.0; var a = 0.5; var q = p;
-    for (var i = 0; i < 3; i = i + 1) { v = v + a * vnoise3(q); q = q * 2.03; a = a * 0.5; }
-    return clamp(v / 0.875, 0.0, 1.0);
+struct Blend { c0: vec2<f32>, c1: vec2<f32>, c2: vec2<f32>, c3: vec2<f32>, w: vec4<f32> }
+
+fn blend_cells(grid: vec2<f32>) -> Blend {
+    let g = grid / BLEND_M;
+    let gi = floor(g);
+    let gf = g - gi;
+    var b: Blend;
+    b.c0 = gi;
+    b.c1 = gi + vec2<f32>(1.0, 0.0);
+    b.c2 = gi + vec2<f32>(0.0, 1.0);
+    b.c3 = gi + vec2<f32>(1.0, 1.0);
+    b.w = vec4<f32>((1.0 - gf.x) * (1.0 - gf.y), gf.x * (1.0 - gf.y),
+                    (1.0 - gf.x) * gf.y, gf.x * gf.y);
+    return b;
 }
 
-fn wave_intensity(dir: vec3<f32>) -> f32 { return fbm3(dir * ocean.amp.x); }
-fn amp_from_dir(dir: vec3<f32>) -> f32 { return mix(ocean.amp.y, ocean.amp.z, wave_intensity(dir)); }
-
-// Smoothly-varying world-space sample offset → breaks the regular tile grid.
-fn warp_world(dir: vec3<f32>) -> vec2<f32> {
-    return (vec2<f32>(vnoise3(dir * 4.0 + 17.3), vnoise3(dir * 4.0 + 71.9)) * 2.0 - 1.0) * WARP_M;
+fn sample_blend(c: i32, grid: vec2<f32>, b: Blend) -> OceanTexel {
+    let tile = cascade_scale(c);
+    var cells = array<vec2<f32>, 4>(b.c0, b.c1, b.c2, b.c3);
+    var disp = vec4<f32>(0.0);
+    var deriv = vec4<f32>(0.0);
+    for (var k = 0; k < 4; k = k + 1) {
+        let cell = cells[k];
+        let r = cell_rot(cell);
+        let off = hash2(cell + vec2<f32>(19.7, 4.3)) * 2048.0;
+        let tx = sample_cascade(c, (r * grid + off) / tile);
+        let rt = transpose(r); // rotate the sampled horizontal vectors back to grid frame
+        let dh = rt * vec2<f32>(tx.disp.x, tx.disp.z);
+        let sl = rt * vec2<f32>(tx.deriv.x, tx.deriv.y);
+        disp = disp + b.w[k] * vec4<f32>(dh.x, tx.disp.y, dh.y, tx.disp.w);
+        deriv = deriv + b.w[k] * vec4<f32>(sl.x, sl.y, tx.deriv.z, tx.deriv.w);
+    }
+    var o: OceanTexel;
+    o.disp = disp;
+    o.deriv = deriv;
+    return o;
 }
 
 // ── Vertex ─────────────────────────────────────────────────────────────────────
@@ -127,6 +152,7 @@ struct VsOut {
     @location(1)       grid      : vec2<f32>,
     @location(2)       fade      : f32,
     @location(3)       wdir      : vec3<f32>,
+    @location(4)       wind      : f32,   // wind strength 0..1 (drives amp + intensity)
 }
 
 // Projected grid: each vertex is a screen-space lattice point already ray-cast
@@ -134,7 +160,7 @@ struct VsOut {
 // the sphere normal + the sub-point tangent, displace by the FFT (faded by the
 // ~screen-uniform cell size), and shade as a wave.
 @vertex
-fn vs_projected(v: VsIn) -> VsOut {
+fn vs_projected(v: VsIn, @builtin(vertex_index) vi: u32) -> VsOut {
     var out: VsOut;
     let base = v.position;                                   // on the sea sphere, cam-relative
     let up = normalize(base - ocean.center_rel.xyz);         // sphere normal at this point
@@ -142,7 +168,9 @@ fn vs_projected(v: VsIn) -> VsOut {
     let rel = base - ocean.sub_point_rel.xyz;
     let grid = vec2<f32>(dot(rel, east), dot(rel, north));   // tangent coords for FFT
     let cell = length(base) * ocean.center_rel.w;            // ~screen-uniform world cell
-    let warp = warp_world(up);
+    let ws = wind[vi];                                       // wind strength 0..1 at this vertex
+    let amp = mix(ocean.amp.y, ocean.amp.z, ws);            // wind drives wave height
+    let b = blend_cells(grid);
     let cc = i32(ocean.cfg.w);
 
     var disp = vec3<f32>(0.0);
@@ -150,9 +178,9 @@ fn vs_projected(v: VsIn) -> VsOut {
         if (c >= cc) { break; }
         let tile = cascade_scale(c);
         let w = 1.0 - smoothstep(tile * 0.4, tile * 0.8, cell);
-        disp = disp + sample_cascade(c, (grid + warp) / tile).disp.xyz * w;
+        disp = disp + sample_blend(c, grid, b).disp.xyz * w;
     }
-    disp = disp * amp_from_dir(up);
+    disp = disp * amp;
 
     let p = base + east * disp.x + north * disp.z + up * disp.y;
     out.clip = frame.view_proj * vec4<f32>(p, 1.0);
@@ -160,6 +188,7 @@ fn vs_projected(v: VsIn) -> VsOut {
     out.grid = grid;
     out.fade = 1.0;
     out.wdir = up;
+    out.wind = ws;
     return out;
 }
 
@@ -239,25 +268,24 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // detail + specular roughening with distance).
     let fp = max(length(dpdx(in.world_pos)), length(dpdy(in.world_pos)));
 
-    // Debug: heat-map the spatial wave-intensity field.
+    // Debug: heat-map the wind field that drives wave height + intensity.
     if (ocean.amp.w > 0.5) {
-        return vec4<f32>(heat(wave_intensity(in.wdir)) * (0.4 + 0.6 * in.fade), 1.0);
+        return vec4<f32>(heat(in.wind) * (0.4 + 0.6 * in.fade), 1.0);
     }
 
-    // Sum cascade derivatives (→ normal) + foam, domain-warped. Each
-    // cascade is faded by the per-pixel screen FOOTPRINT (world metres per pixel) —
-    // detail the pixel can't resolve is dropped, so far / zoomed-out water doesn't
-    // alias foam + fine normals into white speckle.
+    // Sum cascade derivatives (→ normal) + foam. Tile-blended (breaks the repeat),
+    // wind-driven amplitude, and faded by the per-pixel screen FOOTPRINT (world
+    // metres per pixel) so far / zoomed-out water doesn't alias into white speckle.
     let cc = i32(ocean.cfg.w);
-    let amp = amp_from_dir(in.wdir);
-    let warp = warp_world(in.wdir);
+    let amp = mix(ocean.amp.y, ocean.amp.z, in.wind);
+    let b = blend_cells(in.grid);
     var deriv = vec4<f32>(0.0);
     var foam = 0.0;
     for (var c = 0; c < 3; c = c + 1) {
         if (c >= cc) { break; }
         let tile = cascade_scale(c);
         let w = 1.0 - smoothstep(tile * 0.4, tile * 0.9, fp);
-        let tx = sample_cascade(c, (in.grid + warp) / tile);
+        let tx = sample_blend(c, in.grid, b);
         deriv = deriv + tx.deriv * w;
         if (c < cc - 1) { foam = foam + clamp((ocean.shading.y - tx.disp.w) * ocean.shading.z, 0.0, 1.0) * w; }
     }

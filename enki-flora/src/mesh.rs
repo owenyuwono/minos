@@ -195,6 +195,13 @@ pub struct BranchMesh {
     pub uvs: Vec<f32>,
     pub ao: Vec<f32>,
     pub radii: Vec<f32>,
+    /// `3 * vertex_count` — per-vertex branch FRAME: `tangents` = the branch axial
+    /// direction (T), `frame_us` = one cross-section basis vector (U). Both are
+    /// parallel-transported along the chain AND inherited across forks, so the
+    /// bark shader can derive a seamless around-the-branch angle (T,U,W=T×U) that
+    /// flows across branch junctions instead of jumping. (dryad branchMesh fix.)
+    pub tangents: Vec<f32>,
+    pub frame_us: Vec<f32>,
     pub indices: Vec<u32>,
     pub vertex_count: u32,
     pub triangle_count: u32,
@@ -213,6 +220,8 @@ impl BranchMesh {
             uvs: Vec::new(),
             ao: Vec::new(),
             radii: Vec::new(),
+            tangents: Vec::new(),
+            frame_us: Vec::new(),
             indices: Vec::new(),
             vertex_count: 0,
             triangle_count: 0,
@@ -235,6 +244,8 @@ struct Builder {
     uvs: Vec<f32>,
     ao: Vec<f32>,
     radii: Vec<f32>,
+    tangents: Vec<f32>,
+    frame_us: Vec<f32>,
     indices: Vec<u32>,
     // ── Wind bake (purely additive — written alongside every vertex push). ──
     bone_index: Vec<f32>,
@@ -252,6 +263,8 @@ impl Builder {
             uvs: Vec::new(),
             ao: Vec::new(),
             radii: Vec::new(),
+            tangents: Vec::new(),
+            frame_us: Vec::new(),
             indices: Vec::new(),
             bone_index: Vec::new(),
             bone_fraction: Vec::new(),
@@ -272,6 +285,8 @@ impl Builder {
         radius: f64,
         bone_idx: f64,
         bone_frac: f64,
+        tangent: V3,
+        frame_u: V3,
     ) -> u32 {
         let vi = self.v_cursor;
         self.positions.push(p[0] as f32);
@@ -284,6 +299,12 @@ impl Builder {
         self.uvs.push(v as f32);
         self.ao.push(ao_val as f32);
         self.radii.push(radius as f32);
+        self.tangents.push(tangent[0] as f32);
+        self.tangents.push(tangent[1] as f32);
+        self.tangents.push(tangent[2] as f32);
+        self.frame_us.push(frame_u[0] as f32);
+        self.frame_us.push(frame_u[1] as f32);
+        self.frame_us.push(frame_u[2] as f32);
         self.bone_index.push(bone_idx as f32);
         self.bone_fraction.push(bone_frac as f32);
         for k in 0..3 {
@@ -317,6 +338,10 @@ impl Builder {
     ) -> u32 {
         let first_vert = self.v_cursor;
         let two_pi = std::f64::consts::TAU;
+        // Ring axial tangent T = u × v (frame is orthonormal → equals the branch
+        // axis). Constant across the ring; baked per-vertex so the bark shader can
+        // align its furrow pattern to the branch axis. frameU baked = u.
+        let t_ax = v3cross(u, v);
         for j in 0..segs {
             let theta = (j as f64 / segs as f64) * two_pi;
             let ct = theta.cos();
@@ -339,7 +364,7 @@ impl Builder {
             }
 
             let u_coord = j as f64 / segs as f64;
-            self.write_vertex(p, n, u_coord, arc_len, ao_val, r, bone_idx, bone_frac);
+            self.write_vertex(p, n, u_coord, arc_len, ao_val, r, bone_idx, bone_frac, t_ax, u);
         }
         first_vert
     }
@@ -636,6 +661,18 @@ pub fn build_branch_mesh_with(graph: &Graph, opts: BranchMeshOpts) -> BranchMesh
         });
     }
 
+    // ── Per-node FRAME + GLOBAL-ARC storage for cross-fork inheritance (dryad
+    //    branchMesh seam fix). A child chain forking off a node INHERITS that
+    //    node's parallel-transport frame + its global arc, so the bark
+    //    around-coordinate flows across the junction and UV.v doesn't reset → no
+    //    bark seam at forks. Chains emit parent-before-child (ascending node
+    //    order), so a fork node is already stored when its children start. ──
+    let mut node_frame_u: Vec<V3> = vec![[0.0; 3]; n_nodes];
+    let mut node_frame_t: Vec<V3> = vec![[0.0; 3]; n_nodes];
+    let mut node_frame_set: Vec<bool> = vec![false; n_nodes];
+    let mut node_arc: Vec<f64> = vec![0.0; n_nodes];
+    let mut node_arc_set: Vec<bool> = vec![false; n_nodes];
+
     let mut b = Builder::new();
 
     // ---- Emit geometry per chain. ci == bone index for every vertex of the
@@ -702,24 +739,59 @@ pub fn build_branch_mesh_with(graph: &Graph, opts: BranchMeshOpts) -> BranchMesh
         let pivot_ni = if has_prepend { 1 } else { 0 };
         let total_arc = chain_total_arc_from_pivot[ci];
 
-        // Initial tangent + frame.
+        // Initial tangent + frame. INHERIT the parent's parallel-transport frame
+        // across the fork (chain[0] is the shared fork node when prepended) so the
+        // bark around-coordinate flows across junctions; otherwise (root) perp_to.
         let tangent = if n >= 2 {
             v3norm(v3sub(nodes[chain[1]].pos, nodes[chain[0]].pos))
         } else {
             [0.0, 1.0, 0.0]
         };
-        let frame_u = perp_to(tangent);
-        let frame_v = v3norm(v3cross(tangent, frame_u));
+        let start_node = chain[0];
+        // For an inherited (fork-child) chain, use the parent's frame + tangent
+        // AS-IS for the shared fork ring (chain[0]), so that ring is IDENTICAL to
+        // the parent's ring there → no bark seam at the junction. The bend to THIS
+        // chain's direction is then handled by the NORMAL per-segment transport at
+        // the next ring. (Pre-transporting to this chain's `tangent` here made the
+        // shared ring outgoing-aligned while the parent's was incoming-aligned — a
+        // frame mismatch that showed as a horizontal furrow seam at every fork/bend.)
+        let (frame_u, frame_v, init_prev_tangent) = if node_frame_set[start_node] {
+            let p_u = node_frame_u[start_node];
+            let p_t = node_frame_t[start_node];
+            let p_v = v3norm(v3cross(p_t, p_u));
+            (p_u, p_v, p_t)
+        } else {
+            let fu = perp_to(tangent);
+            (fu, v3norm(v3cross(tangent, fu)), tangent)
+        };
+        // Global arc from the root for this chain's start (inherited at the fork
+        // node), so UV.v is continuous across forks → no bark texture seam.
+        let global_arc_start = if node_arc_set[start_node] {
+            node_arc[start_node]
+        } else {
+            0.0
+        };
 
         // Single-node chain: minimal geometry, no triangles. boneFraction = 0.
         if n == 1 {
             let node = &nodes[chain[0]];
             let r = node.radius.max(MIN_RADIUS);
             let ao_val = node_ao[chain[0]];
+            // Record frame/arc so anything forking here inherits it (don't clobber
+            // a fork node the parent already set).
+            if !node_frame_set[chain[0]] {
+                node_frame_u[chain[0]] = frame_u;
+                node_frame_t[chain[0]] = tangent;
+                node_frame_set[chain[0]] = true;
+            }
+            if !node_arc_set[chain[0]] {
+                node_arc[chain[0]] = global_arc_start;
+                node_arc_set[chain[0]] = true;
+            }
             if is_tip {
-                b.write_vertex(node.pos, [0.0, 1.0, 0.0], 0.0, 0.0, ao_val, r, bone_idx, 0.0);
+                b.write_vertex(node.pos, [0.0, 1.0, 0.0], 0.0, global_arc_start, ao_val, r, bone_idx, 0.0, tangent, frame_u);
             } else {
-                b.emit_ring(node.pos, r, frame_u, frame_v, segs, 0.0, ao_val, bone_idx, 0.0);
+                b.emit_ring(node.pos, r, frame_u, frame_v, segs, global_arc_start, ao_val, bone_idx, 0.0);
             }
             continue;
         }
@@ -728,7 +800,7 @@ pub fn build_branch_mesh_with(graph: &Graph, opts: BranchMeshOpts) -> BranchMesh
         let mut arc_len = 0.0_f64;
         let mut arc_from_pivot = 0.0_f64; // arc from the pivot node (for boneFraction)
         let mut ring_indices: Vec<u32> = Vec::new();
-        let mut prev_tangent = tangent;
+        let mut prev_tangent = init_prev_tangent;
         let mut cur_u = frame_u;
         let mut cur_v = frame_v;
 
@@ -796,12 +868,26 @@ pub fn build_branch_mesh_with(graph: &Graph, opts: BranchMeshOpts) -> BranchMesh
                 cur_u,
                 cur_v,
                 segs,
-                arc_len,
+                global_arc_start + arc_len,
                 node_ao[chain[ni]],
                 bone_idx,
                 bone_frac,
             );
             ring_indices.push(ring_start);
+            // Record this node's GLOBAL arc + frame so child chains forking here
+            // inherit them. Do NOT overwrite the shared ni==0 fork node already set
+            // by the parent (else a 2nd+ sibling would inherit the 1st's frame =
+            // an extra rotation → twisted bark). ni>0 nodes belong to this chain.
+            let node_idx = chain[ni];
+            if ni > 0 || !node_arc_set[node_idx] {
+                node_arc[node_idx] = global_arc_start + arc_len;
+                node_arc_set[node_idx] = true;
+            }
+            if ni > 0 || !node_frame_set[node_idx] {
+                node_frame_u[node_idx] = cur_u;
+                node_frame_t[node_idx] = prev_tangent;
+                node_frame_set[node_idx] = true;
+            }
         }
 
         for ri in 0..ring_indices.len().saturating_sub(1) {
@@ -819,11 +905,13 @@ pub fn build_branch_mesh_with(graph: &Graph, opts: BranchMeshOpts) -> BranchMesh
                 tip_node.pos,
                 apex_normal,
                 0.5,
-                tip_arc_len,
+                global_arc_start + tip_arc_len,
                 node_ao[chain[n - 1]],
                 (tip_node.radius * taper_mul(n - 1)).max(MIN_RADIUS),
                 bone_idx,
                 tip_bone_frac,
+                prev_tangent,
+                cur_u,
             );
             b.emit_apex_fan(apex_vert, *ring_indices.last().unwrap(), segs);
         }
@@ -847,6 +935,8 @@ pub fn build_branch_mesh_with(graph: &Graph, opts: BranchMeshOpts) -> BranchMesh
         uvs: b.uvs,
         ao: b.ao,
         radii: b.radii,
+        tangents: b.tangents,
+        frame_us: b.frame_us,
         indices: b.indices,
         vertex_count,
         triangle_count,

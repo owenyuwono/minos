@@ -47,10 +47,17 @@ const DEFAULT_DIST: f32 = 6.0;
 const ZOOM_STEP: f32 = 0.8;
 /// How fast the body yaws to face its travel direction (radians/second).
 const TURN_RATE: f32 = 12.0;
-/// Keep the third-person camera this far above the terrain (m).
-const CAM_MARGIN: f64 = 0.4;
-/// Steps in the camera-occlusion march (boom pull-in).
-const COLLISION_STEPS: u32 = 8;
+/// Keep the third-person camera this far off the terrain (m) — acts as the
+/// camera's collision radius so the near plane clears the surface.
+const CAM_MARGIN: f64 = 0.5;
+/// Samples in the camera-collision march from the character outward.
+const COLLISION_STEPS: u32 = 16;
+/// Closest the collision may pull the boom (m) when fully obstructed.
+const COLLISION_MIN: f32 = 0.4;
+/// Boom smoothing rates (per second): snap IN fast when blocked, ease OUT slowly
+/// when clear so the camera doesn't pop out from behind cover.
+const BOOM_PULL_IN_RATE: f32 = 30.0;
+const BOOM_PUSH_OUT_RATE: f32 = 6.0;
 
 // ── View ────────────────────────────────────────────────────────────────────
 
@@ -76,8 +83,11 @@ pub struct ThirdPersonController {
     cam_dir: Vec3,
     /// Camera pitch (radians), clamped to `[MIN_PITCH, MAX_PITCH]`.
     cam_pitch: f32,
-    /// Chase-camera boom length (m).
+    /// Desired chase-camera boom length (m) — what zoom sets.
     cam_dist: f32,
+    /// Smoothed *effective* boom after collision (lerps toward the collided
+    /// target; fast in, slow out). This is what `camera()` actually uses.
+    eff_dist: f32,
     view: View,
 
     hf: Arc<dyn HeightField>,
@@ -110,6 +120,7 @@ impl ThirdPersonController {
             cam_dir: facing,
             cam_pitch: 0.2,
             cam_dist: DEFAULT_DIST,
+            eff_dist: DEFAULT_DIST,
             view: View::Third,
             hf,
             base_radius,
@@ -210,22 +221,38 @@ impl ThirdPersonController {
         speed as f32
     }
 
+    /// Camera target (look-at) point — shoulders height above the feet.
+    fn anchor(&self) -> DVec3 {
+        self.feet + self.local_up() * ANCHOR_HEIGHT
+    }
+
+    /// Camera look direction: azimuth tilted by pitch. Positive pitch tilts
+    /// downward (the chase camera is elevated and looks down on the character).
+    fn look_dir(&self) -> Vec3 {
+        let upf = self.local_up().as_vec3();
+        let (sp, cp) = (self.cam_pitch.sin(), self.cam_pitch.cos());
+        (self.cam_dir * cp - upf * sp).normalize()
+    }
+
+    /// Per-frame tick: advance the smoothed collision boom. Call once per frame
+    /// (with the active surface controller) so `camera()` reflects collision.
+    pub fn update(&mut self, dt: f32) {
+        let target = self.collide_boom(self.anchor(), self.look_dir());
+        // Snap in fast when newly blocked; ease out slowly when the view clears.
+        let rate = if target < self.eff_dist { BOOM_PULL_IN_RATE } else { BOOM_PUSH_OUT_RATE };
+        let t = (rate * dt).clamp(0.0, 1.0);
+        self.eff_dist += (target - self.eff_dist) * t;
+    }
+
     /// Build the camera for the current view.
     pub fn camera(&self) -> Camera {
         let up = self.local_up();
         let upf = up.as_vec3();
-        // Look direction: azimuth tilted by pitch. Positive pitch tilts downward
-        // (the chase camera is elevated and looks down on the character).
-        let (sp, cp) = (self.cam_pitch.sin(), self.cam_pitch.cos());
-        let look = (self.cam_dir * cp - upf * sp).normalize();
+        let look = self.look_dir();
 
         let position = match self.view {
             View::First => self.feet + up * EYE_HEIGHT,
-            View::Third => {
-                let anchor = self.feet + up * ANCHOR_HEIGHT;
-                let dist = self.collide_boom(anchor, look);
-                anchor - look.as_dvec3() * dist as f64
-            }
+            View::Third => self.anchor() - look.as_dvec3() * self.eff_dist as f64,
         };
 
         // Orientation from (forward = look, world up = surface up).
@@ -242,25 +269,29 @@ impl ThirdPersonController {
         }
     }
 
-    /// Pull the boom in so the chase camera never clips through terrain.
+    /// Largest collision-free boom length: march from the anchor outward along the
+    /// boom and stop at the first sample that enters terrain, so terrain *between*
+    /// the character and the camera pulls the camera in (line-of-sight occlusion).
     ///
-    /// ponytail: an 8-step linear march from full length inward — picks the
-    /// longest boom that keeps the camera above the surface. Swap for a proper
-    /// ray-march against the height field if the step shows.
+    /// Tested against the **drawn** grid surface (same as the feet) so it agrees
+    /// with what's on screen — not the analytic curve. `CAM_MARGIN` is the camera's
+    /// collision radius.
     fn collide_boom(&self, anchor: DVec3, look: Vec3) -> f32 {
-        let mut chosen = MIN_DIST;
-        for i in 0..COLLISION_STEPS {
-            // Sample from the full length inward toward the anchor.
-            let t = 1.0 - i as f32 / (COLLISION_STEPS - 1) as f32;
-            let d = self.cam_dist * t;
-            let pos = anchor - look.as_dvec3() * d as f64;
-            let min_r = self.ground_radius(pos.normalize()) + CAM_MARGIN;
-            if pos.length() >= min_r {
-                chosen = d;
-                break;
+        let out = -look.as_dvec3(); // anchor → desired camera position
+        let mut safe = COLLISION_MIN.min(self.cam_dist);
+        for i in 1..=COLLISION_STEPS {
+            let d = self.cam_dist * (i as f32 / COLLISION_STEPS as f32);
+            let pos = anchor + out * d as f64;
+            let ground = grid_surface_radius(
+                self.hf.as_ref(), self.base_radius, self.height_scale, self.grid_res,
+                pos.normalize(),
+            ) + CAM_MARGIN;
+            if pos.length() < ground {
+                break; // blocked here → keep the last clear distance
             }
+            safe = d;
         }
-        chosen
+        safe.clamp(COLLISION_MIN.min(self.cam_dist), self.cam_dist)
     }
 
     /// Current feet position on the surface.
@@ -386,16 +417,41 @@ mod tests {
 
     #[test]
     fn chase_camera_stays_above_terrain() {
-        // Even at the lowest pitch, the camera must not sink below the surface.
+        // Even at the lowest pitch, collision must keep the camera above the surface.
         let mut c = spawn();
         for _ in 0..50 {
             c.on_orbit(0.0, -10_000.0); // drag up hard → minimum elevation (look up)
+        }
+        // Collision is applied by update(); converge the smoothed boom.
+        for _ in 0..10 {
+            c.update(0.1);
         }
         let cam = c.camera();
         let dir = cam.position.normalize();
         let min_r = c.ground_radius(dir);
         assert!(cam.position.length() >= min_r - 1e-3,
             "camera sank below terrain: r={} min={}", cam.position.length(), min_r);
+    }
+
+    #[test]
+    fn collision_pulls_camera_in_when_blocked() {
+        // Terrain that climbs steeply away from the spawn pole — the camera, sitting
+        // a few metres off-pole, runs into the rising ground and the boom shortens.
+        // Small test planet so a few metres of boom is a meaningful arc.
+        struct RampHf;
+        impl HeightField for RampHf {
+            fn height(&self, dir: DVec3, _l: u8) -> f64 {
+                1.0 - dir.normalize().y // 0 at the +Y pole, rising away from it
+            }
+        }
+        let mut c = ThirdPersonController::new(
+            DVec3::new(0.0, 100.0, 0.0), Arc::new(RampHf), 100.0, 2000.0, 256,
+            Vec3::new(0.0, 0.0, -1.0),
+        );
+        for _ in 0..30 { c.update(0.1); }
+        assert!(c.eff_dist < DEFAULT_DIST - 0.5,
+            "boom should pull in against the rising terrain, got {}", c.eff_dist);
+        assert!(c.eff_dist > 0.0 && c.eff_dist.is_finite());
     }
 
     #[test]
