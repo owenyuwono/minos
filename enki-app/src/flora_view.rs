@@ -675,6 +675,8 @@ impl FloraView {
         // Write the debug mode into the spare bark2.z lane (see flora.wgsl).
         let mut bark2 = self.bark2;
         bark2[2] = dbg;
+        // In-scene: tell fs_branch to ACES-tonemap (matches terrain). Viewer: 0.
+        bark2[3] = if renderer.in_scene() { 1.0 } else { 0.0 };
         let bpush = BranchPush {
             model: model.to_cols_array_2d(),
             wind,
@@ -714,6 +716,8 @@ impl FloraView {
             // Write the debug mode into the spare leaf_params2.z lane.
             let mut leaf_params2 = self.leaf_params2;
             leaf_params2[2] = dbg;
+            // In-scene: ACES-tonemap in fs_leaf (matches terrain). Viewer: 0.
+            leaf_params2[3] = if renderer.in_scene() { 1.0 } else { 0.0 };
             let lpush = LeafPush {
                 model: model.to_cols_array_2d(),
                 pigment: self.leaf_pigment,
@@ -1197,12 +1201,17 @@ fn build_leaf_mesh(
         let outward = (canopy_out + tan_out)
             .normalize_or(canopy_out)
             .normalize_or(Vec3::Y);
-        // The anchor already carries mid_radius for body/apical clusters, so a
-        // FULL extra radius would float them. Seat to the surface using a small
-        // fraction that closes the gap for centerline (spine) anchors and hugs
-        // thin twigs without lifting surface-seated clusters off (radius is tiny
-        // on twigs by construction). // ponytail: one mul-add, no extra alloc.
-        const SEAT_FRAC: f32 = 0.5;
+        // The anchor sits on the ORIGINAL (untapered) wood surface
+        // (cluster_base = centerline + radial*mid_radius). The branch mesher now
+        // TAPERS the twig tube toward the tip (mesh.rs twig taper), so the
+        // rendered wood surface is pulled INWARD of the anchor by the taper gap.
+        // Seating the base further OUT would float it off the thinned wood, so we
+        // instead seat it slightly INWARD (toward the canopy center) — a small
+        // insertion that lands the base ON / just inside the rendered twig wood
+        // for every leaf, never hanging in air. `radius` (mid_radius) is tiny on
+        // twigs by construction, so the insertion is small and reads as the leaf
+        // emerging from the bark. // ponytail: one mul-add, no extra alloc.
+        const SEAT_FRAC: f32 = -0.6; // negative = seat inward (insertion)
         let p = anchor + outward * (radius * SEAT_FRAC);
 
         // ── Render-side LIFT (insertion/elevation) + UP_BIAS adjustment. ──

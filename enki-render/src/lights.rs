@@ -141,6 +141,21 @@ impl Lights {
             },
         }
     }
+
+    /// Lighting for a sun at `dir` (unit, surface→sun) with premultiplied `color`.
+    /// Keeps `demiurge_default`'s hemisphere + ambient base, sets the primary
+    /// directional to the sun, and zeroes the fill light so the day/night terminator
+    /// stays clean (the night side is lit only by hemisphere + ambient). Driven by
+    /// [`crate::sky::SkyModel`].
+    pub fn from_sun(dir: glam::Vec3, color: glam::Vec3) -> Self {
+        let mut l = Self::demiurge_default();
+        l.directional_0 = DirectionalLight {
+            direction: dir.normalize_or_zero(),
+            color_intensity: color,
+        };
+        l.directional_1.color_intensity = glam::Vec3::ZERO;
+        l
+    }
 }
 
 /// Approximate gamma-expand from sRGB to linear (component-wise).

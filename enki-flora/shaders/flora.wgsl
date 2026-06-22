@@ -44,7 +44,7 @@ struct FrameUniforms {
 //               rendered with, plus the texel size + normalBias + enable flag.
 struct ShadowUniforms {
     light_view_proj : mat4x4<f32>,  // world → light clip (same matrix the depth pass used)
-    params          : vec4<f32>,    // (1/shadowMapSize, normalBias, enabled, 0)
+    params          : vec4<f32>,    // (1/shadowMapSize, normalBias, enabled, dappled)
 }
 @group(1) @binding(0) var shadow_map     : texture_depth_2d;
 @group(1) @binding(1) var shadow_sampler : sampler_comparison;
@@ -117,8 +117,12 @@ fn env_brdf_approx(roughness: f32, ndv: f32) -> vec2<f32> {
 // is sun0; sun1 is an unshadowed diffuse fill; AO multiplies ONLY the indirect
 // (IBL) terms (dryad applies AO to indirectDiffuse, not the direct sun). The
 // caller still applies ACES afterward, exactly as the half-Lambert path did.
+// `ind_shadow` (default 1.0 = today): an extra multiplier on the INDIRECT (IBL)
+// term only, used by DAPPLED mode to trim the sky/ambient fill in shadowed
+// regions so the real PCF sun-spots punch through instead of being filled back in
+// by un-shadowed IBL. OFF passes 1.0 here → byte-identical to the old shading.
 fn pbr_shade(n: vec3<f32>, v: vec3<f32>, albedo: vec3<f32>, roughness: f32,
-             shadow_f: f32, ao: f32) -> vec3<f32> {
+             shadow_f: f32, ao: f32, ind_shadow: f32) -> vec3<f32> {
     let F0 = vec3<f32>(0.04);
     let ndv = max(dot(n, v), 1e-4);
 
@@ -154,7 +158,7 @@ fn pbr_shade(n: vec3<f32>, v: vec3<f32>, albedo: vec3<f32>, roughness: f32,
     // dryad: reflectedLight.indirectDiffuse *= mix(1.0, vAo, 0.85) — AO floored
     // at 15% and applied to the INDIRECT (IBL/SH) term ONLY, never the direct sun.
     let ao_indirect = mix(1.0, ao, 0.85);
-    return direct + fill + (diff_ibl + spec_ibl) * ao_indirect;
+    return direct + fill + (diff_ibl + spec_ibl) * ao_indirect * ind_shadow;
 }
 
 // dryad shadow.bias = -0.0005 (NDC depth units). enki is reversed-Z (GREATER,
@@ -204,7 +208,23 @@ fn sample_shadow(world_pos: vec3<f32>, world_normal: vec3<f32>, ndl: f32) -> f32
     let ref_depth = clamp(ndc.z + SHADOW_DEPTH_BIAS, 0.0, 1.0);
 
     let texel = shadow.params.x;
+    // DAPPLED (params.w): the high-res 4096 map resolves the leaf gaps into hard
+    // sun-spots; a wider 5×5 grid (literal-bounded → naga-safe) softens those
+    // edges back to a dryad-like penumbra so the dappling reads as soft light, not
+    // stair-stepped aliasing. OFF keeps the exact 3×3 (9-tap) kernel → byte-
+    // identical to today's look.
+    let dappled = shadow.params.w > 0.5;
     var sum = 0.0;
+    if (dappled) {
+        // 5×5 grid (25 taps) over the comparison sampler.
+        for (var dy = -2; dy <= 2; dy = dy + 1) {
+            for (var dx = -2; dx <= 2; dx = dx + 1) {
+                let ofs = vec2<f32>(f32(dx), f32(dy)) * texel;
+                sum = sum + textureSampleCompare(shadow_map, shadow_sampler, uv + ofs, ref_depth);
+            }
+        }
+        return sum / 25.0;
+    }
     // 3×3 grid (literal-bounded → naga-safe).
     for (var dy = -1; dy <= 1; dy = dy + 1) {
         for (var dx = -1; dx <= 1; dx = dx + 1) {
@@ -770,9 +790,19 @@ fn fs_branch(in: BranchVsOut) -> @location(0) vec4<f32> {
     let ndl0   = dot(n, frame.sun0_dir.xyz);
     let shadow_f = sample_shadow(in.shadow_pos, n, ndl0);
 
-    let lit = pbr_shade(n, v, albedo, roughness, shadow_f, ao);
-    // LINEAR HDR out — the flora OutputPass applies ACES ONCE on scene+bloom.
-    return vec4<f32>(lit, 1.0);
+    // DAPPLED: trim the bark's INDIRECT (sky/IBL) fill in shadowed regions so the
+    // canopy's sun-spots read on the trunk too. mix(0.55,1.0,shadow_f) keeps a
+    // dappled-shade floor (55% ambient in full shadow) so the trunk doesn't go
+    // black. OFF → 1.0 (byte-identical).
+    let dappled = shadow.params.w > 0.5;
+    let ind_shadow = select(1.0, mix(0.55, 1.0, shadow_f), dappled);
+
+    let lit = pbr_shade(n, v, albedo, roughness, shadow_f, ao, ind_shadow);
+    // Viewer path: LINEAR HDR out (the flora OutputPass applies ACES once on
+    // scene+bloom). In-scene path (bark2.w > 0.5): there is no flora post pass, so
+    // apply the SAME ACES as terrain.wgsl here → flora sits in the ground's exposure.
+    let outc = select(lit, aces_filmic(lit), branch_pc.bark2.w > 0.5);
+    return vec4<f32>(outc, 1.0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1074,7 +1104,12 @@ fn fs_leaf(in: LeafVsOut, @builtin(front_facing) front: bool) -> @location(0) ve
         let perturbed = normalize(t * tn.x + b * tn.y + n * tn.z);
         // Blend toward the canopy sphere normal (dryad's 80% canopy weight) so the
         // relief reads as surface detail, not a per-card facet break.
-        n = normalize(mix(perturbed, n, 0.8));
+        // DAPPLED: pull LESS toward the soft sphere normal (0.8→0.35) so per-leaf
+        // geometric variation in ndl survives — the canopy stops facing the sun as
+        // one uniform dome, so the shadow gaps land on differently-oriented leaves
+        // and the dappling reads as distinct sun-spots. OFF → 0.8 (byte-identical).
+        let canopy_w = select(0.8, 0.35, shadow.params.w > 0.5);
+        n = normalize(mix(perturbed, n, canopy_w));
     }
 
     // ── Debug render modes (spare push lane). Silhouette cutout already applied
@@ -1092,14 +1127,25 @@ fn fs_leaf(in: LeafVsOut, @builtin(front_facing) front: bool) -> @location(0) ve
     // BOTH the canopy-depth AO (exposure*0.5+0.5) AND the former whole-term
     // interior-shadow factor (mix(0.45,1.0,exposure), was `shadowMul` below) into
     // the single `ao` arg → pbr_shade restricts it to the indirect IBL term.
+    let dappled = shadow.params.w > 0.5;
     let exp_leaf  = clamp(in.exposure, 0.0, 1.0);
-    let ao_leaf   = (exp_leaf * 0.5 + 0.5) * mix(0.45, 1.0, exp_leaf);
+    // The exposure-darkening floor (the smooth bright→dark crown gradient) is the
+    // canopy-normal/exposure FAKE that masks fine dappling. DAPPLED: lift that
+    // floor (mix base 0.45→0.75) so the fake interior-shadow gradient softens and
+    // the REAL high-res PCF shadow becomes what darkens the interior. OFF → 0.45
+    // (byte-identical).
+    let exp_floor = select(0.45, 0.75, dappled);
+    let ao_leaf   = (exp_leaf * 0.5 + 0.5) * mix(exp_floor, 1.0, exp_leaf);
     let v = normalize(-in.view_pos);
     // SUN0 (key) is the shadow-caster: PCF-gate it. The leaf casts cutout shadows
     // (alpha-tested depth pass), so leaves shadow each other + the ground.
     let ndl0 = dot(n, frame.sun0_dir.xyz);
     let shadow_f = sample_shadow(in.shadow_pos, n, ndl0);
-    let pbr = pbr_shade(n, v, albedo, roughness, shadow_f, ao_leaf);
+    // DAPPLED: trim the INDIRECT (sky/IBL) fill in shadowed leaves so the sun-spots
+    // punch through instead of being filled back in by un-shadowed IBL. Floor 0.4
+    // keeps shaded interior leaves from going black. OFF → 1.0 (byte-identical).
+    let ind_shadow = select(1.0, mix(0.4, 1.0, shadow_f), dappled);
+    let pbr = pbr_shade(n, v, albedo, roughness, shadow_f, ao_leaf, ind_shadow);
 
     // ── Backlit / transmission (dryad two-lobe): wrap-diffuse + forward scatter.
     // ponytail: the OLD weights stacked the bright key sun (intensity ~3.0) onto
@@ -1139,8 +1185,10 @@ fn fs_leaf(in: LeafVsOut, @builtin(front_facing) front: bool) -> @location(0) ve
     // (LEAF_EXPOSURE) so sunlit leaves read as lit foliage just under the bloom
     // gate — only the very brightest specular tips still bloom, the way dryad's do.
     let lit = (pbr + sunlift + backlitGlow) * LEAF_EXPOSURE;
-    // LINEAR HDR out — the flora OutputPass applies ACES ONCE on scene+bloom.
-    return vec4<f32>(lit, 1.0);
+    // See fs_branch: linear HDR for the viewer; ACES-in-shader when in-scene
+    // (leaf_params2.w > 0.5) so it matches terrain's exposure.
+    let outc = select(lit, aces_filmic(lit), leaf_pc.leaf_params2.w > 0.5);
+    return vec4<f32>(outc, 1.0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

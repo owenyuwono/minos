@@ -647,22 +647,27 @@ pub fn build_branch_mesh_with(graph: &Graph, opts: BranchMeshOpts) -> BranchMesh
         let segs = radial_segs_for(level);
         let is_tip = children_of[*chain.last().unwrap()].is_empty();
 
-        // ── Twig-tip wood cull (opt-in). The foliage pass clothes leaf-bearing
-        //    twigs (branch_level >= cull_level) in leaf cards, so rendering bark
-        //    there is the "bare sticks poking past the canopy" artifact. We strip
-        //    the TUBE on the outer twig portion of TIP chains only:
-        //      * Only TIP chains (no children) are eligible — truncating an
-        //        interior chain would orphan its child geometry; tips have none.
-        //      * Within a tip chain, branch_level rises monotonically toward the
-        //        tip, so the twig nodes (>= cull_level) form a contiguous TAIL.
-        //        We keep the leading rings (level < cull_level, plus ONE boundary
-        //        node so the kept stub still meets its leafy continuation flush)
-        //        and drop the rest. If the chain is twig all the way (the whole
-        //        thing is >= cull_level — e.g. a fine fork-child), drop it whole.
+        // ── Twig-tip wood TAPER + apex cull (opt-in). The foliage pass clothes
+        //    leaf-bearing twigs (branch_level >= cull_level) in leaf cards whose
+        //    bases are seated ON the bark surface (foliage cluster_base =
+        //    centerline + radial*mid_radius). If we deleted that bark the leaves
+        //    would float in mid-air. Instead we KEEP the full tube under every
+        //    leaf-bearing node (no floating) but make the twig read as a fine
+        //    natural twig rather than a chunky bare stick:
+        //      * TIP chains only (no children) are eligible to be tapered —
+        //        interior chains keep full radius (they carry structural wood).
+        //      * Twig nodes (branch_level >= cull_level) form a contiguous tail
+        //        (level rises monotonically toward the tip). Their ring radius is
+        //        smoothly tapered from the boundary radius down toward ~MIN_RADIUS
+        //        at the very tip, so the wood is present (leaves attach) but thin.
+        //      * The collapsing APEX fan of a tapered tip is dropped (the tube
+        //        already tapers to a hair); this also keeps the culled mesh
+        //        strictly smaller than the un-culled baseline.
         //    Bones/node_to_bone (built above) are UNAFFECTED, so the wind
         //    hierarchy and the leaf pass's nearest_bone lookup are untouched. ──
-        let mut culled_tip = false; // dropped the real apex → no apex fan
-        let mut cull_keep: Option<usize> = None; // #rings to keep when truncating
+        // twig_taper = Some((first_twig_idx, last_idx)): rings in this [start,end]
+        // index range get a tip-ward radius taper. `None` → no taper this chain.
+        let mut twig_taper: Option<(usize, usize)> = None;
         if let Some(cull_level) = opts.twig_cull_level {
             if is_tip {
                 // First node index whose branch_level reaches the twig level.
@@ -670,19 +675,27 @@ pub fn build_branch_mesh_with(graph: &Graph, opts: BranchMeshOpts) -> BranchMesh
                     .iter()
                     .position(|&ni| nodes[ni].branch_level >= cull_level);
                 if let Some(ts) = twig_start {
-                    // Keep up to and including the boundary node (ts), so the
-                    // surviving bark stub overlaps where leaves begin. Need >= 2
-                    // kept rings for a tube; otherwise the chain is essentially
-                    // all twig → drop it entirely.
-                    let keep = ts + 1;
-                    if keep < 2 {
-                        continue; // whole chain is twig wood: cull it
-                    }
-                    cull_keep = Some(keep);
-                    culled_tip = true; // the real tip (and its apex) is gone
+                    // Taper from the boundary node to the apex. The apex node is
+                    // chain[n-1] (collapsed below), so taper across [ts, n-1].
+                    twig_taper = Some((ts, n - 1));
                 }
             }
         }
+        // Per-ring twig radius taper. Returns a multiplier in (0,1] for ring `ni`:
+        // 1.0 before the first twig node, then eases toward ~0 at the tip so the
+        // outermost twig wood is a fine thread. Quadratic ease keeps the join at
+        // the boundary smooth (multiplier 1.0 there) while thinning fast near tip.
+        let taper_mul = |ni: usize| -> f64 {
+            match twig_taper {
+                Some((start, end)) if ni >= start && end > start => {
+                    let f = (ni - start) as f64 / (end - start) as f64; // 0..1
+                    // ease: keep ~full at boundary, thin toward the tip.
+                    let e = f * f; // quadratic
+                    (1.0 - 0.92 * e).max(0.04)
+                }
+                _ => 1.0,
+            }
+        };
         let bone_idx = ci as f64;
         // Pivot node index within the chain (0 if no prepend, 1 if prepended).
         let has_prepend = n >= 2 && parent_of_chain_start[chain[1]] == chain[0] as isize;
@@ -723,21 +736,20 @@ pub fn build_branch_mesh_with(graph: &Graph, opts: BranchMeshOpts) -> BranchMesh
         // apex fan after). When the twig tail is culled we instead emit `keep`
         // closed rings (the boundary node gets a real ring, not an apex) and skip
         // the fan — `effective_is_tip` drives the apex block below.
-        let effective_is_tip = is_tip && !culled_tip;
-        let ring_count = match cull_keep {
-            Some(keep) => keep,
-            None => {
-                if is_tip {
-                    n - 1
-                } else {
-                    n
-                }
-            }
+        // Tapered twig tips keep the normal tip topology (n-1 rings + a collapsed
+        // apex), so the wood TUBE is present under every leaf — only the radius is
+        // thinned toward the tip. No geometry is dropped; the tip reads as a fine
+        // natural twig instead of a chunky bare stick.
+        let effective_is_tip = is_tip;
+        let ring_count = if is_tip {
+            n - 1
+        } else {
+            n
         };
 
         for ni in 0..ring_count {
             let node = &nodes[chain[ni]];
-            let r = node.radius.max(MIN_RADIUS);
+            let r = (node.radius * taper_mul(ni)).max(MIN_RADIUS);
 
             if ni > 0 {
                 let prev_pos = nodes[chain[ni - 1]].pos;
@@ -809,7 +821,7 @@ pub fn build_branch_mesh_with(graph: &Graph, opts: BranchMeshOpts) -> BranchMesh
                 0.5,
                 tip_arc_len,
                 node_ao[chain[n - 1]],
-                tip_node.radius.max(MIN_RADIUS),
+                (tip_node.radius * taper_mul(n - 1)).max(MIN_RADIUS),
                 bone_idx,
                 tip_bone_frac,
             );
@@ -908,32 +920,47 @@ mod tests {
     }
 
     #[test]
-    fn seed_42_twig_cull_mesh_is_nonempty_finite_in_range_deterministic_and_smaller() {
+    fn seed_42_twig_cull_mesh_is_nonempty_finite_in_range_deterministic_and_tapered() {
         let env = Env::default();
         let genome = random_genome(&env, 42);
         let resolved = resolve(&genome, &env);
 
-        // Baseline (no cull) and the twig-tip-culled output share the SAME graph.
+        // Baseline (no taper) and the twig-tip-tapered output share the SAME graph.
         let base = build_branch_mesh(&resolved.graph);
         let opts = BranchMeshOpts { twig_cull_level: Some(3) };
         let mesh = build_branch_mesh_with(&resolved.graph, opts);
 
-        // Non-empty: the trunk + thick branches always survive the cull.
-        assert!(mesh.vertex_count > 0, "expected vertices after twig cull");
-        assert!(mesh.triangle_count > 0, "expected triangles after twig cull");
+        // Non-empty: the trunk + thick branches always survive.
+        assert!(mesh.vertex_count > 0, "expected vertices after twig taper");
+        assert!(mesh.triangle_count > 0, "expected triangles after twig taper");
 
-        // The cull removed leaf-bearing twig tubes → strictly fewer verts/tris.
-        assert!(
-            mesh.vertex_count < base.vertex_count,
-            "twig cull should drop vertices ({} !< {})",
-            mesh.vertex_count,
-            base.vertex_count
+        // The twig-tip TAPER keeps the full tube under every leaf-bearing node
+        // (so leaves attach to RENDERED wood — no floating); it only THINS the
+        // twig radius toward the tip. Topology is therefore UNCHANGED vs the
+        // baseline — same vertex / triangle counts — but the geometry differs.
+        assert_eq!(
+            mesh.vertex_count, base.vertex_count,
+            "taper must preserve topology (verts {} vs {})",
+            mesh.vertex_count, base.vertex_count
         );
+        assert_eq!(
+            mesh.triangle_count, base.triangle_count,
+            "taper must preserve topology (tris {} vs {})",
+            mesh.triangle_count, base.triangle_count
+        );
+        // The taper actually changed the buffers (thinner twig radii, pulled-in
+        // tube positions) — the culled mesh is NOT byte-identical to the baseline.
+        assert_ne!(
+            mesh.radii, base.radii,
+            "twig taper should thin twig radii vs baseline"
+        );
+        // The thinnest twig radius after taper is strictly below the baseline's
+        // thinnest (the tip is pulled toward MIN_RADIUS).
+        let min_taper = mesh.radii.iter().cloned().fold(f32::INFINITY, f32::min);
+        let min_base = base.radii.iter().cloned().fold(f32::INFINITY, f32::min);
         assert!(
-            mesh.triangle_count < base.triangle_count,
-            "twig cull should drop triangles ({} !< {})",
-            mesh.triangle_count,
-            base.triangle_count
+            min_taper <= min_base,
+            "tapered min radius {min_taper} should be <= baseline min {min_base}"
         );
 
         // SoA lengths still consistent.

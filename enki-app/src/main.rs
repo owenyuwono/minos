@@ -65,6 +65,11 @@ use winit::{
 };
 
 use character::Character;
+#[cfg(feature = "flora")]
+use enki_app::{
+    flora_render::{FloraRenderer, ShadowUniforms},
+    flora_view::{FloraView, LeafMode},
+};
 use controls::{
     first_person::MoveInput,
     globe::GlobeControls,
@@ -79,6 +84,11 @@ use ocean::{Ocean, WaveSurface};
 use planet_view::{PlanetConfig, PlanetView, PlanetViewStats, RhiUploaderDummy, planet_view_from_hf};
 use scene::Scene;
 use stress::StressHarness;
+
+/// Quads per cube-face side of the Nanite terrain bake. Single-sourced so the
+/// third-person character grounds against the *same* grid the renderer draws
+/// (see `controls::terrain_grid`). Must match the bake's `nanite_resolution`.
+const NANITE_BAKE_RES: u32 = 1024;
 
 // ── Render mode ───────────────────────────────────────────────────────────────
 
@@ -119,10 +129,16 @@ struct App {
     character:    Option<Character>,
     #[cfg(feature = "nanite")]
     nanite:       Option<enki_nanite::render::NaniteRenderer>,
-    // Flora lives only in the dedicated `flora_viewer` bin (the showcase + 1:1
-    // dryad-render target). The in-planet draw was a single invisible debug tree
-    // at orbit scale; real on-surface flora (scatter/LOD/placement) is its own
-    // future slice, not this leftover. Removed so `--features flora` stays clean.
+    // Procedural trees (flora), behind `--features flora`. Phase A: the
+    // flora-owned sub-renderer (drawing into the main 3D pass) + one walk-up tree
+    // spawned near the player in Surface mode. Scatter/LOD is a later slice.
+    #[cfg(feature = "flora")]
+    flora_renderer: Option<FloraRenderer>,
+    #[cfg(feature = "flora")]
+    flora_tree:   Option<FloraView>,
+    /// Wind animation clock (seconds), advanced each Surface frame trees draw.
+    #[cfg(feature = "flora")]
+    flora_clock:  f32,
     /// Stage-2 cluster streaming: the deep per-face DAGs (held in RAM) + the
     /// residency selector that streams only the near-cut subset to the GPU pool.
     #[cfg(feature = "nanite")]
@@ -235,6 +251,12 @@ impl App {
             scene:         None,
             stress:        None,
             character:     None,
+            #[cfg(feature = "flora")]
+            flora_renderer: None,
+            #[cfg(feature = "flora")]
+            flora_tree:    None,
+            #[cfg(feature = "flora")]
+            flora_clock:   0.0,
             #[cfg(feature = "nanite")]
             nanite:        None,
             #[cfg(feature = "nanite")]
@@ -406,6 +428,7 @@ impl App {
                 hf,
                 PLANET_RADIUS,
                 self.terrain_height_scale,
+                NANITE_BAKE_RES,
                 heading,
             ));
             self.surface_speed = 0.0;
@@ -656,6 +679,14 @@ impl ApplicationHandler for App {
                     Ok(c)  => self.character = Some(c),
                     Err(e) => log::error!("Character::new failed: {e}"),
                 }
+                // Procedural trees: flora-owned sub-renderer drawing INTO the app's
+                // 3D pass (in_scene = true → swapchain format + ACES-in-shader so it
+                // matches terrain). Trees are spawned lazily once on the surface.
+                #[cfg(feature = "flora")]
+                match FloraRenderer::new(&mut rhi, true) {
+                    Ok(r)  => self.flora_renderer = Some(r),
+                    Err(e) => log::error!("FloraRenderer::new failed: {e}"),
+                }
 
                 let cfg = PlanetConfig {
                     lod: LodConfig {
@@ -716,7 +747,7 @@ impl ApplicationHandler for App {
                     height_scale: cfg.lod.height_scale,
                     // Stage 2: bake DEEP (DAG exceeds the GPU pool); only the
                     // near-cut subset is streamed resident per frame.
-                    nanite_resolution: 1024,
+                    nanite_resolution: NANITE_BAKE_RES,
                 };
                 if matches!(self.mode, RenderMode::SoakTerrain) {
                     self.soak_start = Instant::now();
@@ -1337,6 +1368,62 @@ impl App {
                     }
                 }
 
+                // Flora (procedural trees): spawn one walk-up tree lazily, then
+                // upload its frame/wind uniforms and keep the shadow map valid.
+                // All OUTSIDE begin_rendering (host-visible uploads + a depth-only
+                // pass), mirroring Character::update + the Nanite cull dispatch.
+                #[cfg(feature = "flora")]
+                let draw_trees = nav_mode == NavMode::Surface && self.flora_renderer.is_some();
+                #[cfg(feature = "flora")]
+                if draw_trees {
+                    // Lazy spawn: one tree ~6 m in front of the player, grounded.
+                    if self.flora_tree.is_none() {
+                        if let (Some(tpc), Some(hf)) =
+                            (self.surface.as_ref(), self.height_field.as_ref())
+                        {
+                            let dir = (tpc.feet_position()
+                                + tpc.facing().as_dvec3() * 6.0)
+                                .normalize();
+                            let r = controls::first_person::surface_radius(
+                                hf.as_ref(), controls::PLANET_RADIUS,
+                                self.terrain_height_scale, dir,
+                            );
+                            match FloraView::new(rhi, 0x00C0FFEE, dir * r) {
+                                Ok(tree) => {
+                                    let single = matches!(tree.leaf_mode(), LeafMode::Single);
+                                    if let Some(rend) = self.flora_renderer.as_mut() {
+                                        let _ = rend.update_leaf_texture(
+                                            rhi, &tree.leaf_genes(), single,
+                                        );
+                                    }
+                                    self.flora_tree = Some(tree);
+                                }
+                                Err(e) => log::error!("FloraView::new failed: {e}"),
+                            }
+                        }
+                    }
+                    self.flora_clock += dt;
+                    if let (Some(rend), Some(tree)) =
+                        (self.flora_renderer.as_mut(), self.flora_tree.as_mut())
+                    {
+                        let wind = [self.flora_clock, 0.6, 1.0, 0.0];
+                        let _ = rend.set_frame_uniforms(rhi, fi, &fu);
+                        let _ = rend.set_bone_matrices(rhi, fi, tree.solve_wind(wind));
+                        // Shadows off in-scene: enabled (params.z) = 0 → fs_branch
+                        // skips the sample. The empty depth pass below just keeps
+                        // the set1 shadow map in SHADER_READ so the descriptor stays
+                        // valid. ponytail: re-running the 2048² clear each frame is
+                        // cheap; init once if it ever shows on a profile.
+                        let su = ShadowUniforms {
+                            light_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+                            params: [1.0 / rend.shadow_map_size() as f32, 0.0, 0.0, 0.0],
+                        };
+                        let _ = rend.set_shadow_uniforms(rhi, fi, &su);
+                        rend.begin_shadow_pass(rhi, fi);
+                        rend.end_shadow_pass(rhi, fi);
+                    }
+                }
+
                 // 3D opaque pass.
                 rhi.begin_rendering(fi);
                 rhi.set_viewport_scissor_full(fi);
@@ -1365,6 +1452,20 @@ impl App {
                         let facing = tpc.facing();
                         if let Err(e) = ch.draw(rhi, fi, &fu, &camera, feet, facing) {
                             log::error!("Character::draw error: {e}");
+                        }
+                    }
+                }
+
+                // Procedural trees: drawn inside the opaque pass, after the
+                // character, before the translucent ocean (shares reversed-Z depth).
+                #[cfg(feature = "flora")]
+                if draw_trees {
+                    if let (Some(rend), Some(tree)) =
+                        (self.flora_renderer.as_ref(), self.flora_tree.as_mut())
+                    {
+                        let wind = [self.flora_clock, 0.6, 1.0, 0.0];
+                        if let Err(e) = tree.record(rhi, rend, fi, camera_world_pos, wind) {
+                            log::error!("FloraView::record error: {e}");
                         }
                     }
                 }

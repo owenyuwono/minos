@@ -504,6 +504,7 @@ impl FloraGui {
         gizmo_on: &mut bool,
         bloom_on: &mut bool,
         bloom_strength: &mut f32,
+        dappled: &mut bool,
         flora: Option<&FloraView>,
         stats: &Stats,
     ) -> PanelOut {
@@ -872,6 +873,11 @@ impl FloraGui {
                         *bloom_on,
                         egui::Slider::new(bloom_strength, 0.0..=1.0).text("strength"),
                     );
+                    ui.separator();
+                    // DAPPLED sun-through-canopy self-shadow (render-side, NOT a
+                    // rebuild — a checkbox alone leaves `out.rebuild` unset; it just
+                    // flips ShadowUniforms.params.w next frame).
+                    ui.checkbox(dappled, "Dappled shadows");
                 });
 
             // ── (D) INSPECTOR dock — dryad inspectorPanels port. A scrollable
@@ -1378,6 +1384,13 @@ struct App {
     /// strength 0 is byte-identical to the offscreen-stage parity image.
     bloom_on: bool,
     bloom_strength: f32,
+    /// DAPPLED sun-through-canopy self-shadow mode (render-side, NOT a rebuild).
+    /// When on, the high-res shadow map's sun-spots are let to dominate: the
+    /// shader softens the canopy-normal fake + the exposure floor + the ambient/
+    /// IBL fill so the dappling reads on the trunk + interior leaves. Carried in
+    /// `ShadowUniforms.params.w` and uploaded per-frame — OFF is byte-identical to
+    /// today's look. `FLORA_DAPPLED=1` seeds it on for headless captures.
+    dappled: bool,
     /// ponytail: HEADLESS SCREENSHOT mode. `Some(path)` when `FLORA_SCREENSHOT` is
     /// set → hide the egui panel, render a few warm-up frames, then capture the
     /// final composited frame into a PNG at `path` and exit 0. `frame_count` ticks
@@ -1501,6 +1514,11 @@ impl App {
             // Bloom ON at dryad's default strength (0 / OFF = exact parity).
             bloom_on: true,
             bloom_strength: 0.15,
+            // Dappled OFF by default (byte-identical to the parity look). Set
+            // FLORA_DAPPLED=1 to seed it on for captures.
+            dappled: std::env::var("FLORA_DAPPLED")
+                .map(|v| v != "0")
+                .unwrap_or(false),
             screenshot,
             screenshot_ui,
             frame_count: 0,
@@ -1802,6 +1820,7 @@ impl App {
                 &mut self.gizmo_on,
                 &mut self.bloom_on,
                 &mut self.bloom_strength,
+                &mut self.dappled,
                 self.flora.as_ref(),
                 &stats,
             );
@@ -1862,8 +1881,8 @@ impl App {
                         .unwrap_or(2048) as f32;
                 let su = ShadowUniforms {
                     light_view_proj: lvp.to_cols_array_2d(),
-                    // (1/size, normalBias 0.02 [dryad], enabled, 0)
-                    params: [texel, 0.02, 1.0, 0.0],
+                    // (1/size, normalBias 0.02 [dryad], enabled, dappled)
+                    params: [texel, 0.02, 1.0, if self.dappled { 1.0 } else { 0.0 }],
                 };
                 (su, Some(lvp))
             }
@@ -2200,7 +2219,8 @@ impl ApplicationHandler for App {
 
         // Build the flora-owned sub-renderer (pipelines + descriptor sets + UBO
         // ring) once, from the Rhi's raw handles. Mirrors FloraGui::new.
-        match FloraRenderer::new(&mut rhi) {
+        // in_scene = false: the viewer keeps its own offscreen HDR + bloom pass.
+        match FloraRenderer::new(&mut rhi, false) {
             Ok(r) => self.flora_renderer = Some(r),
             Err(e) => {
                 log::error!("FloraRenderer::new failed: {e}");

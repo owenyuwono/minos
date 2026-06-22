@@ -36,6 +36,7 @@
 pub mod globe;
 pub mod first_person;
 pub mod third_person;
+pub mod terrain_grid;
 pub mod surface_picker;
 pub mod nav_mode;
 

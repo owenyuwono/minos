@@ -20,11 +20,16 @@ use enki_render::camera::Camera;
 use glam::{DVec3, Mat3, Quat, Vec3};
 
 use super::first_person::{project_onto_tangent_plane, surface_radius, MoveInput, SPRINT_MULTIPLIER};
+use super::terrain_grid::grid_surface_radius;
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
 /// Base walk speed (m/s). Sprint multiplies by [`SPRINT_MULTIPLIER`].
 const BASE_SPEED: f64 = 8.0;
+/// Small ground-contact offset (m) so the boots rest on the surface instead of
+/// z-fighting the ground triangle. Grounding is grid-accurate (rides the drawn
+/// mesh), so this is just a contact bias, not a clip band-aid.
+const FOOT_CLEARANCE: f64 = 0.05;
 /// Camera target height above the feet (m) — roughly the shoulders.
 const ANCHOR_HEIGHT: f64 = 1.6;
 /// First-person eye height above the feet (m).
@@ -78,6 +83,9 @@ pub struct ThirdPersonController {
     hf: Arc<dyn HeightField>,
     base_radius: f64,
     height_scale: f64,
+    /// Quads per cube-face side of the rendered terrain grid (Nanite bake res).
+    /// Feet ride this faceted grid, not the full analytic curve.
+    grid_res: u32,
 }
 
 impl ThirdPersonController {
@@ -91,6 +99,7 @@ impl ThirdPersonController {
         hf: Arc<dyn HeightField>,
         base_radius: f64,
         height_scale: f64,
+        grid_res: u32,
         initial_heading: Vec3,
     ) -> Self {
         let dir = feet_pos.normalize();
@@ -105,13 +114,26 @@ impl ThirdPersonController {
             hf,
             base_radius,
             height_scale,
+            grid_res,
         };
-        ctrl.feet = dir * ctrl.ground_radius(dir);
+        ctrl.feet = ctrl.grounded(dir);
         ctrl
     }
 
+    /// Analytic point sample of the surface radius — used for the camera-occlusion
+    /// march (a conservative "is this above ground" probe), not for the feet.
     fn ground_radius(&self, dir: DVec3) -> f64 {
         surface_radius(self.hf.as_ref(), self.base_radius, self.height_scale, dir)
+    }
+
+    /// Feet world position for unit `dir`: the **rendered** (grid-faceted) surface
+    /// under `dir`, lifted by [`FOOT_CLEARANCE`]. Riding the grid (not the analytic
+    /// curve) is what keeps the body on the drawn ground instead of diving.
+    fn grounded(&self, dir: DVec3) -> DVec3 {
+        let r = grid_surface_radius(
+            self.hf.as_ref(), self.base_radius, self.height_scale, self.grid_res, dir,
+        );
+        dir * (r + FOOT_CLEARANCE)
     }
 
     fn local_up(&self) -> DVec3 {
@@ -124,9 +146,10 @@ impl ThirdPersonController {
         // Yaw the azimuth around local up; re-project to absorb numeric drift.
         let yaw = Quat::from_axis_angle(up, -dx * ORBIT_SENSITIVITY);
         self.cam_dir = project_onto_tangent_plane(yaw * self.cam_dir, up);
-        // Drag down (dy>0) lowers the camera (looks up → less elevated); drag up
-        // raises it (looks down). Positive pitch = elevated.
-        self.cam_pitch = (self.cam_pitch - dy * ORBIT_SENSITIVITY).clamp(MIN_PITCH, MAX_PITCH);
+        // Non-inverted: mouse up (dy<0) tilts the view up (camera drops below the
+        // character); mouse down raises the camera to look down. Positive pitch =
+        // camera elevated, looking down.
+        self.cam_pitch = (self.cam_pitch + dy * ORBIT_SENSITIVITY).clamp(MIN_PITCH, MAX_PITCH);
     }
 
     /// Scroll to change the boom length. Positive `delta` zooms in.
@@ -174,7 +197,7 @@ impl ThirdPersonController {
 
         // Advance along the tangent, then re-ground at the new direction.
         let new_dir = (self.feet + move_dir.as_dvec3() * move_dist).normalize();
-        self.feet = new_dir * self.ground_radius(new_dir);
+        self.feet = self.grounded(new_dir);
 
         // Re-project onto the new tangent plane (up rotated as we moved).
         let new_up = self.local_up().as_vec3();
@@ -287,6 +310,7 @@ mod tests {
             Arc::new(FlatHf),
             R,
             1.0,
+            256, // grid_res
             Vec3::new(0.0, 0.0, -1.0),
         )
     }
@@ -365,7 +389,7 @@ mod tests {
         // Even at the lowest pitch, the camera must not sink below the surface.
         let mut c = spawn();
         for _ in 0..50 {
-            c.on_orbit(0.0, 10_000.0); // drag down hard → minimum elevation
+            c.on_orbit(0.0, -10_000.0); // drag up hard → minimum elevation (look up)
         }
         let cam = c.camera();
         let dir = cam.position.normalize();

@@ -12,6 +12,7 @@ $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 - Run: `cargo run -p enki-app`
 - Check/build: `cargo check -p enki-app` (use `check`, not `build`, while the app is running — the `.exe` is locked).
 - Classic engine (no Nanite): `cargo build -p enki-app --no-default-features`.
+- Flora (procedural tree) viewer: `cargo run -p enki-app --bin flora_viewer --features flora` — a standalone bin; the planet `enki` bin does NOT draw flora (see the Flora section).
 - Vendored C deps: `metis` builds clean on MSVC (no cmake/libclang needed).
 
 Both feature configs (default = `nanite` on, and `--no-default-features`) must always compile.
@@ -25,6 +26,7 @@ Both feature configs (default = `nanite` on, and `--no-default-features`) must a
 - **enki-jobs** — background worker pool for chunk meshing.
 - **enki-app** — winit 0.30 app shell, egui panel (`gui.rs`), HUD, `PlanetView` (quadtree grid terrain), async startup loader (`loading.rs`), the Nanite integration, and the third-person controller + animated `Character` (see below).
 - **enki-nanite** — Nanite-style virtualized geometry. **Self-contained, feature-gated, deletable** (see below).
+- **enki-flora** — procedural tree generation: a 1:1 Rust port of the `../dryad` JS flora generator (pure gen-core, no Vulkan, golden-gated) + the flora WGSL shaders. Its GPU render path lives in `enki-app` (`flora_*.rs`). **Self-contained, feature-gated (`flora`), deletable** (see the Flora section).
 
 ## Core conventions
 
@@ -96,6 +98,30 @@ A surface controller with an animated character. Lives in `enki-app` (`controls/
 - Drawn **after terrain/Nanite, before the ocean**, inside the opaque MSAA instance; only when `nav == Surface` and the view is third-person. `Character::update` (skin + upload) runs *before* `begin_rendering` (it's a host-visible memcpy, fine either side); `draw` runs inside.
 - `Character::new` (built at startup in Planet mode) clones the terrain pipeline desc byte-for-byte, so it inherits reversed-Z / MSAA / swapchain format with no special-casing.
 - Controls: Tab → click to drop · WASD (camera-relative) · Shift sprint · mouse orbit · scroll zoom · **V** 1st/3rd · Esc → orbit.
+
+## Flora (procedural trees — `enki-flora` + `flora_viewer`)
+
+A **1:1 Rust/Vulkan port of the `../dryad` JS flora generator** (procedural trees), shown in a standalone CAS-style viewer. **Self-contained, feature-gated (`flora`), deletable**: the pure generator is `enki-flora`; ALL GPU glue is in `enki-app` behind `#[cfg(feature="flora")]` (`flora_render.rs`/`flora_view.rs`/`flora_ibl.rs`/`flora_nanite.rs`/`bark_swatch.rs` + `src/bin/flora_viewer.rs`); the default build never references it. `enki-app` is `lib + bin` so the `flora_viewer` bin can share `flora_view` via the lib.
+
+**Two halves, meeting at `resolve(&Genome, &Env)`:**
+- **Gen-core (`enki-flora/src`, pure, NO Vulkan, deterministic):** `rng` (mulberry32) → `genome` (`random_genome`/`resolve`) → `skeleton`→`roots`→`proportions`→`foliage`, plus `leaf_texture`/`wind_solver`/`mesh`/`bark_swatch`/`color`/`allometry`. A faithful port of dryad's; **determinism is load-bearing** (see the golden contract below).
+- **Render (flora-OWNED raw-`ash` sub-renderer, `flora_render.rs` + `enki-flora/shaders/{flora,staging,post}.wgsl`):** modeled on the egui renderer — flora owns its own VkPipelines + descriptor **set0**(FrameUniforms)/**set1**(shadow map + IBL + wind bone buffer + leaf textures) + its own `gpu-allocator` + offscreen targets, recorded into the viewer's frame bracket. enki-rhi's constrained `create_graphics_pipeline` (one hardcoded set/layout) is bypassed for flora's multi-set needs; the **shared rhi/terrain path is untouched**.
+
+**Render pipeline is 1:1 with dryad:** Cook-Torrance PBR (`pbr_shade`) bark/leaf/ground; HDRI IBL (SH9 irradiance + roughness-mip equirect specular baked from `enki-app/assets/flora/kloofendal_43d_clear_1k.hdr`, embedded via `include_bytes!`, in `flora_ibl.rs`); **PCF sun shadow map** (the tree self-shadows — bark+leaf sample it); dryad light rig (sun `#fff4e0`×3.0, hemi×0.3, env 0.6, exposure 1.0) + Preetham sky (`staging.wgsl`); UnrealBloom → **single ACES** in the composite (linear-HDR offscreen intermediate, no double-tonemap, `post.wgsl`).
+
+**Leaves:** baked superformula+venation textures (`leaf_texture.rs`, color + Sobel-normal, per-genome) on **base-anchored 6-segment curved strips** that grow OUTWARD from the twig (base→tip length axis = the cluster tangent, NOT up) and **droop** (t² world-down × `LEAF_BEND` 0.45). Modes: `Cluster` (1 card = the 5–8-leaf sprite, default) / `Single` (1 card = 1 leaf, `bake_leaf_single`). Single-plane, **double-sided** (back-face normal flip → thin edge-on; dryad's crossed-card multi-plane mode is NOT ported). Render-side **twigs-only** gate; the fine twig wood is **tapered** toward the tip (rendered thin, not deleted) so leaves attach without bare sticks poking. Render-side `LeafTuning` sliders (insertion / up-bias / droop / size / density) live in the View panel and are **golden-free**.
+
+**Wind:** hierarchical bone-skinned (ported `windSolver`+`windSkinGlsl`) — the mesher bakes per-vertex bone weights + a `bones_wind` hierarchy, a per-frame Rust solver composes per-bone matrices → set1 storage buffer → vertex skinning. The leaf gust is **coherent along `windDir`** (not random per-leaf tumble), with an **editable arrow gizmo** at the base (drag on the ground plane to set wind direction). `strength=0` = byte-identical static.
+
+**UI:** egui "flora · CAS" panel — left: preset header + tab strip **Climate/Trunk/Branches/Leaves/Root** (dryad's gene grouping); top-left View window: render modes + Wind + Bloom + Leaf-placement + **Dappled shadows** toggles; top-right Stats. Plus a debug **Inspector** dock (leaf texture/normal/shape, pigment swatch+ramp, bark swatch (CPU-approx of `barkAlbedo`), cross-section). Render modes include **Nanite Triangle/Cluster/LOD**: the branch mesh is baked into `enki-nanite` clusters (`flora_nanite.rs`, via `build_base_clusters`+`build_dag` — the arbitrary-mesh path) and drawn through the Nanite cull+draw, leaves hidden in those debug views.
+
+**Dappled shadows** (View toggle / `FLORA_DAPPLED`): bumps the shadow map to 4096² and a `dappled` flag (`ShadowUniforms.params.w`) lets the real self-shadow dominate (softens the canopy-sphere-normal + exposure fake) → sun-through-canopy. Off = byte-identical soft look. Pure per-frame uniform, no rebuild.
+
+**Determinism / golden contract:** `enki-flora/tests/golden.rs` (`golden_vector_matches_dryad`) byte-compares `resolve()`'s foliage (count/position/scale/rotation/shape) against a dryad-JS dump (`tools/dump_golden.mjs` imports the real `../dryad` JS → `tests/golden.json`). Bar: rng draws + genes EXACT (1e-12), geometry 1e-6 (cross-language trig ~1 ULP). **NEVER reorder genome rng draws (incl. the RESERVED no-ops) or edit `foliage.rs`/`skeleton.rs` placement math / `GOLDEN_ANGLE` without a flag-gated path** — it breaks golden. Mesh changes go through `seed_42_mesh*` determinism tests (NOT loosened). ALL render-side work (`flora_view::build_leaf_mesh`, the shaders, `LeafTuning`, the twig taper) is golden-free. naga + a spv-out emit test validate every WGSL in `cargo test`. NOTE: dryad `resolve(genome, {})` yields NaN (no `gravity` default) — always pass an explicit neutral `Env::default()`.
+
+**Phyllotaxis:** the leaf-cluster azimuth is a 1:1 port — `az_step = (1-radialOrder)·π + radialOrder·GOLDEN_ANGLE` (`GOLDEN_ANGLE = π(3−√5) ≈ 137.5°`). Gene-gated by `radialOrder`; the default broadleaf (`≈0.25`) blends toward alternating (180°), so set `radialOrder=1.0` for the visible golden-angle spiral.
+
+**Visual correctness is USER-verified** (headless agents can't see pixels). For render work: capture a PNG via `FLORA_SCREENSHOT` and LOOK at it — compile/naga/Vulkan-validation green ≠ visually correct (the first 1:1 build rendered a black void with a bloom-blown canopy and still passed every gate).
 
 ## Terrain ↔ ki parity (determinism gate)
 

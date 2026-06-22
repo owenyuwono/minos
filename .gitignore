@@ -1,1 +1,6 @@
 /target
+
+# flora_viewer debug captures + run logs (session artifacts, not source)
+/*.png
+/*.log
+/__pycache__/

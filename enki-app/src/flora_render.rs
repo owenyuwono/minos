@@ -44,8 +44,14 @@ const FLORA_WGSL: &str = include_str!("../../enki-flora/shaders/flora.wgsl");
 const STAGING_WGSL: &str = include_str!("../../enki-flora/shaders/staging.wgsl");
 const POST_WGSL: &str = include_str!("../../enki-flora/shaders/post.wgsl");
 
-/// Square shadow-map resolution (dryad shadow.mapSize = 2048×2048).
-pub const SHADOW_MAP_SIZE: u32 = 2048;
+/// Square shadow-map resolution. Bumped from dryad's 2048 to 4096 so the gaps
+/// between the ~thousands of small leaf cutouts resolve into discrete sun-spots
+/// for the DAPPLED self-shadow mode (a finer map = each PCF tap covers half the
+/// world-space radius → sharper, more-resolved canopy gaps). It is one tree, so
+/// a 4096² D32 map (64 MiB) + its depth pass is trivial here; we keep it always
+/// high-res rather than recreating the image on toggle (the dappled toggle is a
+/// pure per-frame uniform-lane write — see `ShadowUniforms.params.w`).
+pub const SHADOW_MAP_SIZE: u32 = 4096;
 
 /// The LINEAR-HDR offscreen scene format (dryad's composer targets HalfFloatType).
 const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
@@ -72,7 +78,10 @@ struct PostPush {
 pub struct ShadowUniforms {
     /// World(tree-local) → light clip (the matrix the depth pass renders with).
     pub light_view_proj: [[f32; 4]; 4],
-    /// (1/SHADOW_MAP_SIZE, normalBias, enabled, 0).
+    /// (1/SHADOW_MAP_SIZE, normalBias, enabled, dappled).
+    /// `.w` (dappled): 0 = today's look (real shadow + the soft canopy fakes);
+    /// 1 = let the real high-res shadow dominate (soften the canopy-normal blend,
+    /// lower the exposure floor, trim the ambient/IBL fill, extra PCF taps).
     pub params: [f32; 4],
 }
 
@@ -229,6 +238,11 @@ struct Capture {
 pub struct FloraRenderer {
     device: ash::Device,
 
+    /// True when this renderer draws INTO the app's main 3D pass (swapchain
+    /// format, ACES applied in `fs_branch`/`fs_leaf`) rather than its own
+    /// offscreen HDR + bloom pass. Read by `FloraView` to set the tonemap lane.
+    in_scene: bool,
+
     /// ponytail: present only in headless screenshot mode (`FLORA_SCREENSHOT`).
     /// Lazily built on the first capture frame, sized to the swapchain extent.
     capture: Option<Capture>,
@@ -373,12 +387,14 @@ impl FloraRenderer {
     /// Build every flora-owned Vulkan object from the RHI's raw handles. Mirrors
     /// `EguiState::new` → `Renderer::with_default_allocator`: pull raw handles,
     /// build our own pipeline/descriptor objects, return a self-contained renderer.
-    pub fn new(rhi: &mut Rhi) -> Result<Self, RhiError> {
+    pub fn new(rhi: &mut Rhi, in_scene: bool) -> Result<Self, RhiError> {
         let device = rhi.device_handle();
-        // The sky/ground/branch/leaf pipelines now render into the flora-owned
-        // LINEAR-HDR offscreen target (RGBA16F), NOT the swapchain. The composite
-        // OutputPass is the only thing that writes the swapchain format.
-        let color_format = HDR_FORMAT;
+        // Viewer (in_scene = false): branch/leaf/staging render into the
+        // flora-owned LINEAR-HDR offscreen target (RGBA16F), and the composite
+        // OutputPass tonemaps to the swapchain. In-scene (true): they draw straight
+        // into the app's 3D pass, so build them at the SWAPCHAIN format and tonemap
+        // in-shader (the `aces_filmic` lane in flora.wgsl, driven by FloraView).
+        let color_format = if in_scene { rhi.swapchain_format() } else { HDR_FORMAT };
         let samples = rhi.msaa_samples();
         let frames = rhi.frames_in_flight();
 
@@ -635,6 +651,7 @@ impl FloraRenderer {
 
         Ok(Self {
             device,
+            in_scene,
             capture: None,
             flora_module,
             staging_module,
@@ -727,6 +744,13 @@ impl FloraRenderer {
     /// `rhi.msaa_samples()`, both already the Nanite draw pipeline's defaults.
     pub fn scene_color_format(&self) -> vk::Format {
         HDR_FORMAT
+    }
+
+    /// Whether this renderer draws into the app's main 3D pass (vs its own
+    /// offscreen HDR + bloom pass). Drives the ACES-in-shader push lane in
+    /// `FloraView::record_branch`/`record_leaves`.
+    pub fn in_scene(&self) -> bool {
+        self.in_scene
     }
 
     /// Upload this frame's `ShadowUniforms` (light matrix + PCF params) into the

@@ -9,6 +9,7 @@ pub mod camera;
 pub mod projection;
 pub mod material;
 pub mod lights;
+pub mod sky;
 pub mod terrain_pass;
 pub mod water_pass;
 pub mod tonemap;
