@@ -78,6 +78,10 @@ struct GpuFrameData {
     /// True camera world position (xyz); shader reconstructs radial up =
     /// normalize(world_rel + cam_world) for the terrain self-shadow horizon query.
     cam_world: [f32; 4],
+    /// Character shadow capsule (camera-relative): xyz = feet, w = radius.
+    char_a: [f32; 4],
+    /// xyz = head (camera-relative), w = enabled (1 = cast, 0 = none).
+    char_b: [f32; 4],
 }
 
 /// Gribb–Hartmann frustum planes from a view-projection matrix, normalized.
@@ -475,6 +479,9 @@ impl NaniteRenderer {
         // `frame_index`: varies the dither pattern each frame for TAA to average.
         dither: bool,
         frame_index: u32,
+        // Character shadow capsule, camera-relative: (feet, head, radius). `None`
+        // = no caster this frame (e.g. not in third-person). xyz are world_rel-space.
+        character: Option<([f32; 3], [f32; 3], f32)>,
     ) -> Result<(), RhiError> {
         self.debug_mode = debug_mode;
         let args_buf = self.frames[fi as usize].args_buf;
@@ -527,6 +534,8 @@ impl NaniteRenderer {
             // debug: [debug_mode, dither_enabled, frame_index, _]
             debug: [debug_mode, dither as u32, frame_index, 0],
             cam_world: [camera_world.x as f32, camera_world.y as f32, camera_world.z as f32, 0.0],
+            char_a: match character { Some((f, _, r)) => [f[0], f[1], f[2], r], None => [0.0; 4] },
+            char_b: match character { Some((_, h, _)) => [h[0], h[1], h[2], 1.0], None => [0.0; 4] },
         };
         rhi.write_storage_bytes(frame_buf, bytemuck::bytes_of(&data))?;
         // Reset indirect args: vertex_count = 0, instance_count = 1.

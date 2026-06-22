@@ -125,8 +125,11 @@ fn env_brdf_approx(roughness: f32, ndv: f32) -> vec2<f32> {
 // in self-shadow → darken the indirect (IBL) fully and the direct diffuse partly, so
 // the fissures stay dark under any light angle (dryad FRAG_AO_REPLACEMENT). 1.0 = the
 // old shading (leaves pass 1.0).
+// `spec_scale` (1.0 = full): scales BOTH the direct GGX highlight and the IBL
+// specular reflection (incl. the Fresnel rim). Leaves pass a low value to read as
+// matte foliage; bark passes 1.0.
 fn pbr_shade(n: vec3<f32>, v: vec3<f32>, albedo: vec3<f32>, roughness: f32,
-             shadow_f: f32, ao: f32, ind_shadow: f32, crack_ao: f32) -> vec3<f32> {
+             shadow_f: f32, ao: f32, ind_shadow: f32, crack_ao: f32, spec_scale: f32) -> vec3<f32> {
     let F0 = vec3<f32>(0.04);
     let ndv = max(dot(n, v), 1e-4);
 
@@ -145,7 +148,7 @@ fn pbr_shade(n: vec3<f32>, v: vec3<f32>, albedo: vec3<f32>, roughness: f32,
     let ll = ndv * sqrt(ndl * ndl * (1.0 - a2) + a2);
     let Vis = 0.5 / max(lv + ll, 1e-5);
     let F = F0 + (vec3<f32>(1.0) - F0) * pow(1.0 - vdh, 5.0);
-    let spec = D * Vis * F;
+    let spec = D * Vis * F * spec_scale;
     let kd = (vec3<f32>(1.0) - F);   // metalness 0 → albedo not killed
     let direct = (kd * albedo / PI + spec) * frame.sun0_color.xyz * ndl * shadow_f;
 
@@ -157,7 +160,7 @@ fn pbr_shade(n: vec3<f32>, v: vec3<f32>, albedo: vec3<f32>, roughness: f32,
     let R = reflect(-v, n);
     let prefiltered = ibl_specular(R, roughness);
     let ab = env_brdf_approx(roughness, ndv);
-    let spec_ibl = prefiltered * (F0 * ab.x + ab.y);
+    let spec_ibl = prefiltered * (F0 * ab.x + ab.y) * spec_scale;
 
     // dryad: reflectedLight.indirectDiffuse *= mix(1.0, vAo, 0.85) — AO floored
     // at 15% and applied to the INDIRECT (IBL/SH) term ONLY, never the direct sun.
@@ -890,7 +893,7 @@ fn fs_branch(in: BranchVsOut) -> @location(0) vec4<f32> {
     // (low furrowH) are self-shadowed → darken indirect fully + direct partly. Gated
     // by relief so smooth-bark genes aren't darkened.
     let crack_ao = 1.0 - (1.0 - furrowH) * (BARK_CRACK_AO * barkRelief);
-    let lit = pbr_shade(n, v, albedo, roughness, shadow_f, ao, ind_shadow, crack_ao);
+    let lit = pbr_shade(n, v, albedo, roughness, shadow_f, ao, ind_shadow, crack_ao, 1.0);
     // Viewer path: LINEAR HDR out (the flora OutputPass applies ACES once on
     // scene+bloom). In-scene path (bark2.w > 0.5): there is no flora post pass, so
     // apply the SAME ACES as terrain.wgsl here → flora sits in the ground's exposure.
@@ -1212,10 +1215,11 @@ fn fs_leaf(in: LeafVsOut, @builtin(front_facing) front: bool) -> @location(0) ve
     if (mode == 2u) { return vec4<f32>(n * 0.5 + 0.5, 1.0); }      // normals (canopy/face)
     if (mode == 3u) { let e = clamp(in.exposure, 0.0, 1.0); return vec4<f32>(e, e, e, 1.0); } // ao=exposure
 
-    // ── Cook-Torrance PBR (dryad leaf MeshStandardMaterial, metalness 0,
-    //    roughness 0.88 matte). The leaf normal map / exposure-AO are folded in
-    //    as before; AO≈exposure attenuates the indirect IBL term only. ──
-    let roughness = 0.88;
+    // ── Cook-Torrance PBR. Leaves are FULLY MATTE foliage: roughness 0.97 and the
+    //    specular term KILLED (spec_scale 0.0 in the pbr_shade call below) — no
+    //    direct GGX highlight, no IBL sky reflection, no Fresnel rim. Pure diffuse
+    //    (Lambert + SH ambient). (Was 0.30 → still read glossy.) ──
+    let roughness = 0.97;
     // CANOPY-DEPTH DARKENING REMOVED (user request): the height/level `exposure`
     // term used to dim the indirect IBL for lower/interior leaves — the smooth
     // bright-top → dark-bottom crown gradient. Dropped → indirect is uniform; leaves
@@ -1233,7 +1237,7 @@ fn fs_leaf(in: LeafVsOut, @builtin(front_facing) front: bool) -> @location(0) ve
     // punch through instead of being filled back in by un-shadowed IBL. Floor 0.4
     // keeps shaded interior leaves from going black. OFF → 1.0 (byte-identical).
     let ind_shadow = select(1.0, mix(0.4, 1.0, shadow_f), dappled);
-    let pbr = pbr_shade(n, v, albedo, roughness, shadow_f, ao_leaf, ind_shadow, 1.0);
+    let pbr = pbr_shade(n, v, albedo, roughness, shadow_f, ao_leaf, ind_shadow, 1.0, 0.0);
 
     // ── Backlit / transmission (dryad two-lobe): wrap-diffuse + forward scatter.
     // ponytail: the OLD weights stacked the bright key sun (intensity ~3.0) onto

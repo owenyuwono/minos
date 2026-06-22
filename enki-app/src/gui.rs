@@ -85,6 +85,10 @@ pub struct UiOutput {
     pub atmo_enabled: bool,
     /// Atmosphere tunables (height + density).
     pub atmo: crate::atmosphere::AtmoParams,
+    /// Draw the volumetric clouds.
+    pub clouds_enabled: bool,
+    /// Cloud tunables (coverage / density / altitude / wind speed / …).
+    pub clouds: crate::clouds::CloudParams,
     /// Reference markers: pole spikes / equator ring.
     pub markers_poles: bool,
     pub markers_equator: bool,
@@ -204,6 +208,8 @@ impl EguiState {
         wind:              crate::wind::WindParams,
         atmo_enabled:      bool,
         atmo:              crate::atmosphere::AtmoParams,
+        clouds_enabled:    bool,
+        clouds:            crate::clouds::CloudParams,
         markers_poles:     bool,
         markers_equator:   bool,
         stress_stats:      Option<&str>,
@@ -231,6 +237,8 @@ impl EguiState {
             wind,
             atmo_enabled,
             atmo,
+            clouds_enabled,
+            clouds,
             markers_poles,
             markers_equator,
             cycle_nav: false,
@@ -306,6 +314,10 @@ impl EguiState {
                             ui.selectable_value(&mut out.view_mode, 11, "Surface");
                             ui.selectable_value(&mut out.view_mode, 12, "Intensity");
                         });
+                        ui.horizontal(|ui| {
+                            ui.label("Clouds:");
+                            ui.selectable_value(&mut out.view_mode, 13, "Density");
+                        });
                         ui.checkbox(&mut out.wireframe, "Wireframe");
                         ui.checkbox(&mut out.taa, "TAA (temporal AA)");
                     });
@@ -353,6 +365,28 @@ impl EguiState {
                             egui::Slider::new(&mut out.atmo.height, 200.0..=8000.0).text("Height (m)"));
                         ui.add_enabled(out.atmo_enabled,
                             egui::Slider::new(&mut out.atmo.density, 0.0..=2.0).text("Density"));
+                    });
+
+                    // ── Clouds (needs TAA on) ────────────────────────────────
+                    CollapsingHeader::new("Clouds").default_open(true).show(ui, |ui| {
+                        ui.checkbox(&mut out.clouds_enabled, "Show clouds");
+                        let on = out.clouds_enabled;
+                        ui.add_enabled(on,
+                            egui::Slider::new(&mut out.clouds.coverage, 0.0..=1.0).text("Coverage"));
+                        ui.add_enabled(on,
+                            egui::Slider::new(&mut out.clouds.density, 0.0..=0.25).text("Density"));
+                        ui.add_enabled(on,
+                            egui::Slider::new(&mut out.clouds.base_alt_m, 200.0..=8000.0).text("Base alt (m)"));
+                        ui.add_enabled(on,
+                            egui::Slider::new(&mut out.clouds.thickness_m, 500.0..=8000.0).text("Thickness (m)"));
+                        ui.add_enabled(on,
+                            egui::Slider::new(&mut out.clouds.wind_speed, 0.0..=300.0).text("Wind speed (m/s)"));
+                        ui.add_enabled(on,
+                            egui::Slider::new(&mut out.clouds.noise_scale, 500.0..=8000.0).text("Feature size (m)"));
+                        ui.add_enabled(on,
+                            egui::Slider::new(&mut out.clouds.hg_g, 0.0..=0.95).text("Forward scatter"));
+                        ui.add_enabled(on,
+                            egui::Slider::new(&mut out.clouds.steps, 16.0..=96.0).text("March steps"));
                     });
 
                     // ── Reference markers ────────────────────────────────────

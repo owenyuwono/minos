@@ -473,15 +473,18 @@ impl HeightField for TectonicHeightField {
         // Surface wetness = open water (rivers ∪ lakes). Subsurface seep deferred
         // (no seep module yet) — ki's full surface-wetness is the union of both.
         let Some(erosion) = self.erosion.as_ref() else { return 0.0; };
-        // River paint band on the log-normalized acc 0..1 field. Onset matches the
-        // drainage gate the geometry uses (`drain_proxy`, smoothstep(0.30,0.85)) so
-        // water lands in the same channels the valleys are carved into
-        // (`carve_gate`, smoothstep(0.10,0.45)). The old 0.55 onset sat above both,
-        // so only the 1–2 largest trunk mouths cleared it → bare specks.
-        // ponytail: still seed-robust constants, not a percentile of acc — widen
-        // toward carve_gate's 0.10 if the network reads too sparse on other seeds.
-        const RIVER_LO: f64 = 0.30;
-        const RIVER_HI: f64 = 0.55;
+        // River paint band on the log-normalized acc 0..1 field. CRITICAL: the
+        // 4-pass seam-blur on flow_accum (erosion.rs) crushes the peak to ~0.48
+        // (NOT 1.0), so the band must live below that — the old 0.30/0.55 put HI
+        // *above* the field max, so rivers never saturated and only ~3.6% of land
+        // cleared the 0.30 onset → an all-tan, empty Wetness view. Measured land
+        // acc-CDF (seed 42): ≥0.20 ~23%, ≥0.25 ~10%, ≥0.30 ~3.6%, max ~0.48. So
+        // 0.18→0.32 saturates the trunks, fades tributaries in, and floods nothing;
+        // it sits inside the geometry's carve_gate (0.10,0.45) so water lands in the
+        // valleys actually incised. ponytail: not used by height() (that reads acc
+        // directly), so tuning this is golden-free — nudge LO down if still sparse.
+        const RIVER_LO: f64 = 0.18;
+        const RIVER_HI: f64 = 0.32;
         let river = smoothstep(RIVER_LO, RIVER_HI, erosion.acc_at(dir));
         let lake = erosion.lake_mask_at(dir);
         river.max(lake).clamp(0.0, 1.0) as f32

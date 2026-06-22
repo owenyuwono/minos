@@ -32,6 +32,8 @@ struct FrameData {
     planes: array<vec4<f32>, 6>,
     debug: vec4<u32>,
     cam_world: vec4<f32>, // true camera world pos (xyz) — for radial-up reconstruction
+    char_a: vec4<f32>,    // character shadow capsule: xyz = feet (camera-relative), w = radius
+    char_b: vec4<f32>,    // xyz = head (camera-relative), w = enabled (1/0)
 };
 
 struct Push {
@@ -283,6 +285,31 @@ fn terrain_shadow(world_rel: vec3<f32>, horizon: vec4<f32>, sun: vec3<f32>) -> f
     return 1.0 - clamp((h - sun_elev) * HORIZON_STRENGTH, 0.0, 1.0);
 }
 
+// Occlusion [0,1] of the sun ray from receiver `p` (camera-relative) by a sphere
+// `c` (camera-relative) radius `r`: 1 = fully blocked, 0 = clear. The capsule must
+// be on the sun side of `p` (t > 0). Soft edge over [r, 2r] for a penumbra.
+fn sphere_occ(p: vec3<f32>, sun: vec3<f32>, c: vec3<f32>, r: f32) -> f32 {
+    let w = c - p;
+    let t = dot(w, sun);
+    if (t <= 0.0) { return 0.0; } // sphere is behind the receiver w.r.t. the sun
+    let d = length(w - sun * t); // perpendicular distance from sphere centre to the ray
+    return 1.0 - smoothstep(r, r * 2.0, d);
+}
+
+// Character shadow: approximate the body as 3 spheres along the feet→head capsule
+// and take the max occlusion. ponytail: 3 spheres reads as a humanoid cast; swap
+// for an exact ray-vs-capsule (or per-limb) if the blob shape isn't enough.
+fn capsule_shadow(p: vec3<f32>, sun: vec3<f32>) -> f32 {
+    let a = frame.char_a.xyz;
+    let b = frame.char_b.xyz;
+    let r = frame.char_a.w;
+    let occ = max(
+        sphere_occ(p, sun, a, r),
+        max(sphere_occ(p, sun, mix(a, b, 0.5), r), sphere_occ(p, sun, b, r)),
+    );
+    return 1.0 - occ;
+}
+
 @fragment
 fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
     // Dithered LOD cross-fade (frame.debug.y = enabled). This cluster keeps only the
@@ -313,9 +340,14 @@ fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
         let d0 = max(dot(n, frame.sun0_dir.xyz), 0.0) * frame.sun0_color.xyz * albedo;
         let d1 = max(dot(n, frame.sun1_dir.xyz), 0.0) * frame.sun1_color.xyz * albedo;
         let sheen = wet * pow(max(dot(n, frame.sun0_dir.xyz), 0.0), 32.0) * frame.sun0_color.xyz;
-        // Terrain self-shadow: darken the primary-sun direct terms (diffuse + sheen),
-        // leaving ambient/hemisphere/fill so shadowed ground isn't black.
-        let sh = terrain_shadow(in.world_rel, in.horizon, normalize(frame.sun0_dir.xyz));
+        // Sun occlusion: terrain self-shadow × the character's cast shadow. Darken
+        // the primary-sun direct terms (diffuse + sheen), leaving ambient/hemisphere/
+        // fill so shadowed ground isn't black.
+        let sun_dir = normalize(frame.sun0_dir.xyz);
+        var sh = terrain_shadow(in.world_rel, in.horizon, sun_dir);
+        if (frame.char_b.w > 0.5) {
+            sh = sh * capsule_shadow(in.world_rel, sun_dir);
+        }
         rgb = aces_filmic(ambient_term + hemi + (d0 + sheen) * sh + d1);
     } else if (pc.mode == 1u) {
         // Unlit — flat biome albedo (no lighting, no ACES).

@@ -972,10 +972,11 @@ impl FloraView {
         fi: u32,
         model: Mat4,
         wind: [f32; 4],
-        lod: LeafLod,
     ) -> Result<(), RhiError> {
+        // The scatter renders every tree at FULL leaf detail — no per-instance LOD
+        // or impostor fade, so trees stay fully visible at any distance.
         self.draw_branch(rhi, renderer, fi, model, wind)?;
-        self.draw_leaves(rhi, renderer, fi, model, wind, lod)
+        self.draw_leaves(rhi, renderer, fi, model, wind, LeafLod::FULL)
     }
 
     /// Branch draw at a given camera-relative `model` (shared by `record_branch`

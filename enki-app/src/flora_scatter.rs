@@ -29,12 +29,15 @@ pub struct TreeInstance {
 }
 
 /// Draw trees within this distance of the player (m).
-pub const RADIUS_M: f64 = 120.0;
-/// Mean spacing between candidate cells (m) — the lat-lon cell edge.
-pub const SPACING_M: f64 = 8.0;
-/// Hard cap on drawn instances (the no-instancing draw-call ceiling). Density
-/// above this is clamped to the nearest `MAX_TREES`.
-pub const MAX_TREES: usize = 120;
+pub const RADIUS_M: f64 = 150.0;
+/// Mean spacing between candidate cells (m) — the lat-lon cell edge. Smaller =
+/// denser grove.
+pub const SPACING_M: f64 = 5.0;
+/// Hard cap on drawn instances — the nearest `MAX_TREES` render, farther cells
+/// drop. ponytail: trees are plain per-instance draws (NOT Nanite-virtualized),
+/// so this bounds the per-frame draw cost; raise it once trees go through a
+/// virtualized/instanced path (then the radius can grow without an fps cliff).
+pub const MAX_TREES: usize = 400;
 
 /// splitmix64-style finalizer over a mixed (cell_i, cell_j, salt) key.
 fn hash(cell_i: i64, cell_j: i64, salt: u64) -> u64 {

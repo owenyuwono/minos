@@ -44,6 +44,7 @@ mod loading;
 mod ocean;
 mod wind;
 mod atmosphere;
+mod clouds;
 mod markers;
 mod solar;
 mod planet_view;
@@ -89,6 +90,7 @@ use fps::FpsMeter;
 use ocean::{Ocean, WaveSurface};
 use wind::WindOverlay;
 use atmosphere::{Atmosphere, AtmoParams};
+use clouds::{Clouds, CloudParams};
 use markers::Markers;
 use solar::BodyRenderer;
 use controls::space::FreeCam;
@@ -145,6 +147,8 @@ struct App {
     wind:         Option<WindOverlay>,
     /// Translucent atmosphere shell (halo + the wind's home altitude).
     atmosphere:   Option<Atmosphere>,
+    /// Wind-driven volumetric clouds (drawn in the water split; TAA-on only).
+    clouds:       Option<Clouds>,
     /// Equator + pole reference markers.
     markers:      Option<Markers>,
     scene:        Option<Scene>,
@@ -246,6 +250,12 @@ struct App {
     atmo_enabled:      bool,
     /// Atmosphere tunables (height + density).
     atmo_params:       AtmoParams,
+    /// Draw the volumetric clouds.
+    clouds_enabled:    bool,
+    /// Cloud tunables (coverage / density / altitude / wind speed / …).
+    cloud_params:      CloudParams,
+    /// Real-elapsed seconds for cloud wind-advection (independent of sim time_scale).
+    cloud_time:        f32,
     /// Reference marker toggles (pole spikes / equator ring).
     markers_poles:     bool,
     markers_equator:   bool,
@@ -305,6 +315,7 @@ impl App {
             wave:          None,
             wind:          None,
             atmosphere:    None,
+            clouds:        None,
             markers:       None,
             scene:         None,
             stress:        None,
@@ -322,7 +333,7 @@ impl App {
             #[cfg(feature = "flora")]
             flora_clock:   0.0,
             flora_enabled: true,
-            flora_density: 0.5,
+            flora_density: 0.65,
             #[cfg(feature = "nanite")]
             nanite:        None,
             #[cfg(feature = "nanite")]
@@ -359,6 +370,9 @@ impl App {
             wind_enabled:      true,
             atmo_enabled:      true,
             atmo_params:       AtmoParams::default(),
+            clouds_enabled:    true,
+            cloud_params:      CloudParams::default(),
+            cloud_time:        0.0,
             markers_poles:     false,
             markers_equator:   false,
             wave_enabled:      true,
@@ -787,6 +801,11 @@ impl ApplicationHandler for App {
                     Ok(a)  => self.atmosphere = Some(a),
                     Err(e) => log::error!("Atmosphere::new failed: {e}"),
                 }
+                // Volumetric clouds (fullscreen raymarch in the water split).
+                match Clouds::new(&mut rhi, color_format, PLANET_RADIUS) {
+                    Ok(c)  => self.clouds = Some(c),
+                    Err(e) => log::error!("Clouds::new failed: {e}"),
+                }
                 // Equator + pole reference markers.
                 match Markers::new(&mut rhi, color_format, samples, PLANET_RADIUS) {
                     Ok(m)  => self.markers = Some(m),
@@ -954,6 +973,9 @@ impl ApplicationHandler for App {
                     // Free caller-owned GPU resources before RHI teardown.
                     if let Some(wave) = &self.wave {
                         wave.destroy(rhi);
+                    }
+                    if let Some(clouds) = &self.clouds {
+                        clouds.destroy(rhi);
                     }
                 }
                 event_loop.exit();
@@ -1206,6 +1228,8 @@ impl App {
         self.system.advance(self.sky.t_seconds);
         let frame_time = self.fps.frame_time_s();
         self.last_tick = now;
+        // Clouds drift in real time (weather), independent of the sim time_scale.
+        self.cloud_time += dt;
 
         // ── Async loading: show a progress bar until the worker finishes ──
         if self.loader.is_some() {
@@ -1228,6 +1252,9 @@ impl App {
                         }
                         if let Some(w) = self.wind.as_mut() {
                             w.set_wind_source(Arc::clone(&out.hf));
+                        }
+                        if let Some(c) = self.clouds.as_mut() {
+                            c.set_wind_source(Arc::clone(&out.hf));
                         }
                         self.terrain_height_scale = cfg.lod.height_scale;
                         self.planet_view = Some(planet_view_from_hf(cfg, out.hf));
@@ -1312,6 +1339,8 @@ impl App {
             let wind_enabled      = self.wind_enabled;
             let atmo_enabled      = self.atmo_enabled;
             let atmo_params       = self.atmo_params;
+            let clouds_enabled    = self.clouds_enabled;
+            let cloud_params      = self.cloud_params;
             let markers_poles     = self.markers_poles;
             let markers_equator   = self.markers_equator;
             let wind_params       = self.wind.as_ref().map(|w| w.params).unwrap_or_default();
@@ -1336,7 +1365,9 @@ impl App {
                 cfg!(feature = "flora"), flora_enabled, flora_density,
                 self.sky.time_scale, self.sky.paused,
                 wind_enabled, wind_params,
-                atmo_enabled, atmo_params, markers_poles, markers_equator,
+                atmo_enabled, atmo_params,
+                clouds_enabled, cloud_params,
+                markers_poles, markers_equator,
                 None, planet_stats.as_ref(), load_stats.as_ref(),
             ))
         } else {
@@ -1373,6 +1404,8 @@ impl App {
             }
             self.atmo_enabled      = out.atmo_enabled;
             self.atmo_params       = out.atmo;
+            self.clouds_enabled    = out.clouds_enabled;
+            self.cloud_params      = out.clouds;
             self.markers_poles     = out.markers_poles;
             self.markers_equator   = out.markers_equator;
             self.sky.time_scale    = out.time_scale;
@@ -1703,46 +1736,22 @@ impl App {
 
                 // Procedural trees: drawn inside the opaque pass, after the
                 // character, before the translucent ocean (shares reversed-Z depth).
-                // One shared species mesh drawn per scattered instance, each at its
-                // OWN distance-driven leaf LOD (far trees thin their cards / fade to
-                // a billboard) so the grove scales without per-tree geometry.
+                // Every scattered tree renders at FULL detail — no leaf LOD, no
+                // impostor fade — so far trees stay fully visible. ponytail: these
+                // are plain per-instance draws (NOT Nanite-virtualized), so cost
+                // scales with the count; flora_scatter::MAX_TREES caps it.
                 #[cfg(feature = "flora")]
                 if draw_trees {
                     if let (Some(rend), Some(tree)) =
                         (self.flora_renderer.as_ref(), self.flora_tree.as_ref())
                     {
                         let wind = [self.flora_clock, 0.6, 1.0, 0.0];
-                        // Opaque tree meshes, per-instance leaf LOD.
                         for inst in &self.flora_instances {
                             let model = flora_scatter::instance_model(
                                 inst.origin, inst.yaw, inst.scale, camera_world_pos,
                             );
-                            let lod = tree.leaf_lod_at(inst.origin, camera_world_pos, true);
-                            if let Err(e) = tree.record_at(rhi, rend, fi, model, wind, lod) {
+                            if let Err(e) = tree.record_at(rhi, rend, fi, model, wind) {
                                 log::error!("FloraView::record_at error: {e}");
-                                break;
-                            }
-                        }
-                        // Far-tree impostor billboards (alpha-blended) — a no-op
-                        // until an instance crosses the impostor distance, so this
-                        // pass is free for a close grove. Drawn AFTER all opaque
-                        // trees (blending) and faces the camera via its world basis.
-                        let inv = camera.view_matrix_rotation_only().inverse();
-                        let cam_right = inv.x_axis.truncate();
-                        let cam_up = inv.y_axis.truncate();
-                        for inst in &self.flora_instances {
-                            let blend =
-                                tree.leaf_lod_at(inst.origin, camera_world_pos, true).impostor_blend;
-                            if blend <= 0.0 {
-                                continue;
-                            }
-                            let model = flora_scatter::instance_model(
-                                inst.origin, inst.yaw, inst.scale, camera_world_pos,
-                            );
-                            if let Err(e) = tree
-                                .record_impostor_at(rhi, rend, fi, model, cam_right, cam_up, blend)
-                            {
-                                log::error!("FloraView::record_impostor_at error: {e}");
                                 break;
                             }
                         }
@@ -1754,30 +1763,55 @@ impl App {
                 // depth-darkening, and refraction). Without TAA, fall back to the
                 // simple alpha-blended shell in the MSAA pass.
                 let mut water_split = false;
-                if self.ocean_enabled {
+                // Open the refraction split (1× instance + resolved opaque colour/depth)
+                // if EITHER the ocean or the clouds want it; both need TAA on (the split
+                // returns false otherwise). Clouds are independent of the ocean toggle.
+                let want_split = (self.ocean_enabled && self.wave.is_some())
+                    || (self.clouds_enabled && self.clouds.is_some());
+                if want_split || self.ocean_enabled {
                     let sea = self.sea_level_m;
                     // The expensive FFT patch is drawn only near the surface; the shell
                     // covers the rest. begin_water_pass returns false when TAA is off.
                     let draw_waves = self.wave_enabled && altitude < 20_000.0;
-                    let split = self.wave.is_some() && rhi.begin_water_pass(fi).unwrap_or(false);
+                    let split = want_split && rhi.begin_water_pass(fi).unwrap_or(false);
                     water_split = split;
                     if split {
-                        let scene_view = rhi.refraction_src_view();
                         let scene_depth = rhi.refraction_depth_view();
                         let ext = rhi.extent();
-                        let w = self.wave.as_mut().unwrap();
-                        w.params.choppiness = self.wave_choppiness;
-                        w.params.foam_threshold = self.wave_foam;
-                        w.debug_intensity = view_mode == 12; // Ocean: Intensity
-                        if let Err(e) = w.record(
-                            rhi, fi, &fu, &camera, sea,
-                            scene_view, scene_depth, (ext.width, ext.height), draw_waves,
-                        ) {
-                            log::error!("WaveSurface::record error: {e}");
+                        // Ocean first (opaque sea writes into `current`)...
+                        if self.ocean_enabled {
+                            let scene_view = rhi.refraction_src_view();
+                            let w = self.wave.as_mut().unwrap();
+                            w.params.choppiness = self.wave_choppiness;
+                            w.params.foam_threshold = self.wave_foam;
+                            w.debug_intensity = view_mode == 12; // Ocean: Intensity
+                            if let Err(e) = w.record(
+                                rhi, fi, &fu, &camera, sea,
+                                scene_view, scene_depth, (ext.width, ext.height), draw_waves,
+                            ) {
+                                log::error!("WaveSurface::record error: {e}");
+                            }
                         }
-                    } else if let Some(o) = self.ocean.as_ref() {
-                        if let Err(e) = o.record(rhi, fi, &fu, camera_world_pos, sea) {
-                            log::error!("Ocean::record error: {e}");
+                        // ...then clouds on top: a shell above sea level, so they
+                        // composite over both land and sea. The march still clamps to
+                        // the OPAQUE depth (seabed/terrain, captured before the ocean),
+                        // so terrain occlusion is unchanged.
+                        if self.clouds_enabled {
+                            if let Some(c) = self.clouds.as_ref() {
+                                if let Err(e) = c.record(
+                                    rhi, fi, &fu, &camera, scene_depth,
+                                    (ext.width, ext.height), self.cloud_time,
+                                    self.cloud_params, view_mode == 13,
+                                ) {
+                                    log::error!("Clouds::record error: {e}");
+                                }
+                            }
+                        }
+                    } else if self.ocean_enabled {
+                        if let Some(o) = self.ocean.as_ref() {
+                            if let Err(e) = o.record(rhi, fi, &fu, camera_world_pos, sea) {
+                                log::error!("Ocean::record error: {e}");
+                            }
                         }
                     }
                 }
