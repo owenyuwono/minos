@@ -188,6 +188,7 @@ impl FloraNanite {
             rhi, fi, camera_world, fu, screen_h, fov_y, tau_px, debug_mode,
             false, // dither off (no TAA)
             frame_index,
+            None, // no character shadow capsule in the flora debug bake
         )?;
         self.renderer.record_cull(rhi, fi)
     }
