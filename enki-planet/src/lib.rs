@@ -9,6 +9,7 @@ pub mod lod;
 pub mod mesher;
 pub mod noise;
 pub mod quadtree;
+pub mod river_carve;
 pub mod sampler;
 pub mod simple_height;
 pub mod tectonics;

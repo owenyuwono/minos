@@ -147,6 +147,13 @@ impl FloraNanite {
             std::slice::from_ref(&asset),
             scene_color_format,
         )?;
+        // The Nanite draw set statically references the sun shadow map (bindings
+        // 8/9), so even this debug path must bind a valid (cleared) map. The viewer
+        // has no sun shadow; `update_and_cull` keeps it cleared with an empty pass.
+        if !rhi.has_shadow_map() {
+            rhi.create_shadow_map(1024)?;
+        }
+        renderer.bind_shadow_map(rhi);
         Ok(Self { renderer, origin, cluster_count })
     }
 
@@ -183,9 +190,15 @@ impl FloraNanite {
             rhi, fi, camera_world, fu, screen_h, fov_y, tau_px, debug_mode,
             false, // dither off (no TAA)
             frame_index,
-            None, // no character shadow capsule in the flora debug bake
+            glam::Mat4::IDENTITY, // no sun shadow map in the flora debug bake
+            [0.0; 4],             // shadow disabled (strength/enabled = 0)
         )?;
-        self.renderer.record_cull(rhi, fi)
+        self.renderer.record_cull(rhi, fi)?;
+        // Keep the (unused) shadow map cleared + in SHADER_READ_ONLY so the draw's
+        // statically-referenced bindings 8/9 stay valid. Empty pass — no caster.
+        rhi.begin_shadow_pass(fi);
+        rhi.end_shadow_pass(fi);
+        Ok(())
     }
 
     /// Record the indirect vertex-pulling branch draw. Call INSIDE the flora scene

@@ -42,6 +42,7 @@ mod ocean;
 mod wind;
 mod atmosphere;
 mod clouds;
+mod clouds_advect;
 mod markers;
 mod rivers;
 mod solar;
@@ -55,7 +56,7 @@ use std::time::Instant;
 use enki_planet::climate::ClimateParams;
 use enki_planet::height::HeightField;
 use enki_planet::lod::{LodCamera, LodConfig};
-use enki_render::{camera::Camera, frame::FrameUniforms, lights::Lights, projection::reversed_z_perspective, sky::SkyModel, system::SolarSystem};
+use enki_render::{camera::Camera, frame::FrameUniforms, lights::Lights, projection::{reversed_z_perspective, reversed_z_orthographic}, sky::SkyModel, system::SolarSystem};
 use enki_rhi::{Rhi, RhiConfig, RhiError};
 use glam::DVec3;
 use winit::{
@@ -71,7 +72,7 @@ use character::Character;
 #[cfg(feature = "flora")]
 use enki_app::{
     flora_render::{FloraRenderer, ShadowUniforms},
-    flora_view::{FloraView, LeafMode, TreeSpec},
+    flora_view::{FloraView, LeafLod, LeafMode, TreeSpec},
 };
 use controls::{
     tangent::MoveInput,
@@ -204,6 +205,17 @@ struct App {
     /// This frame's sun direction (body frame, toward the sun) — stashed so the TAA
     /// resolve's screen-space sun shadow can read it (it's built in the Planet arm).
     sun_dir_body: glam::Vec3,
+    /// Sun shadow map (Nanite path): on/off + tuning. The light ortho is built
+    /// camera-relative each frame; the map is allocated once with `shadow_size`.
+    shadow_map_enabled: bool,
+    shadow_size: u32,
+    /// Cascade radius (m) — small = sharp (fewer metres over the same texels), at the
+    /// cost of reach; and the light-space depth span (m).
+    shadow_half_extent: f32,
+    shadow_depth: f32,
+    /// Reversed-Z ADD bias (kills acne) + along-normal offset (metres, helps slopes).
+    shadow_depth_bias: f32,
+    shadow_normal_bias: f32,
     /// Last cursor NDC (x right, y up, -1..1) for Placement ray-cast.
     cursor_ndc:   (f32, f32),
     /// Shared terrain height source (clone of the loader's) so the FPS controller
@@ -330,6 +342,12 @@ impl App {
             surface:       None,
             surface_speed: 0.0,
             sun_dir_body:  glam::Vec3::Y,
+            shadow_map_enabled: true,
+            shadow_size:   4096,
+            shadow_half_extent: 60.0,  // 120 m box @ 4096² ≈ 0.029 m/texel
+            shadow_depth:       200.0,
+            shadow_depth_bias:  0.001,
+            shadow_normal_bias: 0.05,  // ~1.5 texels of a 120 m box (was 0.4 = ~14)
             cursor_ndc:    (0.0, 0.0),
             height_field:  None,
             terrain_height_scale: 0.0,
@@ -340,7 +358,7 @@ impl App {
             nanite_enabled:    true,
             nanite_tau:        1.0,
             ocean_enabled:     true,
-            wind_enabled:      true,
+            wind_enabled:      false,
             atmo_enabled:      true,
             atmo_params:       AtmoParams::default(),
             clouds_enabled:    true,
@@ -348,7 +366,9 @@ impl App {
             cloud_time:        0.0,
             markers_poles:     false,
             markers_equator:   false,
-            rivers_enabled:    true,
+            // Off by default: the overlay ribbons clutter the Height-view check and
+            // the real goal is carved incisions (Step 2). Toggle on under Reference.
+            rivers_enabled:    false,
             wave_enabled:      true,
             wave_choppiness:   1.3,
             wave_foam:         0.4,
@@ -1147,6 +1167,12 @@ impl App {
                                         nodes.len(),
                                         clusters,
                                     );
+                                    // Sun shadow map: allocate + point the Nanite draw
+                                    // set at it (bindings 8/9) before the first frame.
+                                    match rhi.create_shadow_map(self.shadow_size) {
+                                        Ok(()) => r.bind_shadow_map(rhi),
+                                        Err(e) => log::error!("create_shadow_map failed: {e}"),
+                                    }
                                     self.nanite_streamer = Some(
                                         enki_nanite::residency::ClusterStreamer::new(&nodes),
                                     );
@@ -1176,7 +1202,9 @@ impl App {
         let nav_mode      = self.nav.mode();
         let view_mode     = self.view_mode;
         // Ocean view modes (11–12) don't recolor the terrain — show it lit.
-        let terrain_view  = if view_mode >= 11 { 0 } else { view_mode };
+        // 11–13 are ocean/cloud views → terrain falls back to Lit; 14 is the Nanite
+        // shadow-map debug view, which the Nanite draw DOES handle.
+        let terrain_view  = if view_mode >= 11 && view_mode != 14 { 0 } else { view_mode };
         let wireframe     = self.wireframe;
         let taa_on        = self.taa_enabled;
         // This frame's sub-pixel jitter (for rasterization); advance() rolls it
@@ -1195,6 +1223,11 @@ impl App {
         let ui_out = if self.egui.is_some() && self.window.is_some() && self.rhi.is_some() {
             let nanite_enabled    = self.nanite_enabled;
             let nanite_tau        = self.nanite_tau;
+            let shadow_map_enabled = self.shadow_map_enabled;
+            let shadow_half_extent = self.shadow_half_extent;
+            let shadow_depth       = self.shadow_depth;
+            let shadow_depth_bias  = self.shadow_depth_bias;
+            let shadow_normal_bias = self.shadow_normal_bias;
             let ocean_enabled     = self.ocean_enabled;
             let wind_enabled      = self.wind_enabled;
             let atmo_enabled      = self.atmo_enabled;
@@ -1221,6 +1254,7 @@ impl App {
 
             Some(egui.build_frame(
                 window, rhi, nav_mode, altitude, frame_time, view_mode, wireframe, taa_on,
+                shadow_map_enabled, shadow_half_extent, shadow_depth, shadow_depth_bias, shadow_normal_bias,
                 nanite_enabled, nanite_tau, cfg!(feature = "nanite"),
                 ocean_enabled, sea_level_m, wave_enabled, wave_choppiness, wave_foam,
                 cfg!(feature = "flora"), flora_enabled, flora_density,
@@ -1242,6 +1276,11 @@ impl App {
             self.view_mode         = out.view_mode;
             self.wireframe         = out.wireframe;
             self.taa_enabled       = out.taa;
+            self.shadow_map_enabled  = out.shadow_map_enabled;
+            self.shadow_half_extent  = out.shadow_half_extent;
+            self.shadow_depth        = out.shadow_depth;
+            self.shadow_depth_bias   = out.shadow_depth_bias;
+            self.shadow_normal_bias  = out.shadow_normal_bias;
             self.nanite_enabled    = out.nanite_enabled;
             self.nanite_tau        = out.nanite_tau;
             // Nanite-only geometry views (3–5) collapse to Lit when the classic path is active.
@@ -1361,6 +1400,34 @@ impl App {
                 };
                 let camera_world_pos = camera.position;
 
+                // Sun shadow map: the light's reversed-Z ortho, built in the SAME
+                // camera-relative world space the Nanite draw + casters use (so
+                // caster and receiver agree). `[depth_bias, normal_bias, strength,
+                // enabled]`. Hoisted here so the cull/update AND the caster pass below
+                // share it.
+                #[cfg(feature = "nanite")]
+                let (sun_lvp, shadow_params) = if self.shadow_map_enabled && rhi.has_shadow_map() {
+                    // Centre the (small, sharp) cascade on the player's feet in Surface
+                    // mode so its forward reach covers the wedge ahead; camera otherwise.
+                    let focus = if nav_mode == NavMode::Surface {
+                        self.surface
+                            .as_ref()
+                            .map(|tpc| tpc.feet_position())
+                            .unwrap_or(camera_world_pos)
+                    } else {
+                        camera_world_pos
+                    };
+                    (
+                        sun_light_view_proj(
+                            self.sun_dir_body, camera_world_pos, focus,
+                            self.shadow_half_extent, self.shadow_depth, self.shadow_size,
+                        ),
+                        [self.shadow_depth_bias, self.shadow_normal_bias, 1.0, 1.0],
+                    )
+                } else {
+                    (glam::Mat4::IDENTITY, [0.0; 4])
+                };
+
                 // Mutual exclusivity: Nanite is an LOD system that REPLACES the
                 // quadtree terrain. When it's active, the quadtree is not rendered.
                 #[cfg(feature = "nanite")]
@@ -1425,18 +1492,13 @@ impl App {
                     // 2. Per-frame uniforms (incl. this frame's active-slot list) + cull.
                     //    FrameUniforms gives the rotation-only camera-relative view-proj
                     //    AND the terrain's lights.
-                    // Character shadow is now the screen-space sun shadow in the TAA
-                    // resolve (real mesh silhouette + trees + terrain), so the old
-                    // capsule proxy is disabled. ponytail: capsule code in render.rs/
-                    // nanite_draw.wgsl is now dead — remove it once the SS shadow sticks.
-                    let char_capsule = None;
                     if let Some(n) = self.nanite.as_mut() {
                         // Dithered LOD cross-fade is only useful with TAA on (it
                         // resolves the per-frame stipple into a smooth blend).
                         let _ = n.update(
                             rhi, fi, camera_world_pos, &fu, screen_h_px,
                             camera.fov_y_radians, self.nanite_tau, terrain_view,
-                            self.taa_enabled, self.frame_counter as u32, char_capsule,
+                            self.taa_enabled, self.frame_counter as u32, sun_lvp, shadow_params,
                         );
                         let _ = n.record_cull(rhi, fi);
                     }
@@ -1537,6 +1599,53 @@ impl App {
                         rend.begin_shadow_pass(rhi, fi);
                         rend.end_shadow_pass(rhi, fi);
                     }
+                }
+
+                // Sun shadow caster pass (depth-only, before the main instance):
+                // render the casters into the shadow map from the light — terrain
+                // (Nanite cut), the character, and nearby trees. The terrain then
+                // samples this map (PCF) in fs_color, so all three cast onto it.
+                #[cfg(feature = "nanite")]
+                if nanite_active && self.shadow_map_enabled && rhi.has_shadow_map() {
+                    rhi.begin_shadow_pass(fi);
+                    if let Some(n) = self.nanite.as_ref() {
+                        let _ = n.record_shadow_draw(rhi, fi);
+                    }
+                    // Character caster (real mesh silhouette).
+                    if draw_character {
+                        if let (Some(ch), Some(tpc)) =
+                            (self.character.as_ref(), self.surface.as_ref())
+                        {
+                            let _ = ch.record_shadow(
+                                rhi, fi, &camera, tpc.feet_position(), tpc.facing(), sun_lvp,
+                            );
+                        }
+                    }
+                    // Tree casters: only instances within the cascade (camera-relative
+                    // |xz| < ~HALF_EXTENT) cast — far trees fall outside the map, and
+                    // casting all ~7k would double the flora draw cost. ponytail:
+                    // distance gate, not a real light-frustum cull.
+                    #[cfg(feature = "flora")]
+                    if draw_trees {
+                        if let (Some(rend), Some(tree)) =
+                            (self.flora_renderer.as_ref(), self.flora_tree.as_ref())
+                        {
+                            const CAST_RADIUS_M: f64 = 200.0;
+                            let wind = [self.flora_clock, 0.6, 1.0, 0.0];
+                            for inst in &self.flora_instances {
+                                if (inst.origin - camera_world_pos).length() > CAST_RADIUS_M {
+                                    continue;
+                                }
+                                let model = flora_scatter::instance_model(
+                                    inst.origin, inst.yaw, inst.scale, camera_world_pos,
+                                );
+                                let _ = tree.record_shadow_model(
+                                    rhi, rend, fi, model, sun_lvp, wind, LeafLod::FULL,
+                                );
+                            }
+                        }
+                    }
+                    rhi.end_shadow_pass(fi);
                 }
 
                 // 3D opaque pass.
@@ -1641,6 +1750,13 @@ impl App {
                 // depth-darkening, and refraction). Without TAA, fall back to the
                 // simple alpha-blended shell in the MSAA pass.
                 let mut water_split = false;
+                // Drive the cloud worker's active state every frame (two-way idle gate)
+                // so it sleeps when clouds are toggled off rather than spinning forever.
+                // record() (the only path that touches active) isn't reached while
+                // clouds are disabled or TAA is off, so latch it here unconditionally.
+                if let Some(c) = self.clouds.as_ref() {
+                    c.set_advect_active(self.clouds_enabled);
+                }
                 // Open the refraction split (1× instance + resolved opaque colour/depth)
                 // if EITHER the ocean or the clouds want it; both need TAA on (the split
                 // returns false otherwise). Clouds are independent of the ocean toggle.
@@ -1678,7 +1794,7 @@ impl App {
                             if let Some(c) = self.clouds.as_mut() {
                                 if let Err(e) = c.record(
                                     rhi, fi, &fu, &camera, scene_depth,
-                                    (ext.width, ext.height), self.cloud_time, dt,
+                                    (ext.width, ext.height), self.cloud_time,
                                     self.cloud_params, view_mode == 13,
                                 ) {
                                     log::error!("Clouds::record error: {e}");
@@ -1747,12 +1863,20 @@ impl App {
             );
             let unjittered_vp = proj * camera.view_matrix_rotation_only();
             self.taa_jitter.advance(unjittered_vp, camera.position);
+            // The shadow MAP supersedes the screen-space sun shadow when it's active
+            // (it casts objects + terrain too) — disable the SS shadow to avoid
+            // double-darkening. Keep SS only as the fallback when the map is off.
+            #[cfg(feature = "nanite")]
+            let map_active = self.shadow_map_enabled && self.nanite_enabled && rhi.has_shadow_map();
+            #[cfg(not(feature = "nanite"))]
+            let map_active = false;
+            let ss_shadow = if map_active { 0.0 } else { 1.0 };
             let params = self.taa_jitter.resolve_params(
                 aspect * screen_h_px,
                 screen_h_px,
                 enki_render::taa::DEFAULT_HISTORY_BLEND,
                 self.sun_dir_body,
-                1.0, // screen-space sun-shadow strength (0 = off)
+                ss_shadow, // screen-space sun-shadow strength (0 = off; map active)
             );
             if let Err(e) = rhi.taa_resolve(fi, params.as_bytes()) {
                 log::error!("taa_resolve error: {e}");
@@ -1783,6 +1907,57 @@ impl App {
             log::error!("end_frame error: {e}");
         }
     }
+}
+
+/// Build the sun shadow map's light view-projection in **camera-relative** world
+/// space (camera at the origin, world axes — the same space the Nanite draw's
+/// `world_rel` lives in). Reversed-Z ortho fit to a fixed region around the camera.
+/// ponytail: a single cascade centred on the camera; a player-centred / multi-
+/// cascade fit (and texel-snap for crawl-free edges) is the upgrade.
+#[cfg_attr(not(feature = "nanite"), allow(dead_code))]
+/// `focus_world` = the world point the cascade is centred on (the player's feet in
+/// third-person; the camera otherwise). `half_extent` = cascade radius in metres —
+/// SMALL is sharp: texel size = `2*half_extent/shadow_size`, so 60 m @ 4096² ≈
+/// 0.03 m/texel (vs 180 m ≈ 0.09 m). An ortho's density is uniform + translation-
+/// invariant, so centring is purely a *reach* choice (a small box must sit on the
+/// player to cover the wedge ahead); shrinking `half_extent` is the density lever.
+#[cfg_attr(not(feature = "nanite"), allow(dead_code))]
+fn sun_light_view_proj(
+    sun_dir: glam::Vec3,
+    cam_world: glam::DVec3,
+    focus_world: glam::DVec3,
+    half_extent: f32,
+    depth: f32,
+    shadow_size: u32,
+) -> glam::Mat4 {
+    let mut sun = sun_dir.normalize_or_zero();
+    if sun.length_squared() < 0.5 {
+        sun = glam::Vec3::Y;
+    }
+    // Radial "up" at the camera (the planet centre is the world origin).
+    let mut up = cam_world.as_vec3().normalize_or_zero();
+    if up.length_squared() < 0.5 {
+        up = glam::Vec3::Y;
+    }
+    // Avoid a degenerate look-at when the sun is near the local vertical.
+    if up.dot(sun).abs() > 0.99 {
+        up = if sun.x.abs() < 0.9 { glam::Vec3::X } else { glam::Vec3::Z };
+    }
+    let center = (focus_world - cam_world).as_vec3(); // camera-relative cascade centre
+    let eye = center + sun * (depth * 0.5);
+    let view = glam::Mat4::look_at_rh(eye, center, up);
+
+    // Texel-snap on the FOCUS point's light-space offset (f64 against the true world
+    // position) so the box steps in whole texels as the player walks → no crawl.
+    let texel = (2.0 * half_extent / shadow_size.max(1) as f32) as f64;
+    let right = view.row(0).truncate().as_dvec3();
+    let upv = view.row(1).truncate().as_dvec3();
+    let sx = (focus_world.dot(right) - (focus_world.dot(right) / texel).round() * texel) as f32;
+    let sy = (focus_world.dot(upv) - (focus_world.dot(upv) / texel).round() * texel) as f32;
+    let snap = glam::Mat4::from_translation(glam::Vec3::new(sx, sy, 0.0));
+
+    let proj = reversed_z_orthographic(-half_extent, half_extent, -half_extent, half_extent, 1.0, depth);
+    proj * snap * view
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────

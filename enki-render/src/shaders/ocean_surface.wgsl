@@ -55,7 +55,7 @@ struct Ocean {
 @group(0) @binding(3) var scene_tex: texture_2d<f32>;
 @group(0) @binding(4) var scene_samp: sampler;
 @group(0) @binding(5) var scene_depth: texture_2d<f32>;
-@group(0) @binding(6) var<storage, read> wind: array<f32>;  // per-vertex wind 0..1
+@group(0) @binding(6) var<storage, read> wind: array<vec2<f32>>; // per-vertex (intensity 0..1, wind angle rad)
 
 // ── Cascade field sampling (bilinear, wrapping) ────────────────────────────────
 
@@ -88,18 +88,20 @@ fn sample_cascade(c: i32, uv: vec2<f32>) -> OceanTexel {
 // ── Tile blending — breaks the FFT tile repeat without distorting waves ─────────
 // Each blend cell rotates + offsets the sample coordinate; 4 cells are bilinearly
 // blended (and the returned horizontal vectors rotated back into the grid frame),
-// so no region reads as a single repeating tile, and the rotations read as
-// crossing / multi-directional seas.
+// so no region reads as a single repeating tile. The per-cell rotation is the
+// local WIND angle + a small jitter, so waves travel WITH the wind (with a little
+// directional spread); the random per-cell offset still breaks the tile.
 
-const BLEND_M: f32 = 240.0; // blend-cell size (m); randomised rotation/offset per cell
+const BLEND_M: f32 = 240.0;     // blend-cell size (m)
+const WIND_SPREAD: f32 = 0.7;   // ±rad of directional spread around the wind
 
 fn hash2(p: vec2<f32>) -> vec2<f32> {
     let q = vec2<f32>(dot(p, vec2<f32>(127.1, 311.7)), dot(p, vec2<f32>(269.5, 183.3)));
     return fract(sin(q) * 43758.5453);
 }
 
-fn cell_rot(cell: vec2<f32>) -> mat2x2<f32> {
-    let a = hash2(cell).x * 6.2831853;
+fn cell_rot(cell: vec2<f32>, base: f32) -> mat2x2<f32> {
+    let a = base + (hash2(cell).x - 0.5) * WIND_SPREAD;
     let c = cos(a); let s = sin(a);
     return mat2x2<f32>(c, s, -s, c);
 }
@@ -120,14 +122,14 @@ fn blend_cells(grid: vec2<f32>) -> Blend {
     return b;
 }
 
-fn sample_blend(c: i32, grid: vec2<f32>, b: Blend) -> OceanTexel {
+fn sample_blend(c: i32, grid: vec2<f32>, b: Blend, wind_angle: f32) -> OceanTexel {
     let tile = cascade_scale(c);
     var cells = array<vec2<f32>, 4>(b.c0, b.c1, b.c2, b.c3);
     var disp = vec4<f32>(0.0);
     var deriv = vec4<f32>(0.0);
     for (var k = 0; k < 4; k = k + 1) {
         let cell = cells[k];
-        let r = cell_rot(cell);
+        let r = cell_rot(cell, wind_angle);
         let off = hash2(cell + vec2<f32>(19.7, 4.3)) * 2048.0;
         let tx = sample_cascade(c, (r * grid + off) / tile);
         let rt = transpose(r); // rotate the sampled horizontal vectors back to grid frame
@@ -152,7 +154,7 @@ struct VsOut {
     @location(1)       grid      : vec2<f32>,
     @location(2)       fade      : f32,
     @location(3)       wdir      : vec3<f32>,
-    @location(4)       wind      : f32,   // wind strength 0..1 (drives amp + intensity)
+    @location(4)       wind      : vec2<f32>, // (intensity 0..1, wind angle rad)
 }
 
 // Projected grid: each vertex is a screen-space lattice point already ray-cast
@@ -168,8 +170,8 @@ fn vs_projected(v: VsIn, @builtin(vertex_index) vi: u32) -> VsOut {
     let rel = base - ocean.sub_point_rel.xyz;
     let grid = vec2<f32>(dot(rel, east), dot(rel, north));   // tangent coords for FFT
     let cell = length(base) * ocean.center_rel.w;            // ~screen-uniform world cell
-    let ws = wind[vi];                                       // wind strength 0..1 at this vertex
-    let amp = mix(ocean.amp.y, ocean.amp.z, ws);            // wind drives wave height
+    let ws = wind[vi];                                       // (intensity, wind angle) at this vertex
+    let amp = mix(ocean.amp.y, ocean.amp.z, ws.x);          // wind speed drives wave height
     let b = blend_cells(grid);
     let cc = i32(ocean.cfg.w);
 
@@ -178,7 +180,7 @@ fn vs_projected(v: VsIn, @builtin(vertex_index) vi: u32) -> VsOut {
         if (c >= cc) { break; }
         let tile = cascade_scale(c);
         let w = 1.0 - smoothstep(tile * 0.4, tile * 0.8, cell);
-        disp = disp + sample_blend(c, grid, b).disp.xyz * w;
+        disp = disp + sample_blend(c, grid, b, ws.y).disp.xyz * w;
     }
     disp = disp * amp;
 
@@ -202,8 +204,11 @@ fn sky_color(dir: vec3<f32>, gloss: f32) -> vec3<f32> {
     let h = dot(dir, ocean.up.xyz);
     let grad = mix(ocean.sky_horizon.xyz, ocean.sky_zenith.xyz, smoothstep(-0.05, 0.4, h));
     let sd = max(dot(dir, frame.sun0_dir.xyz), 0.0);
-    let disc = pow(sd, 1200.0) * 8.0 * gloss;
-    let glow = pow(sd, 7.0) * 0.35;
+    // Both the sharp disc and the broad glow are gated by `gloss` (→0 with screen
+    // footprint), so the sun specular is fully disabled on distant / zoomed-out
+    // water — only the smooth sky-gradient reflection remains (itself altitude-damped).
+    let disc = pow(sd, 1200.0) * 4.0 * gloss;
+    let glow = pow(sd, 16.0) * 0.15 * gloss;
     return grad + (disc + glow) * ocean.sun_color.xyz;
 }
 
@@ -221,6 +226,11 @@ fn heat(t: f32) -> vec3<f32> {
 fn view_dist(d: f32) -> f32 {
     let n = ocean.depth_params.x; let f = ocean.depth_params.y;
     return n * f / (n + d * (f - n)); // reversed-Z (d=1 near, d=0 far)
+}
+
+// Hemisphere ambient (sky above / ground below by world-y) — matches the terrain.
+fn hemisphere_ambient(n: vec3<f32>, sky: vec3<f32>, ground: vec3<f32>) -> vec3<f32> {
+    return mix(ground, sky, n.y * 0.5 + 0.5);
 }
 
 // Shared water body: screen-space refraction + depth-based absorption + Fresnel sky.
@@ -254,12 +264,35 @@ fn shade_water(world_pos: vec3<f32>, N: vec3<f32>, fade: f32, frag_xy: vec2<f32>
     let watercol = mix(ocean.deep_color.xyz, ocean.scatter_color.xyz, trans);
     var body = mix(watercol, bottom, trans * ocean.depth_params.w);
 
+    // Diffuse sun lighting on the water body — matches the terrain (ambient +
+    // hemisphere + 2 suns). Uses the LOCAL radial normal (not the wave normal `N`,
+    // which lives in the fixed sub-point frame) so the ocean tracks the planet's
+    // day/night terminator + directional shading. The sky reflection (below) carries
+    // its own brightness, so only the body is lit here.
+    let radial = normalize(world_pos - ocean.center_rel.xyz);
+    let light = frame.ambient.xyz
+        + hemisphere_ambient(radial, frame.hemi_sky.xyz, frame.hemi_ground.xyz)
+        + max(dot(radial, frame.sun0_dir.xyz), 0.0) * frame.sun0_color.xyz
+        + max(dot(radial, frame.sun1_dir.xyz), 0.0) * frame.sun1_color.xyz;
+    body = body * light;
+
     // Subsurface scatter on back-lit crests.
     let H = normalize(-N + frame.sun0_dir.xyz);
     let sss = pow(clamp(dot(V, -H), 0.0, 1.0), 4.0) * ocean.shading.x;
     body = mix(body, ocean.scatter_color.xyz, clamp(sss * fade, 0.0, 0.3));
 
-    return mix(body, reflection, fresnel);
+    // Damp the sky reflection with altitude: the reflected `sky_color` is always
+    // the bright near-surface gradient, so from high up a grazing ocean reads as a
+    // too-bright mirror. Fade the reflection toward the water body so a zoomed-out
+    // ocean shows its deep-water colour (planet radius ~50 km, so the band is tens
+    // of km, not hundreds). From orbit the reflected env is really dark space, not a
+    // bright sky, so it's nearly killed. (Tune the 2..40 km band / 0.97 max damp.)
+    let altitude = length(ocean.center_rel.xyz) - ocean.sub_point_rel.w;
+    let refl_damp = 1.0 - 0.97 * smoothstep(2000.0, 40000.0, altitude);
+    // Reflection follows day/night too — at night the reflected sky is dark, not the
+    // bright daytime gradient (small floor for ambient/star light).
+    let daylight = max(smoothstep(-0.1, 0.25, dot(radial, frame.sun0_dir.xyz)), 0.05);
+    return mix(body, reflection * daylight, fresnel * refl_damp);
 }
 
 @fragment
@@ -268,16 +301,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // detail + specular roughening with distance).
     let fp = max(length(dpdx(in.world_pos)), length(dpdy(in.world_pos)));
 
-    // Debug: heat-map the wind field that drives wave height + intensity.
+    // Debug: heat-map the wind intensity that drives wave height.
     if (ocean.amp.w > 0.5) {
-        return vec4<f32>(heat(in.wind) * (0.4 + 0.6 * in.fade), 1.0);
+        return vec4<f32>(heat(in.wind.x) * (0.4 + 0.6 * in.fade), 1.0);
     }
 
     // Sum cascade derivatives (→ normal) + foam. Tile-blended (breaks the repeat),
-    // wind-driven amplitude, and faded by the per-pixel screen FOOTPRINT (world
-    // metres per pixel) so far / zoomed-out water doesn't alias into white speckle.
+    // wind-driven amplitude + direction, and faded by the per-pixel screen FOOTPRINT
+    // (world metres per pixel) so far / zoomed-out water doesn't alias into speckle.
     let cc = i32(ocean.cfg.w);
-    let amp = mix(ocean.amp.y, ocean.amp.z, in.wind);
+    let amp = mix(ocean.amp.y, ocean.amp.z, in.wind.x);
     let b = blend_cells(in.grid);
     var deriv = vec4<f32>(0.0);
     var foam = 0.0;
@@ -285,7 +318,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         if (c >= cc) { break; }
         let tile = cascade_scale(c);
         let w = 1.0 - smoothstep(tile * 0.4, tile * 0.9, fp);
-        let tx = sample_blend(c, in.grid, b);
+        let tx = sample_blend(c, in.grid, b, in.wind.y);
         deriv = deriv + tx.deriv * w;
         if (c < cc - 1) { foam = foam + clamp((ocean.shading.y - tx.disp.w) * ocean.shading.z, 0.0, 1.0) * w; }
     }

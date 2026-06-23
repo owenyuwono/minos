@@ -4,14 +4,16 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["nanite"]
+default = ["nanite", "flora"]
 # Plug-and-play Nanite virtualized terrain. Off (`--no-default-features`) builds
 # the classic engine with zero references to enki-nanite.
 nanite = ["dep:enki-nanite"]
-# Plug-and-play deterministic procedural flora. Off by default; enable with
-# `--features flora`. Pulls in ash + naga for the flora-OWNED Vulkan sub-renderer
-# (flora_render.rs), which builds its own pipelines/descriptor sets from raw RHI
-# handles (egui-ash-renderer precedent). Deletable: off → none of this compiles.
+# Plug-and-play deterministic procedural flora. ON by default → the enki bin
+# scatters trees on the planet surface; drop it with `--no-default-features`
+# (re-add nanite if wanted). Pulls in ash + naga for the flora-OWNED Vulkan
+# sub-renderer (flora_render.rs), which builds its own pipelines/descriptor sets
+# from raw RHI handles (egui-ash-renderer precedent). Still fully gated/deletable:
+# off → none of this compiles.
 flora = ["dep:enki-flora", "dep:ash", "dep:naga", "dep:image"]
 
 [lib]

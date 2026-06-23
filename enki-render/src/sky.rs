@@ -52,12 +52,12 @@ pub struct SkyModel {
 }
 
 impl SkyModel {
-    /// True-scale Earth defaults. `time_scale` defaults so day/night is visible
-    /// (~one day per 30 s of real time); the GUI exposes it as a slider.
+    /// True-scale Earth defaults. `time_scale` defaults so one in-game day takes
+    /// ~1 hr of real time; the GUI exposes it as a slider.
     pub fn earth() -> Self {
         Self {
             t_seconds: 0.0,
-            time_scale: EARTH_DAY_S / 30.0, // ≈ 1 day / 30 s real
+            time_scale: EARTH_DAY_S / 3600.0, // 1 day / 1 hr real (= 24×)
             paused: false,
             day_len_s: EARTH_DAY_S,
             year_len_s: EARTH_YEAR_S,

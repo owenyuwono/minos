@@ -193,6 +193,20 @@ pub struct Rhi {
     /// When true (and `taa` is initialised), the frame bracket renders the 3D
     /// pass to the TAA targets and runs the resolve. Toggled by the app.
     taa_enabled: bool,
+
+    // ── Sun shadow map ───────────────────────────────────────────────────────
+    /// 1× D32 depth targets rendered from the light each frame, sampled (PCF) by
+    /// the Nanite/terrain lit shader. One per frame-in-flight (a single shared
+    /// image would race: frame N sampling it while N+1 overwrites it). Empty until
+    /// [`Self::create_shadow_map`].
+    shadow_maps: Vec<image::AllocatedImage>,
+    /// Tracked layout of each `shadow_maps[fi]` (UNDEFINED → DEPTH_ATTACHMENT
+    /// during the caster pass → SHADER_READ_ONLY for sampling).
+    shadow_map_layouts: Vec<vk::ImageLayout>,
+    /// Comparison sampler (GREATER_OR_EQUAL, clamp-to-border) for the shadow map.
+    /// Owned by the RHI; created in [`Self::create_shadow_map`], freed in Drop.
+    shadow_sampler: vk::Sampler,
+    shadow_extent: vk::Extent2D,
 }
 
 impl Rhi {
@@ -321,6 +335,10 @@ impl Rhi {
             streamer: Some(streamer),
             taa: None,
             taa_enabled: false,
+            shadow_maps: Vec::new(),
+            shadow_map_layouts: Vec::new(),
+            shadow_sampler: vk::Sampler::null(),
+            shadow_extent: vk::Extent2D { width: 0, height: 0 },
         })
     }
 
@@ -518,6 +536,26 @@ impl Rhi {
         self.pipelines.create_pulling(desc)
     }
 
+    /// Create a **depth-only** vertex-pulling pipeline (no fragment, no color
+    /// attachment) for a sun shadow-map caster pass. `desc.color_format`/`fs_entry`
+    /// are ignored.
+    pub fn create_graphics_pipeline_pulling_depth(
+        &mut self,
+        desc: &GraphicsPipelineDesc<'_>,
+    ) -> Result<PipelineHandle, RhiError> {
+        self.pipelines.create_pulling_depth(desc)
+    }
+
+    /// Create a **depth-only** pipeline with the standard 4×vec3 vertex input (no
+    /// fragment, no color attachment) for a shadow-map caster of vertex-buffer
+    /// geometry (the character). `desc.color_format`/`fs_entry` are ignored.
+    pub fn create_graphics_pipeline_depth(
+        &mut self,
+        desc: &GraphicsPipelineDesc<'_>,
+    ) -> Result<PipelineHandle, RhiError> {
+        self.pipelines.create_depth(desc)
+    }
+
     // ── Storage buffers (generic GPU-driven data) ───────────────────────────
 
     /// Create a storage buffer (SSBO). `host_visible = true` makes it mappable
@@ -655,6 +693,171 @@ impl Rhi {
     /// Destroy a sampler created by [`Self::create_sampler`].
     pub fn destroy_sampler(&self, sampler: vk::Sampler) {
         unsafe { self.device.handle.destroy_sampler(sampler, None) };
+    }
+
+    // ── Sun shadow map ───────────────────────────────────────────────────────
+
+    /// A depth-comparison sampler (`GREATER_OR_EQUAL`, linear → 2×2 hardware PCF,
+    /// clamp-to-border with a black/`0.0` border so anything outside the light
+    /// frustum reads as fully lit in reversed-Z). Caller owns it (`destroy_sampler`).
+    pub fn create_comparison_sampler(&self) -> Result<vk::Sampler, RhiError> {
+        let info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_BORDER)
+            .border_color(vk::BorderColor::FLOAT_OPAQUE_BLACK)
+            .compare_enable(true)
+            .compare_op(vk::CompareOp::GREATER_OR_EQUAL)
+            .min_lod(0.0)
+            .max_lod(0.0);
+        unsafe { self.device.handle.create_sampler(&info, None) }.map_err(RhiError::Vulkan)
+    }
+
+    /// Allocate the sun shadow-map depth targets (`size`×`size`, one per
+    /// frame-in-flight) + the comparison sampler. Idempotent (replaces any
+    /// existing). Call once after the swapchain is sized.
+    pub fn create_shadow_map(&mut self, size: u32) -> Result<(), RhiError> {
+        let extent = vk::Extent2D { width: size, height: size };
+        let dev_h: *const ash::Device = &self.device.handle;
+        let dev_a: *mut gpu_allocator::vulkan::Allocator = &mut *self.device.allocator;
+        for old in std::mem::take(&mut self.shadow_maps) {
+            old.destroy(unsafe { &*dev_h }, unsafe { &mut *dev_a });
+        }
+        let fif = self.frames_in_flight;
+        let mut maps = Vec::with_capacity(fif);
+        for _ in 0..fif {
+            maps.push(image::AllocatedImage::new_render_target(
+                unsafe { &*dev_h },
+                unsafe { &mut *dev_a },
+                extent,
+                vk::Format::D32_SFLOAT,
+                vk::SampleCountFlags::TYPE_1,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                vk::ImageAspectFlags::DEPTH,
+                "sun_shadow_map",
+            )?);
+        }
+        self.shadow_maps = maps;
+        self.shadow_map_layouts = vec![vk::ImageLayout::UNDEFINED; fif];
+        self.shadow_extent = extent;
+        if self.shadow_sampler == vk::Sampler::null() {
+            self.shadow_sampler = self.create_comparison_sampler()?;
+        }
+        log::info!("Sun shadow map: {fif}× {size}² D32 + comparison sampler");
+        Ok(())
+    }
+
+    /// Image view of frame `fi`'s shadow map (for the receiver's descriptor set).
+    pub fn shadow_map_view(&self, fi: u32) -> vk::ImageView {
+        self.shadow_maps
+            .get(fi as usize)
+            .map(|m| m.view)
+            .unwrap_or(vk::ImageView::null())
+    }
+
+    /// The shadow-map comparison sampler.
+    pub fn shadow_map_sampler(&self) -> vk::Sampler {
+        self.shadow_sampler
+    }
+
+    /// `true` once [`Self::create_shadow_map`] has run.
+    pub fn has_shadow_map(&self) -> bool {
+        !self.shadow_maps.is_empty()
+    }
+
+    /// Open the depth-only sun-shadow caster pass for frame `fi`: transition the
+    /// map to a depth attachment, clear it, set the viewport to the map extent.
+    /// Record the caster draw(s), then call [`Self::end_shadow_pass`]. MUST be
+    /// called BEFORE `begin_rendering` (it opens its own rendering instance).
+    pub fn begin_shadow_pass(&mut self, fi: u32) {
+        if fi == u32::MAX || self.shadow_maps.is_empty() {
+            return;
+        }
+        let fi_idx = fi as usize;
+        let cmd = self.commands.frames[fi_idx].buffer;
+        let (image, view) = {
+            let m = &self.shadow_maps[fi_idx];
+            (m.image, m.view)
+        };
+        let extent = self.shadow_extent;
+        let old = self.shadow_map_layouts[fi_idx];
+        let depth = depth_subresource_range();
+        let barrier = img_barrier(
+            image,
+            old,
+            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_READ,
+            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            depth,
+        );
+        let clear = vk::ClearValue {
+            depth_stencil: vk::ClearDepthStencilValue { depth: 0.0, stencil: 0 },
+        };
+        unsafe {
+            self.device.handle.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier)),
+            );
+            let attach = vk::RenderingAttachmentInfo::default()
+                .image_view(view)
+                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(clear);
+            let info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent })
+                .layer_count(1)
+                .depth_attachment(&attach);
+            self.device.handle.cmd_begin_rendering(cmd, &info);
+            let vp = vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: extent.width as f32,
+                height: extent.height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+            let sc = vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent };
+            self.device.handle.cmd_set_viewport(cmd, 0, std::slice::from_ref(&vp));
+            self.device.handle.cmd_set_scissor(cmd, 0, std::slice::from_ref(&sc));
+        }
+        self.shadow_map_layouts[fi_idx] = vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL;
+    }
+
+    /// Close the sun-shadow caster pass and transition the map to
+    /// `SHADER_READ_ONLY` for sampling in the main pass.
+    pub fn end_shadow_pass(&mut self, fi: u32) {
+        if fi == u32::MAX || self.shadow_maps.is_empty() {
+            return;
+        }
+        let fi_idx = fi as usize;
+        let cmd = self.commands.frames[fi_idx].buffer;
+        let image = self.shadow_maps[fi_idx].image;
+        let depth = depth_subresource_range();
+        let barrier = img_barrier(
+            image,
+            vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+            vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags2::FRAGMENT_SHADER,
+            vk::AccessFlags2::SHADER_READ,
+            depth,
+        );
+        unsafe {
+            self.device.handle.cmd_end_rendering(cmd);
+            self.device.handle.cmd_pipeline_barrier2(
+                cmd,
+                &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier)),
+            );
+        }
+        self.shadow_map_layouts[fi_idx] = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
     }
 
     // ── TAA (temporal anti-aliasing) ─────────────────────────────────────────
@@ -2142,6 +2345,14 @@ impl Drop for Rhi {
                 &mut *self.device.allocator;
             if let Some(taa) = self.taa.take() {
                 taa.destroy(&*dev_handle, &mut *dev_alloc);
+            }
+
+            // 4c. Destroy sun shadow maps + comparison sampler.
+            for img in std::mem::take(&mut self.shadow_maps) {
+                img.destroy(&*dev_handle, &mut *dev_alloc);
+            }
+            if self.shadow_sampler != vk::Sampler::null() {
+                self.device.handle.destroy_sampler(self.shadow_sampler, None);
             }
 
             // 5. Destroy depth and MSAA images.

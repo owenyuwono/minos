@@ -412,11 +412,13 @@ fn bake_moisture(
                 );
                 let wind_t = wind_vec - dir * wind_vec.dot(dir);
                 let w_len = wind_t.length();
+                // height_fn(dir, RAINSHADOW_LEVEL) is the rain-shadow reference AND
+                // the temperature elevation below — same fn+args, so compute once.
+                let this_h = height_fn(dir, RAINSHADOW_LEVEL);
                 let shadow;
                 if w_len > 1e-4 {
                     // Upwind is opposite the wind travel direction.
                     let up = -(wind_t / w_len);
-                    let this_h = height_fn(dir, RAINSHADOW_LEVEL);
                     let mut max_upwind = this_h;
                     for s in 1..=UPWIND_STEPS {
                         let d = s as f64 * UPWIND_STEP_RAD;
@@ -435,7 +437,7 @@ fn bake_moisture(
                 let mut m = clamp01(band * sea_prox * shadow * moist_gain);
 
                 // 4. Frozen attenuation — very cold regions hold less liquid moisture.
-                let t_height = height_fn(dir, RAINSHADOW_LEVEL);
+                let t_height = this_h;
                 let temp = {
                     let abs_y = dir.y.abs();
                     let cos_lat = (1.0 - dir.y * dir.y).max(0.0).sqrt();

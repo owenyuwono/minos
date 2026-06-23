@@ -1,20 +1,22 @@
-//! `rivers` — drainage-network water surface traced from the baked erosion flow
-//! field, drawn as translucent blue ribbons. A 1:1-in-spirit port of ki's
-//! `RiverNetwork.ts`, adapted to enki's `HeightField` trait (`flow_accum_at` /
-//! `flow_dir_at` / `lake_mask_at` / `height`) + the cube-sphere `cubemap` helpers.
+//! `rivers` — drainage-network water surface computed from terrain HEIGHT +
+//! PRECIPITATION (NO erosion data), drawn as translucent blue ribbons. Reads only
+//! `HeightField::{height, moisture}` + the cube-sphere `cubemap` helpers.
 //!
-//! Why a MESH and not per-vertex paint: rivers are 1–2 erosion-texels wide, far
-//! thinner than the terrain mesh's vertex spacing, so painting `wetness` into the
-//! terrain albedo aliases away at every LOD. A traced ribbon is its own geometry,
-//! independent of terrain tessellation, so it stays crisp at any zoom.
+//! Why a MESH and not per-vertex paint: rivers are far thinner than the terrain
+//! mesh's vertex spacing, so painting `wetness` into the terrain albedo aliases away
+//! at every LOD. A swept ribbon is its own geometry, crisp at any zoom.
 //!
-//! Tracing: seed from channel HEADS (a cell where acc ≥ threshold but one step
-//! upstream is below it), then walk downhill on a cube-sphere `visited` grid —
-//! reaches that enter an already-traced cell merge into it (a converging tree).
-//! Each reach's coarse centerline is Catmull-Rom subdivided and swept into a
-//! ribbon whose half-width ∝ √discharge (hydraulic geometry). Built ONCE on the
-//! main thread when the heightfield arrives; only the camera-relative position
-//! buffer is rewritten per frame (mirrors `markers.rs`).
+//! Why height+precip and not the erosion flow field: the erosion sim is MFD +
+//! 4-pass blurred — diffuse, so collapsing it to single-downstream broke into
+//! disconnected stubs. Instead we run the textbook hydrology pipeline
+//! (see docs/rivers-research.md): **Priority-Flood (Barnes 2014)** fills depressions
+//! and builds a drainage TREE where every land cell drains downhill to the sea
+//! (connected by construction), then **precipitation accumulates** down the tree
+//! (wetter basins → bigger rivers), threshold → channel network → junction graph
+//! (source / confluence nodes) → Catmull-Rom + Laplacian smooth → ribbon (half-width
+//! ∝ √discharge). Built ONCE when the heightfield arrives; only the camera-relative
+//! position buffer is rewritten per frame (mirrors `markers.rs`). ponytail: the
+//! erosion-based `flow_*`/`lake_mask` trait methods are no longer used here.
 
 use bytemuck::cast_slice;
 use enki_planet::cubemap::{neighbor_texel, tex_ang, texel_index, texel_to_dir};
@@ -22,35 +24,43 @@ use enki_planet::height::HeightField;
 use enki_render::{frame::FrameUniforms, material::ChunkPush};
 use enki_rhi::{vk, BufferHandle, PipelineHandle, Rhi, RhiError};
 use glam::DVec3;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use crate::markers::{draw_ribbon, overlay_pipeline};
 
 const RIVERS_WGSL: &str = include_str!("rivers.wgsl");
 
-// --- Tracer tuning (ponytail: tunables, not derived — all USER-verified visually) ---
+// --- Extraction tuning (ponytail: tunables, not derived — all USER-verified visually) ---
 
-/// Seed / visited grid resolution per cube face.
-const GRID_RES: usize = 96;
-/// Channel-initiation threshold on the log-normalized acc 0..1 field. The 4-pass
-/// blur on `flow_accum` caps the field at ~0.48 (CDF over land: ≥0.20 ~23%,
-/// ≥0.25 ~10%, ≥0.30 ~3.6%). High here → only SIGNIFICANT channels seed heads,
-/// so the network is a sparse trunk+tributary tree, not the whole drainage basin.
-const THRESHOLD: f64 = 0.26;
-/// Discrete downstream step length as a multiple of one grid texel's pitch.
-const STEP_MUL: f64 = 1.0;
-/// `HeightField` LOD used to drape the water line (matches the fine terrain).
+/// Drainage-extraction grid resolution per cube face. Higher = finer channels but
+/// the bake is `6·RES²` `height()` calls — the dominant cost. 160 ≈ ~3 s one-time.
+const GRID_RES: usize = 160;
+/// `HeightField` LOD for the ROUTING height sample (the broad/medium terrain drives
+/// where water collects; fine FBM bumps don't matter for routing → cheaper level).
+const ROUTE_LEVEL: u8 = 5;
+/// Priority-Flood fill increment — a tiny monotonic raise so filled depressions /
+/// flats still have a downstream gradient toward their spill point.
+const FILL_EPS: f32 = 1e-7;
+/// Channel-initiation threshold on the precipitation-weighted, log-normalized
+/// drainage accumulation (0..1, peaks at 1.0 at the largest river mouth). The
+/// SINGLE dominant density knob — lower = denser network (more tributaries),
+/// higher = only trunks. See docs/rivers-research.md.
+const CHANNEL_THRESHOLD: f64 = 0.22;
+/// `HeightField` LOD used to drape the water line (the FINE terrain, so the ribbon
+/// sits in the real valley even though routing uses the coarser ROUTE_LEVEL).
 const DRAPE_LEVEL: u8 = 8;
-/// Per-reach loop guard.
-const MAX_STEPS: usize = 4000;
-/// Catmull-Rom substeps per traced segment (kills the ~grid-pitch angularity).
+/// Per-edge downstream-walk guard (against a noisy flow-direction micro-cycle).
+const MAX_STEPS: usize = 8192;
+/// Catmull-Rom substeps per edge segment (kills the ~grid-pitch angularity).
 const SMOOTH_SUB: usize = 4;
-/// Floor on acc before a cell is even considered as a seed (skip flat interiors).
-const SEED_FLOOR: f64 = 0.04;
-/// Skip reaches shorter than this many TRACED points. Adjacent seeds in one basin
-/// hit `visited` after a step or two and would emit tiny fragments that stipple
-/// the whole continent — this drops those merge-stubs, keeping real trunks/tribs.
-const MIN_REACH_POINTS: usize = 5;
+/// Laplacian centerline-smoothing passes — relaxes the D8/channel-preference
+/// staircase (axis-cell hops on diagonal flow) into a natural meander.
+const LAPLACE_ITERS: usize = 12;
+/// Skip graph EDGES shorter than this many cells (a confluence sitting one or two
+/// cells below another is real but invisibly short — drop the sub-pixel reach).
+const MIN_REACH_POINTS: usize = 3;
 
 /// Channel half-width (world m) at zero discharge + the extra at full discharge
 /// (×√acc). Thin: on a ~50 km-radius planet a trunk reads as a ~120 m thread, not
@@ -231,139 +241,210 @@ fn half_width_for(acc: f64) -> f64 {
     0.5 * (WIDTH_BASE + WIDTH_SCALE * acc.max(0.0).sqrt())
 }
 
-/// Trace the whole network. `radius`/`height_scale` drape the water line; the
-/// drainage comes from `hf.flow_accum_at` / `flow_dir_at` / `lake_mask_at`.
+/// Laplacian smoothing of a polyline (neighbour-average, endpoints fixed). Used to
+/// relax the discrete-routing staircase before splining. Slight chord-sag at this
+/// step size (~m on a 50 km planet) is negligible vs the visual win.
+fn laplacian_smooth(pts: &[DVec3], iters: usize) -> Vec<DVec3> {
+    let n = pts.len();
+    let mut cur = pts.to_vec();
+    if n < 3 {
+        return cur;
+    }
+    let mut tmp = cur.clone();
+    for _ in 0..iters {
+        for i in 1..n - 1 {
+            tmp[i] = cur[i] * 0.5 + (cur[i - 1] + cur[i + 1]) * 0.25;
+        }
+        std::mem::swap(&mut cur, &mut tmp);
+    }
+    cur
+}
+
+/// Decode a flat cube-sphere cell index → (face, x, y). Mirrors erosion's
+/// `cell_to_face_xy`.
+#[inline]
+fn cell_to_fxy(c: u32, res: usize) -> (usize, usize, usize) {
+    let c = c as usize;
+    let rr = res * res;
+    (c / rr, (c % rr) % res, (c % rr) / res)
+}
+
+const SINK: u32 = u32::MAX;
+
+/// Priority-Flood min-heap item (pop the LOWEST filled height first; idx breaks ties
+/// deterministically). `BinaryHeap` is a max-heap, so `Ord` is reversed.
+#[derive(Clone, Copy, PartialEq)]
+struct HeapItem {
+    filled: f32,
+    idx: u32,
+}
+impl Eq for HeapItem {}
+impl Ord for HeapItem {
+    fn cmp(&self, o: &Self) -> Ordering {
+        o.filled
+            .partial_cmp(&self.filled)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| o.idx.cmp(&self.idx))
+    }
+}
+impl PartialOrd for HeapItem {
+    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
+        Some(self.cmp(o))
+    }
+}
+
+/// Extract the river network from terrain HEIGHT + PRECIPITATION (no erosion data):
+///   1. Sample broad `height()` + `moisture()` (precip) over the grid.
+///   2. Priority-Flood (Barnes 2014) with flow-direction assignment: seed every sea
+///      cell, pop lowest, fill each neighbour to `max(h, parent+ε)` and point it
+///      downstream at the cell that reached it → a depression-filled drainage TREE
+///      where every land cell drains downhill to the sea (connected by construction).
+///   3. Accumulate precip down the tree (wetter basins → bigger rivers).
+///   4. Threshold the accumulation → channel cells; collapse to a junction graph
+///      (source = in-degree 0, confluence = ≥2) and sweep ribbons (width ∝ √acc).
+/// See docs/rivers-research.md. `radius`/`height_scale` drape the water line.
 pub fn trace_rivers(hf: &dyn HeightField, radius: f64, height_scale: f64) -> RiverMesh {
     let mut mesh = RiverMesh::default();
     let res = GRID_RES;
-    let mut visited = vec![0u8; 6 * res * res];
-    let step_arc = tex_ang(res) * STEP_MUL;
-    let (cos_arc, sin_arc) = (step_arc.cos(), step_arc.sin());
-    // A normal smoothed segment is ~`step_arc*radius/SMOOTH_SUB`; anything far
-    // beyond one whole grid step is a face-seam jump → don't bridge it (no quad
-    // spanning the planet). Guard at ~4 grid steps of world distance.
+    let n = 6 * res * res;
+    // A reach segment is ~one grid step / SMOOTH_SUB; a jump beyond a few grid steps
+    // is a cube-face seam crossing → don't bridge it with a giant quad.
     let max_seg = 4.0 * tex_ang(res) * radius;
 
-    // Per-reach centerline (world position) + half-width, reused per trace.
-    let mut cw: Vec<DVec3> = Vec::new();
-    let mut chw: Vec<f64> = Vec::new();
-
-    // Seed from channel heads (sea/lake/low-acc cells are skipped).
+    // --- 1. Sample routing height + precipitation per cell. ---
+    let mut height = vec![0.0f32; n];
+    let mut precip = vec![0.0f32; n];
     for face in 0..6usize {
         for y in 0..res {
             for x in 0..res {
+                let c = texel_index(face, x, y, res);
                 let dir = texel_to_dir(face, x, y, res);
-                let a = hf.flow_accum_at(dir) as f64;
-                if visited[texel_index(face, x, y, res)] == 1 || a < SEED_FLOOR {
-                    continue;
-                }
-                let h = hf.height(dir, DRAPE_LEVEL);
-                if h < 0.0 || hf.lake_mask_at(dir) as f64 > 0.5 || a < THRESHOLD {
-                    continue;
-                }
-                // Head test: one step UPWIND (rotate dir against the flow) is below
-                // threshold. Incoherent flow → treat as a head.
-                let f = project_flow(hf.flow_dir_at(dir), dir);
-                let is_head = if f.length() > 1e-6 {
-                    let fhat = f.normalize();
-                    let up = (dir * cos_arc - fhat * sin_arc).normalize();
-                    (hf.flow_accum_at(up) as f64) < THRESHOLD
-                } else {
-                    true
-                };
-                if !is_head {
-                    continue;
-                }
-                trace_reach(
-                    hf, radius, height_scale, res, face, x, y, max_seg,
-                    &mut visited, &mut cw, &mut chw, &mut mesh,
-                );
+                height[c] = hf.height(dir, ROUTE_LEVEL) as f32;
+                precip[c] = hf.moisture(dir).max(0.0);
             }
         }
+    }
+
+    // --- 2. Priority-Flood with flow-direction (Barnes 2014). Seed the sea (h<0);
+    //        each cell drains to whoever reached it → a tree rooted at the ocean.
+    //        `order` = ascending-fill pop order (reverse = upstream→downstream). ---
+    let mut filled = height.clone();
+    let mut downstream = vec![SINK; n];
+    let mut processed = vec![false; n];
+    let mut order: Vec<u32> = Vec::with_capacity(n);
+    let mut heap: BinaryHeap<HeapItem> = BinaryHeap::new();
+    for c in 0..n {
+        if height[c] < 0.0 {
+            processed[c] = true;
+            heap.push(HeapItem { filled: filled[c], idx: c as u32 });
+        }
+    }
+    if heap.is_empty() {
+        return mesh; // no ocean outlet → no rivers
+    }
+    while let Some(item) = heap.pop() {
+        let c = item.idx as usize;
+        order.push(c as u32);
+        let (f, x, y) = cell_to_fxy(c as u32, res);
+        for k in 0..8 {
+            let nt = neighbor_texel(f, x, y, NB_DX[k], NB_DY[k], res);
+            let nc = texel_index(nt.face, nt.x, nt.y, res);
+            if processed[nc] {
+                continue;
+            }
+            processed[nc] = true;
+            let nf = height[nc].max(item.filled + FILL_EPS);
+            filled[nc] = nf;
+            downstream[nc] = c as u32;
+            heap.push(HeapItem { filled: nf, idx: nc as u32 });
+        }
+    }
+
+    // --- 3. Accumulate precipitation downstream, then log-normalize to 0..1. ---
+    let mut flow: Vec<f64> = precip.iter().map(|&p| p as f64).collect();
+    for &c in order.iter().rev() {
+        let d = downstream[c as usize];
+        if d != SINK {
+            flow[d as usize] += flow[c as usize];
+        }
+    }
+    let fmax = flow.iter().cloned().fold(0.0f64, f64::max);
+    let lmax = (1.0 + fmax).ln().max(1e-9);
+    let acc: Vec<f32> = flow.iter().map(|&q| ((1.0 + q).ln() / lmax) as f32).collect();
+
+    // --- 4. Channel mask (land + enough discharge) + in-degree on the tree. ---
+    let mut is_channel = vec![false; n];
+    for c in 0..n {
+        if height[c] >= 0.0 && acc[c] as f64 >= CHANNEL_THRESHOLD {
+            is_channel[c] = true;
+        }
+    }
+    let mut indeg = vec![0u16; n];
+    for c in 0..n {
+        if is_channel[c] {
+            let d = downstream[c];
+            if d != SINK && is_channel[d as usize] {
+                indeg[d as usize] += 1;
+            }
+        }
+    }
+
+    // --- 5. Walk one reach from every node (source = in-degree 0; confluence = ≥2)
+    //        down to the next node / outlet. In-degree-1 cells are interior. ---
+    let mut cw: Vec<DVec3> = Vec::new();
+    let mut chw: Vec<f64> = Vec::new();
+    for c in 0..n {
+        if !is_channel[c] || indeg[c] == 1 {
+            continue;
+        }
+        walk_reach(
+            hf, radius, height_scale, res, c as u32,
+            &downstream, &indeg, &is_channel, &acc, max_seg,
+            &mut cw, &mut chw, &mut mesh,
+        );
     }
     mesh
 }
 
-/// Project a flow vector into `dir`'s tangent plane (drop the radial component).
-#[inline]
-fn project_flow(f: DVec3, dir: DVec3) -> DVec3 {
-    f - dir * f.dot(dir)
-}
-
+/// Collect one graph edge (a chain of channel cells) from `start` downstream to the
+/// next confluence or outlet, drape it on the fine terrain, and emit the ribbon.
 #[allow(clippy::too_many_arguments)]
-fn trace_reach(
+fn walk_reach(
     hf: &dyn HeightField,
     radius: f64,
     height_scale: f64,
     res: usize,
-    sf: usize,
-    sx: usize,
-    sy: usize,
+    start: u32,
+    downstream: &[u32],
+    indeg: &[u16],
+    is_channel: &[bool],
+    acc: &[f32],
     max_seg: f64,
-    visited: &mut [u8],
     cw: &mut Vec<DVec3>,
     chw: &mut Vec<f64>,
     mesh: &mut RiverMesh,
 ) {
-    let (mut cf, mut cx, mut cy) = (sf, sx, sy);
     cw.clear();
     chw.clear();
-    let mut last_dir: Option<DVec3> = None;
-
-    for _ in 0..MAX_STEPS {
-        let idx = texel_index(cf, cx, cy, res);
-        let already = visited[idx] == 1;
-
-        let dir = texel_to_dir(cf, cx, cy, res);
-        let acc = hf.flow_accum_at(dir) as f64;
+    let mut cur = start;
+    for step in 0..=MAX_STEPS {
+        let (f, x, y) = cell_to_fxy(cur, res);
+        let dir = texel_to_dir(f, x, y, res);
+        // Drape on the FINE terrain so the ribbon sits in the real valley.
         let h = hf.height(dir, DRAPE_LEVEL);
-        // height() already carries the V-incision, so drape at the surface + lift.
-        let r = radius + h * height_scale + LIFT_M;
-        cw.push(dir * r);
-        chw.push(half_width_for(acc));
+        cw.push(dir * (radius + h * height_scale + LIFT_M));
+        chw.push(half_width_for(acc[cur as usize] as f64));
 
-        if already {
-            break; // merged into an already-traced reach
-        }
-        visited[idx] = 1;
-        if h < 0.0 || hf.lake_mask_at(dir) as f64 > 0.5 {
+        // Reached a downstream confluence node (after moving) → this reach ends here.
+        if step > 0 && indeg[cur as usize] >= 2 {
             break;
         }
-
-        // Discrete downstream step: the 8-neighbour the flow points toward. Two
-        // reaches entering one cell pick the SAME neighbour → they merge.
-        let f = project_flow(hf.flow_dir_at(dir), dir);
-        let g = if f.length() > 1e-3 {
-            let g = f.normalize();
-            last_dir = Some(g);
-            g
-        } else if let Some(g) = last_dir {
-            g
-        } else {
-            break;
-        };
-
-        let mut best_dot = f64::NEG_INFINITY;
-        let (mut bf, mut bx, mut by) = (cf, cx, cy);
-        for k in 0..8 {
-            let nt = neighbor_texel(cf, cx, cy, NB_DX[k], NB_DY[k], res);
-            let ndir = texel_to_dir(nt.face, nt.x, nt.y, res);
-            let d = (ndir - dir).dot(g);
-            if d > best_dot {
-                best_dot = d;
-                bf = nt.face;
-                bx = nt.x;
-                by = nt.y;
-            }
+        let d = downstream[cur as usize];
+        if d == SINK || !is_channel[d as usize] {
+            break; // outlet (sea / sub-threshold)
         }
-        if best_dot <= 0.0 || (bf == cf && bx == cx && by == cy) {
-            break;
-        }
-        cf = bf;
-        cx = bx;
-        cy = by;
+        cur = d;
     }
-
     emit_ribbon(cw, chw, max_seg, mesh);
 }
 
@@ -376,6 +457,13 @@ fn emit_ribbon(cw: &[DVec3], chw: &[f64], max_seg: f64, mesh: &mut RiverMesh) {
     if c < MIN_REACH_POINTS {
         return;
     }
+
+    // Laplacian pre-smooth (endpoints fixed): relax the D8 / channel-preference
+    // staircase — the router hops between axis-aligned channel cells when the true
+    // flow is diagonal, so the raw centerline sawtooths. A few neighbour-averaging
+    // passes straighten it into a smooth meander before the Catmull-Rom subdivision.
+    let cw = laplacian_smooth(cw, LAPLACE_ITERS);
+    let cw = cw.as_slice();
 
     // Subdivide cw/chw → smoothed s* (skip if too short).
     let mut sw: Vec<DVec3> = Vec::new();
@@ -465,24 +553,16 @@ mod tests {
 
     const RES_TEST: usize = 32;
 
-    /// A synthetic field with a single coherent downhill channel: flow points
-    /// toward +Y (north), discharge ramps up toward the equator, no lakes.
+    /// A synthetic planet: north hemisphere is land sloping down to an equatorial
+    /// sea, plus medium-scale bumps so the drainage branches. Uniform precipitation.
     struct ChannelHf;
     impl HeightField for ChannelHf {
         fn height(&self, dir: DVec3, _l: u8) -> f64 {
-            // Land everywhere except a polar sink (h<0 near +Y) so traces terminate.
-            0.2 - 0.5 * dir.y.max(0.0)
+            // h>0 north (land, high pole), <0 south (sea); bumps dissect it.
+            0.3 * dir.y + 0.05 * (dir.x * 8.0).sin() * (dir.z * 8.0).sin()
         }
-        fn flow_accum_at(&self, dir: DVec3) -> f32 {
-            // High discharge in a band near the equator, fading poleward.
-            (0.45 * (1.0 - dir.y.abs())) as f32
-        }
-        fn flow_dir_at(&self, dir: DVec3) -> DVec3 {
-            // Downhill = toward +Y, projected to the tangent plane.
-            project_flow(DVec3::Y, dir)
-        }
-        fn lake_mask_at(&self, _dir: DVec3) -> f32 {
-            0.0
+        fn moisture(&self, _dir: DVec3) -> f32 {
+            0.6
         }
     }
 
@@ -534,8 +614,9 @@ mod tests {
     }
 
     #[test]
-    fn empty_field_traces_nothing() {
-        // Default HeightField (flow_accum 0 everywhere) → no seeds, no geometry.
+    fn no_ocean_traces_nothing() {
+        // All-land (no h<0 cell) → Priority-Flood has no sea seed → no outlet, no
+        // drainage tree, no rivers.
         struct FlatHf;
         impl HeightField for FlatHf {
             fn height(&self, _d: DVec3, _l: u8) -> f64 {

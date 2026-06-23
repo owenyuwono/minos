@@ -50,6 +50,14 @@ pub struct UiOutput {
     pub wireframe: bool,
     /// Temporal anti-aliasing (hides discrete-LOD shimmer + edge aliasing).
     pub taa: bool,
+    /// Sun shadow map (Nanite path): on/off + cascade + bias tuning.
+    pub shadow_map_enabled: bool,
+    /// Cascade radius (m) — smaller = sharper, less reach — and depth span (m).
+    pub shadow_half_extent: f32,
+    pub shadow_depth: f32,
+    /// Reversed-Z ADD bias (kills acne) + along-normal offset (m, helps slopes).
+    pub shadow_depth_bias: f32,
+    pub shadow_normal_bias: f32,
     pub nanite_enabled: bool,
     /// LOD pixel-error threshold (lower = finer / smoother LOD, heavier).
     pub nanite_tau: f32,
@@ -193,6 +201,11 @@ impl EguiState {
         view_mode:         u32,
         wireframe:         bool,
         taa:               bool,
+        shadow_map_enabled: bool,
+        shadow_half_extent: f32,
+        shadow_depth:       f32,
+        shadow_depth_bias:  f32,
+        shadow_normal_bias: f32,
         nanite_enabled:    bool,
         nanite_tau:        f32,
         nanite_available:  bool,
@@ -224,6 +237,11 @@ impl EguiState {
             view_mode,
             wireframe,
             taa,
+            shadow_map_enabled,
+            shadow_half_extent,
+            shadow_depth,
+            shadow_depth_bias,
+            shadow_normal_bias,
             nanite_enabled,
             nanite_tau,
             ocean_enabled,
@@ -283,7 +301,7 @@ impl EguiState {
                     CollapsingHeader::new("Time").default_open(false).show(ui, |ui| {
                         ui.checkbox(&mut out.paused, "Pause");
                         ui.add(
-                            egui::Slider::new(&mut out.time_scale, 60.0..=300_000.0)
+                            egui::Slider::new(&mut out.time_scale, 1.0..=300_000.0)
                                 .logarithmic(true)
                                 .text("Sim speed (×real)"),
                         );
@@ -302,6 +320,7 @@ impl EguiState {
                                 ui.selectable_value(&mut out.view_mode, 3, "Triangle");
                                 ui.selectable_value(&mut out.view_mode, 4, "Cluster");
                                 ui.selectable_value(&mut out.view_mode, 5, "LOD");
+                                ui.selectable_value(&mut out.view_mode, 14, "Shadow⊙");
                             });
                         });
                         ui.horizontal(|ui| {
@@ -323,6 +342,21 @@ impl EguiState {
                         });
                         ui.checkbox(&mut out.wireframe, "Wireframe");
                         ui.checkbox(&mut out.taa, "TAA (temporal AA)");
+                        // Sun shadow map (Nanite path) — casters: terrain + character
+                        // + nearby trees. Greyed when Nanite is off.
+                        ui.add_enabled_ui(nanite_active, |ui| {
+                            ui.checkbox(&mut out.shadow_map_enabled, "Sun shadows (map)");
+                            if out.shadow_map_enabled {
+                                ui.add(egui::Slider::new(&mut out.shadow_half_extent, 24.0..=256.0)
+                                    .text("Shadow radius (m) — smaller = sharper"));
+                                ui.add(egui::Slider::new(&mut out.shadow_depth, 60.0..=600.0)
+                                    .text("Shadow depth span (m)"));
+                                ui.add(egui::Slider::new(&mut out.shadow_depth_bias, 0.0..=0.005)
+                                    .text("Shadow depth bias"));
+                                ui.add(egui::Slider::new(&mut out.shadow_normal_bias, 0.0..=0.3)
+                                    .text("Shadow normal bias (m)"));
+                            }
+                        });
                     });
 
                     // ── Ocean ────────────────────────────────────────────────
@@ -383,7 +417,7 @@ impl EguiState {
                         ui.add_enabled(on,
                             egui::Slider::new(&mut out.clouds.thickness_m, 500.0..=8000.0).text("Thickness (m)"));
                         ui.add_enabled(on,
-                            egui::Slider::new(&mut out.clouds.wind_speed, 0.0..=300.0).text("Wind speed (m/s)"));
+                            egui::Slider::new(&mut out.clouds.wind_speed, 0.0..=6000.0).text("Wind speed (m/s)"));
                         ui.add_enabled(on,
                             egui::Slider::new(&mut out.clouds.noise_scale, 500.0..=8000.0).text("Feature size (m)"));
                         ui.add_enabled(on,
@@ -396,6 +430,10 @@ impl EguiState {
                             egui::Slider::new(&mut out.clouds.powder, 0.0..=1.0).text("Powder (dark edges)"));
                         ui.add_enabled(on,
                             egui::Slider::new(&mut out.clouds.curl, 0.0..=1.0).text("Curl turbulence"));
+                        ui.add_enabled(on,
+                            egui::Slider::new(&mut out.clouds.form_rate, 0.0..=0.5).text("Form rate (re-form)"));
+                        ui.add_enabled(on,
+                            egui::Slider::new(&mut out.clouds.decay_rate, 0.0..=0.2).text("Decay rate"));
                         ui.add_enabled(on,
                             egui::Slider::new(&mut out.clouds.steps, 16.0..=96.0).text("March steps"));
                     });

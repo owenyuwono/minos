@@ -32,8 +32,8 @@ struct FrameData {
     planes: array<vec4<f32>, 6>,
     debug: vec4<u32>,
     cam_world: vec4<f32>, // true camera world pos (xyz) — for radial-up reconstruction
-    char_a: vec4<f32>,    // character shadow capsule: xyz = feet (camera-relative), w = radius
-    char_b: vec4<f32>,    // xyz = head (camera-relative), w = enabled (1/0)
+    light_view_proj: mat4x4<f32>, // sun shadow map: world(camera-relative) → light clip
+    shadow_params: vec4<f32>,     // [depth_bias, normal_bias, strength, enabled]
 };
 
 struct Push {
@@ -46,6 +46,9 @@ struct Push {
 @group(0) @binding(3) var<storage, read> visible:   array<u32>;
 @group(0) @binding(5) var<storage, read> frame:     FrameData;
 @group(0) @binding(6) var<storage, read> node_xlat: array<vec4<f32>>;
+// Sun shadow map (depth) + comparison sampler — receiver side (fs_color).
+@group(0) @binding(8) var shadow_map:  texture_depth_2d;
+@group(0) @binding(9) var shadow_samp: sampler_comparison;
 
 var<immediate> pc: Push;
 
@@ -169,6 +172,37 @@ fn vs_pull(@builtin(vertex_index) vid: u32) -> VsOut {
     return out;
 }
 
+struct DepthOut {
+    @builtin(position) clip: vec4<f32>,
+};
+
+// Sun shadow-map caster: pull the same geometry as `vs_pull`, project with the
+// light view-proj (depth-only, no attributes). Degenerate tris go off-screen.
+@vertex
+fn vs_depth(@builtin(vertex_index) vid: u32) -> DepthOut {
+    var out: DepthOut;
+    let per = MAX_TRIS * 3u;
+    let vis = vid / per;
+    let local = vid % per;
+    let tri = local / 3u;
+    let corner = local % 3u;
+
+    let ci = visible[vis];
+    let m = clusters[ci];
+    let t = node_xlat[m.range.z].xyz;
+
+    if (tri >= m.range.y) {
+        out.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0); // degenerate → clipped
+        return out;
+    }
+    let gt = ci * MAX_TRIS + tri;
+    let vidx = tris[gt * 3u + corner];
+    let base = vidx * 20u;
+    let world_rel = vec3<f32>(verts[base + 0u], verts[base + 1u], verts[base + 2u]) + t;
+    out.clip = frame.light_view_proj * vec4<f32>(world_rel, 1.0);
+    return out;
+}
+
 fn hash_u32(x: u32) -> u32 {
     var h = x * 0x9E3779B1u;
     h = h ^ (h >> 16u);
@@ -234,6 +268,30 @@ fn material_ramp(t: f32) -> vec3<f32> {
     return mix(c3, c4, (t - 0.75) / 0.25);
 }
 
+// Hypsometric elevation ramp (debug Height view): ocean blues → green lowland →
+// yellow → brown highland → white peaks. The land range (most terrain sits in
+// ~0–0.4) gets closely-spaced, distinct bands so small height differences —
+// valleys vs ridges, and whether rivers sit in them — read with strong contrast,
+// unlike the old flat grayscale that crushed everything into mid-grays.
+fn height_ramp(e: f32) -> vec3<f32> {
+    if (e < 0.0) {
+        // Ocean: shallow cyan at the coast → deep navy in the abyss.
+        let d = clamp(-e / 0.5, 0.0, 1.0);
+        return mix(vec3<f32>(0.20, 0.55, 0.70), vec3<f32>(0.02, 0.06, 0.20), d);
+    }
+    let c0 = vec3<f32>(0.18, 0.52, 0.24); // coast green
+    let c1 = vec3<f32>(0.45, 0.68, 0.28); // lowland green
+    let c2 = vec3<f32>(0.82, 0.80, 0.38); // yellow
+    let c3 = vec3<f32>(0.72, 0.50, 0.28); // tan
+    let c4 = vec3<f32>(0.48, 0.35, 0.26); // dark brown
+    let c5 = vec3<f32>(0.97, 0.97, 0.98); // snow / peak
+    if (e < 0.10) { return mix(c0, c1, e / 0.10); }
+    else if (e < 0.22) { return mix(c1, c2, (e - 0.10) / 0.12); }
+    else if (e < 0.36) { return mix(c2, c3, (e - 0.22) / 0.14); }
+    else if (e < 0.52) { return mix(c3, c4, (e - 0.36) / 0.16); }
+    return mix(c4, c5, clamp((e - 0.52) / 0.20, 0.0, 1.0));
+}
+
 // Wetness ramp, dry→wet: dry tan (#b8a07a, neutral) → wet blue (#2a6fb0), so
 // rivers/lakes read as blue threads over a neutral surface.
 fn wetness_ramp(t: f32) -> vec3<f32> {
@@ -285,29 +343,34 @@ fn terrain_shadow(world_rel: vec3<f32>, horizon: vec4<f32>, sun: vec3<f32>) -> f
     return 1.0 - clamp((h - sun_elev) * HORIZON_STRENGTH, 0.0, 1.0);
 }
 
-// Occlusion [0,1] of the sun ray from receiver `p` (camera-relative) by a sphere
-// `c` (camera-relative) radius `r`: 1 = fully blocked, 0 = clear. The capsule must
-// be on the sun side of `p` (t > 0). Soft edge over [r, 2r] for a penumbra.
-fn sphere_occ(p: vec3<f32>, sun: vec3<f32>, c: vec3<f32>, r: f32) -> f32 {
-    let w = c - p;
-    let t = dot(w, sun);
-    if (t <= 0.0) { return 0.0; } // sphere is behind the receiver w.r.t. the sun
-    let d = length(w - sun * t); // perpendicular distance from sphere centre to the ray
-    return 1.0 - smoothstep(r, r * 2.0, d);
-}
-
-// Character shadow: approximate the body as 3 spheres along the feet→head capsule
-// and take the max occlusion. ponytail: 3 spheres reads as a humanoid cast; swap
-// for an exact ray-vs-capsule (or per-limb) if the blob shape isn't enough.
-fn capsule_shadow(p: vec3<f32>, sun: vec3<f32>) -> f32 {
-    let a = frame.char_a.xyz;
-    let b = frame.char_b.xyz;
-    let r = frame.char_a.w;
-    let occ = max(
-        sphere_occ(p, sun, a, r),
-        max(sphere_occ(p, sun, mix(a, b, 0.5), r), sphere_occ(p, sun, b, r)),
-    );
-    return 1.0 - occ;
+// Sun shadow map (PCF). 1 = lit, 0 = fully shadowed. Reversed-Z: the caster (closest
+// to the light) stored the GREATER depth, so a receiver behind it has a SMALLER
+// ndc.z → the GREATER_OR_EQUAL comparison fails → shadowed. `depth_bias` is ADDED to
+// the reference (pushes toward lit → kills self-shadow acne); `normal_bias` offsets
+// the sample point along the surface normal (helps grazing slopes). Outside the
+// light frustum → lit (the border sampler + the uv/z guard).
+fn sample_shadow(world_rel: vec3<f32>, n: vec3<f32>) -> f32 {
+    if (frame.shadow_params.w < 0.5) { return 1.0; } // disabled
+    let p = world_rel + n * frame.shadow_params.y;
+    let clip = frame.light_view_proj * vec4<f32>(p, 1.0);
+    if (clip.w <= 0.0) { return 1.0; }
+    let ndc = clip.xyz / clip.w;
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, ndc.y * 0.5 + 0.5);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z <= 0.0 || ndc.z >= 1.0) {
+        return 1.0;
+    }
+    let ref_depth = ndc.z + frame.shadow_params.x;
+    // 3×3 PCF (each tap is itself 2×2 hardware PCF via the linear comparison
+    // sampler → ~6×6 effective), softening the texel stair-steps into a penumbra.
+    let texel = 1.0 / f32(textureDimensions(shadow_map).x);
+    var sum = 0.0;
+    for (var dy = -1; dy <= 1; dy = dy + 1) {
+        for (var dx = -1; dx <= 1; dx = dx + 1) {
+            let o = vec2<f32>(f32(dx), f32(dy)) * texel;
+            sum = sum + textureSampleCompareLevel(shadow_map, shadow_samp, uv + o, ref_depth);
+        }
+    }
+    return sum / 9.0;
 }
 
 @fragment
@@ -345,9 +408,7 @@ fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
         // fill so shadowed ground isn't black.
         let sun_dir = normalize(frame.sun0_dir.xyz);
         var sh = terrain_shadow(in.world_rel, in.horizon, sun_dir);
-        if (frame.char_b.w > 0.5) {
-            sh = sh * capsule_shadow(in.world_rel, sun_dir);
-        }
+        sh = sh * sample_shadow(in.world_rel, n); // sun shadow map (objects + terrain)
         rgb = aces_filmic(ambient_term + hemi + (d0 + sheen) * sh + d1);
     } else if (pc.mode == 1u) {
         // Unlit — flat biome albedo (no lighting, no ACES).
@@ -365,13 +426,26 @@ fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
         // Plate — per-plate tint.
         rgb = in.plate;
     } else if (pc.mode == 7u) {
-        // Height — signed normalized elevation → grayscale (ocean dark, peaks bright).
-        let g = clamp(in.elevation * 0.5 + 0.5, 0.0, 1.0);
-        rgb = vec3<f32>(g);
+        // Height — hypsometric tint (ocean blues → green → brown → white peaks),
+        // high-contrast in the low-land range so valleys/ridges read clearly.
+        rgb = height_ramp(in.elevation);
     } else if (pc.mode == 8u) {
         rgb = material_ramp(clamp(in.material, 0.0, 1.0));
     } else if (pc.mode == 9u) {
         rgb = wetness_ramp(clamp(in.wetness, 0.0, 1.0));
+    } else if (pc.mode == 14u) {
+        // DEBUG: |ndc.xy| of this point in the LIGHT's clip space.
+        //   * dark near the camera fading to bright at the cascade edge (a smooth
+        //     radial gradient) = the light matrix is VALID (cascade may be too small);
+        //   * UNIFORM BRIGHT everywhere (incl. the ground under the camera) = the
+        //     matrix is identity/broken (geometry projects to metres, not [-1,1]).
+        // GREEN tint where inside the [-1,1] frustun (would be shadow-mapped); plain
+        // grey where outside.
+        let clip = frame.light_view_proj * vec4<f32>(in.world_rel, 1.0);
+        let ndc = clip.xyz / clip.w;
+        let m = clamp(length(ndc.xy) / 3.0, 0.0, 1.0);
+        let inside = abs(ndc.x) <= 1.0 && abs(ndc.y) <= 1.0;
+        rgb = select(vec3<f32>(m, m, m), vec3<f32>(0.0, m + 0.2, 0.0), inside);
     } else {
         rgb = volcano_ramp(clamp(in.volcanism, 0.0, 1.0));
     }

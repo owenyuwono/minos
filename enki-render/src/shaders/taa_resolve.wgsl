@@ -55,17 +55,30 @@ fn reconstruct_world(uv: vec2<f32>, depth: f32) -> vec3<f32> {
 // occluded → shadow. Reuses this pass's depth + matrices, so it costs no extra
 // pass and shadows EVERYTHING in the depth buffer (character, trees, terrain).
 // Limitations: screen-space (off-screen casters miss; reach = SUN_SHADOW_LEN).
-const SUN_SHADOW_STEPS: i32 = 24;
-const SUN_SHADOW_LEN: f32 = 12.0;    // metres marched toward the sun
-const SUN_SHADOW_BIAS: f32 = 0.05;   // metres — avoid self-shadow acne
-const SUN_SHADOW_THICK: f32 = 6.0;   // metres — occluder must be within this slab
-const SUN_SHADOW_DARKEN: f32 = 0.55; // 1 = black core, 0 = none
+const SUN_SHADOW_LEN: f32 = 12.0;      // metres marched toward the sun
+const SUN_SHADOW_BIAS: f32 = 0.05;     // metres — avoid self-shadow acne
+const SUN_SHADOW_THICK: f32 = 2.0;     // metres — occluder must be within this slab
+const SUN_SHADOW_DARKEN: f32 = 0.55;   // 1 = black core, 0 = none
+const SUN_SHADOW_PX_STRIDE: f32 = 2.0; // on-screen spacing between march samples
+const SUN_SHADOW_MAX_STEPS: i32 = 48;  // perf cap on the adaptive step count
 
-fn sun_shadow(world: vec3<f32>) -> f32 {
+// `uv` = this pixel's screen UV (the march start on screen). The step COUNT scales
+// with the march's on-screen length so samples stay ~SUN_SHADOW_PX_STRIDE px apart
+// at any distance/grazing angle — a fixed count spreads thin over long shadows and
+// steps over the (thin) occluder, which is what combed the shadow into slats.
+fn sun_shadow(world: vec3<f32>, uv: vec2<f32>) -> f32 {
     if (params.sun.w <= 0.0) { return 1.0; }
     let sun = params.sun.xyz;
-    for (var i: i32 = 1; i <= SUN_SHADOW_STEPS; i = i + 1) {
-        let t = SUN_SHADOW_LEN * f32(i) / f32(SUN_SHADOW_STEPS);
+
+    // Project the far end of the march; its on-screen distance sets the sample count.
+    let ce = params.cur_view_proj * vec4<f32>(world + sun * SUN_SHADOW_LEN, 1.0);
+    if (ce.w <= 0.0) { return 1.0; }
+    let end_uv = (ce.xy / ce.w) * 0.5 + 0.5;
+    let span_px = length((end_uv - uv) * params.texel.zw);
+    let steps = clamp(i32(span_px / SUN_SHADOW_PX_STRIDE), 4, SUN_SHADOW_MAX_STEPS);
+
+    for (var i: i32 = 1; i <= steps; i = i + 1) {
+        let t = SUN_SHADOW_LEN * f32(i) / f32(steps);
         let p = world + sun * t;
         let clip = params.cur_view_proj * vec4<f32>(p, 1.0);
         if (clip.w <= 0.0) { continue; }
@@ -132,7 +145,7 @@ fn fs_resolve(in: VsOut) -> @location(0) vec4<f32> {
     // recomputes fresh each frame on the current depth — stable, no ghosting).
     let d_self = textureSampleLevel(depth_tex, samp, uv, 0.0).r;
     if (d_self > 0.0) {
-        outc = outc * sun_shadow(reconstruct_world(uv, d_self));
+        outc = outc * sun_shadow(reconstruct_world(uv, d_self), uv);
     }
 
     return vec4<f32>(outc, 1.0);

@@ -175,6 +175,10 @@ pub struct Erosion {
     res: usize,
     erosion_delta: Vec<f32>,
     flow_accum: Vec<f32>,
+    /// The SAME log-discharge but UNblurred — for river-network extraction (the
+    /// 4-pass blur on `flow_accum` smears channel peaks into fat gradients; the
+    /// network tracer needs sharp peaks or it floods the basin with pseudo-channels).
+    flow_accum_sharp: Vec<f32>,
     flow_dir_x: Vec<f32>,
     flow_dir_y: Vec<f32>,
     flow_dir_z: Vec<f32>,
@@ -562,6 +566,11 @@ impl Erosion {
             flow_accum[c] = v.clamp(0.0, 1.0) as f32;
         }
 
+        // Keep the UNblurred discharge for river-network extraction BEFORE the
+        // seam blur smears the channel peaks (fine for terrain incision, useless
+        // for tracing crisp dendritic channels — see docs/rivers-research.md).
+        let flow_accum_sharp = flow_accum.clone();
+
         // l. seam blur (delta 3, acc 4, flowDir 4 — flowDir NOT re-normalized)
         let erosion_delta = blur_field_n(&erosion_delta, res, 3);
         let flow_accum = blur_field_n(&flow_accum, res, 4);
@@ -573,6 +582,7 @@ impl Erosion {
             res,
             erosion_delta,
             flow_accum,
+            flow_accum_sharp,
             flow_dir_x,
             flow_dir_y,
             flow_dir_z,
@@ -596,6 +606,13 @@ impl Erosion {
         sample_c1(&self.flow_accum, self.warped_dir(dir), self.res)
     }
 
+    /// UNblurred log discharge 0..1 at `dir` — for river-network extraction.
+    /// PLAIN bilinear, NO domain warp: the network wants the field's true sharp
+    /// peaks, not the warped-into-terrain-detail version `acc_at` returns.
+    pub fn acc_sharp_at(&self, dir: DVec3) -> f64 {
+        sample_smooth(&self.flow_accum_sharp, dir, self.res)
+    }
+
     /// World-space downhill flow vector at `dir` (RAW bilinear — magnitude is the
     /// coherence signal, NOT re-normalized). C1-sampled per component.
     pub fn flow_at(&self, dir: DVec3) -> DVec3 {
@@ -610,6 +627,20 @@ impl Erosion {
         } else {
             DVec3::ZERO
         }
+    }
+
+    /// UNwarped downhill flow tangent at `dir` — for river-network ROUTING. The
+    /// query-time domain warp `flow_at` applies (~0.03 rad ≈ several cells) is
+    /// cosmetic terrain-detail steering; using it would misalign the routing from
+    /// the unwarped `acc_sharp_at` channel raster (the downstream step lands off the
+    /// channel → disconnected short reaches). Plain bilinear, no warp.
+    pub fn flow_dir_raw_at(&self, dir: DVec3) -> DVec3 {
+        let out = DVec3::new(
+            sample_smooth(&self.flow_dir_x, dir, self.res),
+            sample_smooth(&self.flow_dir_y, dir, self.res),
+            sample_smooth(&self.flow_dir_z, dir, self.res),
+        );
+        if out.is_finite() { out } else { DVec3::ZERO }
     }
 
     /// Lake spill elevation (metres) at `dir`; LAKE_SENTINEL where not a lake.

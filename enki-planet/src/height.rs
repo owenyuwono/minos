@@ -62,9 +62,23 @@ pub trait HeightField: Send + Sync {
         0.0
     }
 
+    /// UNblurred log-discharge 0..1 at `dir` — the river-network EXTRACTION reads
+    /// this (the blurred `flow_accum_at` smears channel peaks into fat gradients).
+    /// Default 0. See `erosion::Erosion::acc_sharp_at`.
+    fn flow_accum_sharp_at(&self, _dir: DVec3) -> f32 {
+        0.0
+    }
+
     /// World-space downhill flow tangent at `dir` (magnitude = coherence signal,
     /// NOT unit). Default zero. See `erosion::Erosion::flow_at`.
     fn flow_dir_at(&self, _dir: DVec3) -> DVec3 {
+        DVec3::ZERO
+    }
+
+    /// UNwarped downhill flow tangent at `dir` — the river-network ROUTING reads
+    /// this (the domain warp in `flow_dir_at` misaligns routing from the unwarped
+    /// channel raster). Default zero. See `erosion::Erosion::flow_dir_raw_at`.
+    fn flow_dir_sharp_at(&self, _dir: DVec3) -> DVec3 {
         DVec3::ZERO
     }
 

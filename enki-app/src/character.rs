@@ -24,6 +24,16 @@ use enki_rhi::{
 };
 use glam::{DVec3, Mat4, Vec3, Vec4};
 
+/// Depth-only sun-shadow caster shader: project the skinned position by the
+/// light's (view-proj × model). No fragment (depth-only). Reads only location 0
+/// (position); the pipeline's other 3 vertex bindings are bound but unused.
+const CHARACTER_DEPTH_WGSL: &str = "\
+var<immediate> mvp: mat4x4<f32>;\n\
+@vertex\n\
+fn vs_depth(@location(0) pos: vec3<f32>) -> @builtin(position) vec4<f32> {\n\
+    return mvp * vec4<f32>(pos, 1.0);\n\
+}\n";
+
 // ── Body dimensions (metres) — shared by the skeleton offsets and the boxes ──
 
 const HIP_HEIGHT: f32 = 0.95;
@@ -215,6 +225,8 @@ fn solve_pose(phase: f32, speed: f32) -> [Mat4; NUM_BONES] {
 /// pipeline + the static colour/index buffers + a per-frame position/normal ring.
 pub struct Character {
     pipeline: PipelineHandle,
+    /// Depth-only caster pipeline for the sun shadow map (1× D32).
+    shadow_pipeline: PipelineHandle,
 
     // Static streams (never change): colour (also reused as the plate slot) + index.
     col: BufferHandle,
@@ -262,6 +274,22 @@ impl Character {
         })?;
         rhi.destroy_shader_module(shader);
 
+        // Depth-only sun-shadow caster (1× D32, same 4-vertex-buffer layout).
+        let depth_shader = rhi.create_shader_module(CHARACTER_DEPTH_WGSL)?;
+        let shadow_pipeline = rhi.create_graphics_pipeline_depth(&GraphicsPipelineDesc {
+            shader: depth_shader,
+            vs_entry: "vs_depth",
+            fs_entry: "vs_depth", // ignored (depth-only)
+            push_constant_size: 64, // mat4: light_view_proj * model
+            set0_layout: rhi.set0_layout(),
+            color_format, // ignored
+            depth_format: vk::Format::D32_SFLOAT,
+            samples: vk::SampleCountFlags::TYPE_1,
+            blend: false,
+            fill: true,
+        })?;
+        rhi.destroy_shader_module(depth_shader);
+
         // Static colour stream; the plate slot reuses it (mode 0 ignores plate).
         let col = rhi.create_vertex_buffer(cast_slice(&rest.col))?;
         let idx = rhi.create_index_buffer(&rest.idx)?;
@@ -278,6 +306,7 @@ impl Character {
 
         Ok(Self {
             pipeline,
+            shadow_pipeline,
             col,
             idx,
             index_count: rest.idx.len() as u32,
@@ -353,6 +382,39 @@ impl Character {
         rhi.draw_indexed(fi, self.index_count);
         Ok(())
     }
+
+    /// Record the character as a depth-only caster into the (already-open) sun
+    /// shadow pass — same placement as [`Self::draw`], projected with the light's
+    /// view-proj. The shadow pass set the viewport already, so we don't touch it.
+    pub fn record_shadow(
+        &self,
+        rhi: &mut Rhi,
+        fi: u32,
+        camera: &Camera,
+        feet: DVec3,
+        facing: Vec3,
+        light_view_proj: Mat4,
+    ) -> Result<(), RhiError> {
+        let up = feet.normalize().as_vec3();
+        let forward = facing.normalize();
+        let right = up.cross(forward).normalize();
+        let feet_rel = (feet - camera.position).as_vec3();
+        let model = Mat4::from_cols(
+            right.extend(0.0),
+            up.extend(0.0),
+            forward.extend(0.0),
+            feet_rel.extend(1.0),
+        );
+        let mvp = (light_view_proj * model).to_cols_array_2d();
+
+        let fidx = fi as usize;
+        rhi.bind_pipeline(fi, self.shadow_pipeline)?;
+        rhi.bind_vertex_buffers(fi, &[self.pos_ring[fidx], self.nrm_ring[fidx], self.col, self.col])?;
+        rhi.bind_index_buffer(fi, self.idx)?;
+        rhi.push_constants(fi, bytemuck::bytes_of(&mvp))?;
+        rhi.draw_indexed(fi, self.index_count);
+        Ok(())
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────
@@ -370,6 +432,19 @@ mod tests {
             .zip(&rig.bone)
             .map(|(p, &b)| bones[b].transform_point3(Vec3::from(*p)))
             .collect()
+    }
+
+    #[test]
+    fn depth_caster_wgsl_validates() {
+        let module = naga::front::wgsl::parse_str(CHARACTER_DEPTH_WGSL)
+            .unwrap_or_else(|e| panic!("character depth WGSL failed to parse: {e:?}"));
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        validator
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("character depth WGSL failed to validate: {e:?}"));
     }
 
     #[test]

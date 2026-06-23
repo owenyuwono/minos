@@ -110,7 +110,7 @@ impl PipelineStore {
         &mut self,
         desc: &GraphicsPipelineDesc<'_>,
     ) -> Result<PipelineHandle, RhiError> {
-        self.create_inner(desc, false)
+        self.create_inner(desc, false, false)
     }
 
     /// Like [`Self::create`] but with NO vertex input bindings — the vertex shader
@@ -120,13 +120,35 @@ impl PipelineStore {
         &mut self,
         desc: &GraphicsPipelineDesc<'_>,
     ) -> Result<PipelineHandle, RhiError> {
-        self.create_inner(desc, true)
+        self.create_inner(desc, true, false)
+    }
+
+    /// Like [`Self::create_pulling`] but **depth-only**: no fragment stage, no color
+    /// attachment (depth write ON). For a sun shadow-map caster pass that pulls the
+    /// same geometry and projects with the light view-proj. `desc.color_format` /
+    /// `fs_entry` are ignored; `depth_format` + `samples` are used.
+    pub fn create_pulling_depth(
+        &mut self,
+        desc: &GraphicsPipelineDesc<'_>,
+    ) -> Result<PipelineHandle, RhiError> {
+        self.create_inner(desc, true, true)
+    }
+
+    /// Depth-only pipeline WITH the standard 4×vec3 vertex input (no fragment, no
+    /// color attachment). For a shadow-map caster of vertex-buffer geometry (e.g.
+    /// the character). `desc.color_format`/`fs_entry` are ignored.
+    pub fn create_depth(
+        &mut self,
+        desc: &GraphicsPipelineDesc<'_>,
+    ) -> Result<PipelineHandle, RhiError> {
+        self.create_inner(desc, false, true)
     }
 
     fn create_inner(
         &mut self,
         desc: &GraphicsPipelineDesc<'_>,
         vertex_pulling: bool,
+        depth_only: bool,
     ) -> Result<PipelineHandle, RhiError> {
         // ── Pipeline layout ─────────────────────────────────────────────────
         let set_layouts = [desc.set0_layout];
@@ -152,16 +174,19 @@ impl PipelineStore {
             RhiError::Other("fs_entry contains null byte".to_string().into())
         })?;
 
-        let stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::VERTEX)
-                .module(desc.shader.handle)
-                .name(&vs_name),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(desc.shader.handle)
-                .name(&fs_name),
-        ];
+        // Depth-only passes (shadow caster) have no fragment stage.
+        let mut stages = vec![vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(desc.shader.handle)
+            .name(&vs_name)];
+        if !depth_only {
+            stages.push(
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                    .module(desc.shader.handle)
+                    .name(&fs_name),
+            );
+        }
 
         // ── Vertex input ────────────────────────────────────────────────────
         // 4 separate bindings, each carries one vec3<f32> attribute.
@@ -245,9 +270,12 @@ impl PipelineStore {
                 .color_write_mask(vk::ColorComponentFlags::RGBA)
         };
 
+        // Depth-only: no color attachment to blend.
+        let blend_attachments: &[vk::PipelineColorBlendAttachmentState] =
+            if depth_only { &[] } else { std::slice::from_ref(&blend_attachment) };
         let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
             .logic_op_enable(false)
-            .attachments(std::slice::from_ref(&blend_attachment));
+            .attachments(blend_attachments);
 
         // ── Dynamic state ───────────────────────────────────────────────────
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
@@ -260,8 +288,11 @@ impl PipelineStore {
             .scissor_count(1);
 
         // ── Dynamic rendering — no render pass object ───────────────────────
+        // Depth-only: zero color attachments.
+        let color_formats: &[vk::Format] =
+            if depth_only { &[] } else { std::slice::from_ref(&desc.color_format) };
         let mut rendering_info = vk::PipelineRenderingCreateInfo::default()
-            .color_attachment_formats(std::slice::from_ref(&desc.color_format))
+            .color_attachment_formats(color_formats)
             .depth_attachment_format(desc.depth_format);
 
         // ── Assemble and create ──────────────────────────────────────────────

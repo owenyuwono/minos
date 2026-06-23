@@ -38,3 +38,55 @@ pub fn reversed_z_perspective(fov_y_radians: f32, aspect: f32, near: f32, far: f
         glam::Vec4::new(0.0, 0.0, b, 0.0),
     )
 }
+
+/// Build a reversed-Z orthographic projection (Vulkan clip: Y-down, depth [0,1],
+/// **near→1.0, far→0.0** — same convention as [`reversed_z_perspective`]). Used for
+/// the sun shadow map's light projection. `w` stays 1 (no perspective divide), so
+/// depth is linear in view-space z; a closer caster stores a *greater* depth, which
+/// pairs with a `GREATER_OR_EQUAL` comparison sampler + an ADD depth bias on the
+/// receiver (see the Nanite/flora `sample_shadow`).
+pub fn reversed_z_orthographic(
+    l: f32,
+    r: f32,
+    b: f32,
+    t: f32,
+    near: f32,
+    far: f32,
+) -> glam::Mat4 {
+    let sx = 2.0 / (r - l);
+    let sy = 2.0 / (t - b);
+    // ndc.z = z_e / (far - near) + far / (far - near): at z_e=-near → 1, z_e=-far → 0.
+    let a = 1.0 / (far - near);
+    let bz = far / (far - near);
+    let tx = -(r + l) / (r - l);
+    let ty = (t + b) / (t - b); // Vulkan Y-flip folds the OpenGL sign in
+    glam::Mat4::from_cols(
+        glam::Vec4::new(sx, 0.0, 0.0, 0.0),
+        glam::Vec4::new(0.0, -sy, 0.0, 0.0), // flip Y for Vulkan
+        glam::Vec4::new(0.0, 0.0, a, 0.0),
+        glam::Vec4::new(tx, ty, bz, 1.0),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reversed_z_ortho_depth_convention() {
+        // The #1 silent-inversion trap: prove near→1, far→0, monotonic (closer =
+        // greater), and Vulkan Y-flip, before any GPU shadow code relies on it.
+        let m = reversed_z_orthographic(-10.0, 10.0, -10.0, 10.0, 1.0, 100.0);
+        let d = |z: f32| {
+            let c = m * glam::Vec4::new(0.0, 0.0, z, 1.0);
+            c.z / c.w
+        };
+        assert!((d(-1.0) - 1.0).abs() < 1e-5, "near plane must map to depth 1");
+        assert!(d(-100.0).abs() < 1e-5, "far plane must map to depth 0");
+        assert!(d(-1.0) > d(-50.0) && d(-50.0) > d(-100.0), "reversed-Z: closer = greater depth");
+        // Right/top edges → +1 / −1 (Vulkan Y-down).
+        let corner = m * glam::Vec4::new(10.0, 10.0, -1.0, 1.0);
+        assert!((corner.x / corner.w - 1.0).abs() < 1e-5, "right edge → +1");
+        assert!((corner.y / corner.w + 1.0).abs() < 1e-5, "top edge → −1 (Vulkan Y-down)");
+    }
+}

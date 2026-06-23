@@ -13,6 +13,7 @@
 //! compute is the perf upgrade path once this is proven.
 
 pub mod fft;
+mod fetch;
 mod mesh;
 pub mod sim;
 pub mod spectrum;
@@ -124,6 +125,10 @@ const N_CASCADES: usize = 3;
 const LENGTH_SCALES: [f32; 3] = [250.0, 17.0, 5.0];
 /// Projected grid: screen-space lattice resolution (cells per side).
 const PROJ_RES: u32 = 224;
+/// Open-water swell FLOOR for wave intensity: even at zero wind, open ocean keeps
+/// this fraction of full energy (so the low-wind equator isn't a dead blue band).
+/// Wind adds the rest; `openness` then caps small/enclosed seas. ~0 = pure-wind (old).
+const WAVE_BASE: f32 = 0.45;
 
 /// GPU mirror of `ocean_surface.wgsl`'s `Ocean` uniform (std140, all vec4).
 #[repr(C)]
@@ -170,12 +175,17 @@ pub struct WaveSurface {
     proj_count: u32,
     proj_dyn:  Vec<BufferHandle>,
     proj_scratch: Vec<[f32; 3]>,
-    // Per-vertex wind strength (0..1), sampled from the planet each frame → drives
-    // wave height + intensity (binding 6, read by `vs_projected` via vertex_index).
-    // `None` until the heightfield finishes loading (then neutral 0.5 is used).
-    wind_src:  Option<Arc<dyn HeightField>>,
+    // Per-vertex (intensity, wind angle), written each frame from the baked cubes →
+    // binding 6, read by `vs_projected` via vertex_index.
     wind_dyn:  Vec<BufferHandle>,
-    wind_scratch: Vec<f32>,
+    wind_scratch: Vec<[f32; 2]>,
+    /// Baked + blurred planet wind (speed, world direction) — sampled per vertex
+    /// for smooth intensity (softened shear bands) + wave direction. Empty until load.
+    wind_speed_cube: Vec<f32>,
+    wind_dir_cube:   Vec<[f32; 3]>,
+    /// Baked openness cube (fetch proxy): wind is scaled by this per vertex so
+    /// water enclosed by land stays calm. Empty until the heightfield loads.
+    openness:  Vec<f32>,
     // ── Background FFT worker (keeps the heavy N=256×3 sim off the render thread) ──
     /// Latest completed field, written by the worker, copied to the GPU each frame.
     latest:        Arc<Mutex<Vec<OceanTexel>>>,
@@ -209,7 +219,7 @@ impl WaveSurface {
         let proj_idx = rhi.create_index_buffer(&proj_i)?;
         let proj_count = proj_i.len() as u32;
         let proj_scratch = vec![[0.0f32; 3]; proj_ndc.len()];
-        let wind_scratch = vec![0.0f32; proj_ndc.len()];
+        let wind_scratch = vec![[0.0f32; 2]; proj_ndc.len()];
 
         // ── Custom set 0: frame UBO + field storage + ocean UBO + scene refraction
         // + per-vertex wind (binding 6). ──
@@ -261,12 +271,15 @@ impl WaveSurface {
                     cutoff_high,
                     g: 9.81,
                     depth: 500.0,
+                    // Bake the dominant direction at +x (0 rad) so the per-vertex wind
+                    // angle (applied as the tile-blend rotation) aligns waves to the
+                    // local wind with no built-in offset; swell keeps a small cross.
                     local: Spectrum {
-                        scale: 1.0, wind_speed: 16.0, wind_dir_rad: 45f32.to_radians(),
+                        scale: 1.0, wind_speed: 16.0, wind_dir_rad: 0.0,
                         fetch: 100_000.0, spread_blend: 1.0, swell: 0.2, gamma: 3.3, short_waves_fade: 0.02,
                     },
                     swell: Spectrum {
-                        scale: 0.8, wind_speed: 2.0, wind_dir_rad: 70f32.to_radians(),
+                        scale: 0.8, wind_speed: 2.0, wind_dir_rad: 0.4,
                         fetch: 300_000.0, spread_blend: 1.0, swell: 1.0, gamma: 3.3, short_waves_fade: 0.01,
                     },
                 }
@@ -316,7 +329,7 @@ impl WaveSurface {
         let fif = rhi.frames_in_flight();
         let field_size = (FFT_N * FFT_N * N_CASCADES * std::mem::size_of::<OceanTexel>()) as u64;
         let proj_dyn_size = (proj_ndc.len() * std::mem::size_of::<[f32; 3]>()) as u64;
-        let wind_dyn_size = (proj_ndc.len() * std::mem::size_of::<f32>()) as u64;
+        let wind_dyn_size = (proj_ndc.len() * std::mem::size_of::<[f32; 2]>()) as u64;
         let mut frames = Vec::with_capacity(fif);
         let mut proj_dyn = Vec::with_capacity(fif);
         let mut wind_dyn = Vec::with_capacity(fif);
@@ -346,7 +359,8 @@ impl WaveSurface {
         Ok(Self {
             proj_pipeline, layout, sampler,
             proj_ndc, proj_idx, proj_count, proj_dyn, proj_scratch,
-            wind_src: None, wind_dyn, wind_scratch,
+            wind_dyn, wind_scratch, openness: Vec::new(),
+            wind_speed_cube: Vec::new(), wind_dir_cube: Vec::new(),
             latest, shared_params, active, running, worker: Some(worker),
             length_scales, cascade_count,
             params: WaveParams::default(), debug_intensity: false, frames, base_radius,
@@ -439,14 +453,33 @@ impl WaveSurface {
             let ndc = &self.proj_ndc;
             let scratch = &mut self.proj_scratch;
             let wscratch = &mut self.wind_scratch;
-            let wind_src = &self.wind_src;
+            let openness = &self.openness;
+            let wspeed = &self.wind_speed_cube;
+            let wvec = &self.wind_dir_cube;
+            let east_d = east.as_dvec3();
+            let north_d = north.as_dvec3();
             for (i, p) in ndc.iter().enumerate() {
                 let dir = fwd
                     + rgt * (p[0] as f64 * tan_half * aspect)
                     + upc * (p[1] as f64 * tan_half);
                 let hit = mesh::project_to_sphere(dir, center, sea_radius, 0.5); // cam-relative
                 let wdir = (hit + camera_pos).normalize(); // world surface direction
-                wscratch[i] = wind_src.as_ref().map_or(0.5, |h| h.wind_speed_at(wdir));
+                // Planet wind (baked + blurred → smooth, gradual bands): speed →
+                // intensity, scaled by openness (calm when land-enclosed); direction
+                // → wave-propagation angle in the (east, north) tangent frame so waves
+                // travel WITH the wind. Open water keeps a swell FLOOR (`WAVE_BASE`) so
+                // the low-wind equator stays energetic, not a hard blue band.
+                let open = if openness.is_empty() { 1.0 } else { fetch::sample(openness, fetch::OPEN_RES, wdir) };
+                let (intensity, angle) = if wspeed.is_empty() {
+                    (0.5 * open, 0.0)
+                } else {
+                    let speed = fetch::sample(wspeed, fetch::OPEN_RES, wdir);
+                    let v = fetch::sample_vec3(wvec, fetch::OPEN_RES, wdir);
+                    let wv = DVec3::new(v[0] as f64, v[1] as f64, v[2] as f64);
+                    let ang = wv.dot(north_d).atan2(wv.dot(east_d)) as f32;
+                    ((WAVE_BASE + (1.0 - WAVE_BASE) * speed) * open, ang)
+                };
+                wscratch[i] = [intensity, angle];
                 let h = hit.as_vec3();
                 scratch[i] = [h.x, h.y, h.z];
             }
@@ -463,9 +496,13 @@ impl WaveSurface {
     }
 
     /// Supply the planet as the wind source once it has finished loading; until
-    /// then waves use a neutral wind. Drives per-vertex wave height + intensity.
+    /// then waves use a neutral wind. Drives per-vertex wave height + intensity,
+    /// and bakes the openness (fetch) cube so land-enclosed water stays calm.
     pub fn set_wind_source(&mut self, hf: Arc<dyn HeightField>) {
-        self.wind_src = Some(hf);
+        self.openness = fetch::bake_openness(hf.as_ref(), 0.0); // bake at the e=0 sea datum
+        let (speed, dir) = fetch::bake_wind(hf.as_ref());
+        self.wind_speed_cube = speed;
+        self.wind_dir_cube = dir;
     }
 
     /// Free the caller-owned sampler. Call once before RHI teardown (buffers,

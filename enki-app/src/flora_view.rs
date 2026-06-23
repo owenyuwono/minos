@@ -1040,9 +1040,30 @@ impl FloraView {
         wind: [f32; 4],
         lod: LeafLod,
     ) -> Result<(), RhiError> {
-        let rot = self.rotation_quat();
-        let lvp = light_view_proj.to_cols_array_2d();
-        let rot4 = [rot.x, rot.y, rot.z, rot.w];
+        // The viewer's single tree: orient by the baked rotation. (The depth
+        // shaders skin rot-independently, so folding it into the light matrix and
+        // passing identity rot is exactly `lvp * rotate(skinned, rot)`.)
+        let model = Mat4::from_quat(self.rotation_quat());
+        self.record_shadow_model(rhi, renderer, fi, model, light_view_proj, wind, lod)
+    }
+
+    /// Like [`Self::record_shadow`] but places the caster with a full per-instance
+    /// `model` matrix (the planet scatter), folded into the light view-proj. The
+    /// branch/leaf depth shaders skin in the rest frame BEFORE the rotation, so an
+    /// identity rot + `lvp·model` reproduces `lvp·model·skinned` exactly.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_shadow_model(
+        &self,
+        rhi: &mut Rhi,
+        renderer: &FloraRenderer,
+        fi: u32,
+        model: Mat4,
+        light_view_proj: Mat4,
+        wind: [f32; 4],
+        lod: LeafLod,
+    ) -> Result<(), RhiError> {
+        let lvp = (light_view_proj * model).to_cols_array_2d();
+        let rot4 = [0.0, 0.0, 0.0, 1.0]; // identity — `model` carries the orientation
 
         // ── Branch depth caster ── (branches always cast; they're the trunk)
         renderer.bind_depth(rhi, fi, FloraPipeline::BranchDepth);

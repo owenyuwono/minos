@@ -30,6 +30,7 @@ use crate::noise::Noise3D;
 use crate::tectonics::{Tectonics, boundary_relief};
 use crate::climate::{Climate, ClimateParams, WindSample};
 use crate::erosion::{Erosion, ErosionOpts};
+use crate::river_carve::RiverCarve;
 
 /// ki `_deriveSeed` — child seed from (master, stream). Verbatim port:
 /// `s = master ^ (stream+1)*0xdeadbeef; s ^ (s >> 16)` (single xor-shift, NOT a
@@ -243,6 +244,8 @@ pub struct TectonicHeightField {
     /// Baked erosion field (Phase 4). `Some` in the shipping path; when present the
     /// orogenic stamps are gated off and `erosion.delta_at` owns the relief budget.
     erosion: Option<Erosion>,
+    /// Baked river-valley incision (height+precip drainage; carves valleys + banks).
+    river_carve: RiverCarve,
     /// Process-palette noise streams (40/41/42 via ki `_deriveSeed`).
     glacial_noise: Noise3D,
     aeolian_noise: Noise3D,
@@ -363,6 +366,30 @@ impl TectonicHeightField {
             })
         };
 
+        // --- Bake river-valley incision from height + precipitation (Step 2) ---
+        // Route water on base + erosion (the broad valleys), NOT including the river
+        // incision itself (no circularity). Precip = the wind-driven climate moisture.
+        let river_carve = {
+            let tect_for_r = Arc::clone(&tectonics);
+            let noise_for_r = Noise3D::new(seed);
+            let erosion_ref = &erosion;
+            let route_h = move |dir: DVec3, level: u32| -> f64 {
+                let base = tect_height(
+                    &tect_for_r,
+                    &noise_for_r,
+                    dir,
+                    level as u8,
+                    is_stagnant_lid_c,
+                    shelf_w_base_c,
+                    &HeightExtras::base_only(),
+                );
+                base + erosion_ref.delta_at(dir)
+            };
+            let climate_for_r = Arc::clone(&climate);
+            let moisture = move |dir: DVec3| -> f64 { climate_for_r.moisture(dir) as f64 };
+            RiverCarve::new(route_h, moisture)
+        };
+
         TectonicHeightField {
             tectonics,
             climate,
@@ -370,6 +397,7 @@ impl TectonicHeightField {
             is_stagnant_lid,
             shelf_w_base,
             erosion: Some(erosion),
+            river_carve,
             glacial_noise,
             aeolian_noise,
             karst_noise,
@@ -394,6 +422,7 @@ impl HeightField for TectonicHeightField {
         let ex = HeightExtras {
             gate_stamps: true,
             erosion: self.erosion.as_ref(),
+            river_carve: Some(&self.river_carve),
             climate: Some(self.climate.as_ref()),
             glacial_noise: Some(&self.glacial_noise),
             aeolian_noise: Some(&self.aeolian_noise),
@@ -499,8 +528,16 @@ impl HeightField for TectonicHeightField {
         self.erosion.as_ref().map(|e| e.acc_at(dir) as f32).unwrap_or(0.0)
     }
 
+    fn flow_accum_sharp_at(&self, dir: DVec3) -> f32 {
+        self.erosion.as_ref().map(|e| e.acc_sharp_at(dir) as f32).unwrap_or(0.0)
+    }
+
     fn flow_dir_at(&self, dir: DVec3) -> DVec3 {
         self.erosion.as_ref().map(|e| e.flow_at(dir)).unwrap_or(DVec3::ZERO)
+    }
+
+    fn flow_dir_sharp_at(&self, dir: DVec3) -> DVec3 {
+        self.erosion.as_ref().map(|e| e.flow_dir_raw_at(dir)).unwrap_or(DVec3::ZERO)
     }
 
     fn lake_mask_at(&self, dir: DVec3) -> f32 {
@@ -521,6 +558,9 @@ impl HeightField for TectonicHeightField {
 struct HeightExtras<'a> {
     gate_stamps: bool,
     erosion: Option<&'a Erosion>,
+    /// Baked river-valley incision. `None` during the climate/erosion/river-carve
+    /// bakes (no incision feedback → no circularity); `Some` in the shipping height().
+    river_carve: Option<&'a RiverCarve>,
     /// Climate reference for the process-palette weights (moisture + wind). `None`
     /// during Climate's own bake (→ neutral moisture / no wind / pure FLUVIAL).
     climate: Option<&'a Climate>,
@@ -543,6 +583,7 @@ impl<'a> HeightExtras<'a> {
         HeightExtras {
             gate_stamps: true,
             erosion: None,
+            river_carve: None,
             climate: None,
             glacial_noise: None,
             aeolian_noise: None,
@@ -842,8 +883,20 @@ fn tect_height(
     let volcano   = (tectonics.volcano_elevation(dir)).min(TECT_VOLC_SUM_MAX);
     let headroom  = 1.0 - smoothstep(TECT_VOLC_HEADROOM_LO, TECT_VOLC_HEADROOM_HI, surface_h);
     let erosion_h = ex.erosion.map(|e| e.delta_at(dir)).unwrap_or(0.0);
+    let pre = surface_h + erosion_h + volcano * headroom;
 
-    (surface_h + erosion_h + volcano * headroom).clamp(-1.0, 1.0)
+    // River-valley incision (≤0): carve a thin channel along the drainage line so the
+    // un-cut terrain on either side forms the BANKS (Step 2; `None` during bakes).
+    // Clamp so a LAND column never carves below sea level — rivers bottom out AT the
+    // coast, they don't drown the land into an archipelago.
+    let river_incision = ex.river_carve.map(|r| r.incision_at(dir)).unwrap_or(0.0);
+    let carved = if pre > 0.0 {
+        (pre + river_incision).max(0.0)
+    } else {
+        pre
+    };
+
+    carved.clamp(-1.0, 1.0)
 }
 
 // ---------------------------------------------------------------------------
