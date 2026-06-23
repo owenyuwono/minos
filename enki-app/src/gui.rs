@@ -93,6 +93,10 @@ pub struct UiOutput {
     pub atmo_enabled: bool,
     /// Atmosphere tunables (height + density).
     pub atmo: crate::atmosphere::AtmoParams,
+    /// Draw the depth-aware atmospheric scattering (aerial perspective + sky dome).
+    pub aerial_enabled: bool,
+    /// Aerial-scattering tunables (height + strength + intensity + sky brightness).
+    pub aerial: crate::aerial::AerialParams,
     /// Draw the volumetric clouds.
     pub clouds_enabled: bool,
     /// Cloud tunables (coverage / density / altitude / wind speed / …).
@@ -223,6 +227,8 @@ impl EguiState {
         wind:              crate::wind::WindParams,
         atmo_enabled:      bool,
         atmo:              crate::atmosphere::AtmoParams,
+        aerial_enabled:    bool,
+        aerial:            crate::aerial::AerialParams,
         clouds_enabled:    bool,
         clouds:            crate::clouds::CloudParams,
         markers_poles:     bool,
@@ -257,6 +263,8 @@ impl EguiState {
             wind,
             atmo_enabled,
             atmo,
+            aerial_enabled,
+            aerial,
             clouds_enabled,
             clouds,
             markers_poles,
@@ -347,8 +355,8 @@ impl EguiState {
                         ui.add_enabled_ui(nanite_active, |ui| {
                             ui.checkbox(&mut out.shadow_map_enabled, "Sun shadows (map)");
                             if out.shadow_map_enabled {
-                                ui.add(egui::Slider::new(&mut out.shadow_half_extent, 24.0..=256.0)
-                                    .text("Shadow radius (m) — smaller = sharper"));
+                                ui.add(egui::Slider::new(&mut out.shadow_half_extent, 8.0..=64.0)
+                                    .text("Shadow base radius (m) — cascade 0; ×2 per cascade"));
                                 ui.add(egui::Slider::new(&mut out.shadow_depth, 60.0..=600.0)
                                     .text("Shadow depth span (m)"));
                                 ui.add(egui::Slider::new(&mut out.shadow_depth_bias, 0.0..=0.005)
@@ -402,6 +410,23 @@ impl EguiState {
                             egui::Slider::new(&mut out.atmo.height, 200.0..=8000.0).text("Height (m)"));
                         ui.add_enabled(out.atmo_enabled,
                             egui::Slider::new(&mut out.atmo.density, 0.0..=2.0).text("Density"));
+                    });
+
+                    // ── Aerial scattering (depth-aware; needs TAA on) ────────
+                    CollapsingHeader::new("Aerial (scattering)").default_open(true).show(ui, |ui| {
+                        ui.checkbox(&mut out.aerial_enabled, "Show aerial perspective");
+                        let on = out.aerial_enabled;
+                        ui.add_enabled(on,
+                            egui::Slider::new(&mut out.aerial.height, 1000.0..=40000.0).text("Top (m)"));
+                        ui.add_enabled(on,
+                            egui::Slider::new(&mut out.aerial.falloff, 200.0..=15000.0).text("Falloff (m)"));
+                        ui.add_enabled(on,
+                            egui::Slider::new(&mut out.aerial.beta, 1.0e-5..=3.0e-4)
+                                .logarithmic(true).text("Strength (β 1/m)"));
+                        ui.add_enabled(on,
+                            egui::Slider::new(&mut out.aerial.intensity, 0.0..=2.0).text("Intensity"));
+                        ui.add_enabled(on,
+                            egui::Slider::new(&mut out.aerial.sky_strength, 0.0..=2.0).text("Sky brightness"));
                     });
 
                     // ── Clouds (needs TAA on) ────────────────────────────────

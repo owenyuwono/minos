@@ -1,20 +1,23 @@
-//! `clouds_advect` — semi-Lagrangian advection of a cloud-coverage field.
+//! `clouds_advect` — the cloud field, TRANSPORTED (not warped).
 //!
-//! The cloud shader used to *warp* a static noise field by `wind × elapsed_time`,
-//! which shears (never translates coherently, never merges) and tears unbounded.
-//! Instead we TRANSPORT a coverage scalar `c ∈ [0,1]` on a 256×128 equirect grid:
-//! each tick, back-trace every cell along the wind, bilinearly sample the previous
-//! field, and relax toward the climate moisture target. Mass accumulates where the
-//! flow converges → real "weather flows + builds along the wind." See
+//! The shader used to *warp* static noise by `wind × elapsed_time` to fake motion —
+//! which inevitably resets (snaps back) or shears at high wind. Instead we ADVECT the
+//! cloud field itself: a density scalar `c ∈ [0,1]` on a 512×256 equirect grid, where
+//! each tick back-traces every cell along the wind, bilinearly samples the previous
+//! field (semi-Lagrangian), injects cloud SHAPE via an evolving clumpy noise gated by
+//! moisture, and decays. The shader then samples this field DIRECTLY as the cloud
+//! density — so ALL motion is advection: continuous, never resets, never shears.
+//! (Advection, not a fluid sim: the wind is given/baked, we only transport.) See
 //! `docs/clouds-advection-research.md`.
 //!
 //! Runs on a background worker (the ocean-FFT / wind-streak pattern); the render
-//! thread copies `latest` into a per-FiF storage buffer the shader samples.
+//! thread copies `latest` into a per-FiF storage buffer the shader samples bilinearly.
 //!
-//! ponytail: plain bilinear SL (over-diffuses slowly — the moisture source + the
-//! render-time fbm/Worley detail hide it); 3D-Cartesian back-trace dodges the pole
-//! singularity; latitude CLAMPS at the seam (fold + MacCormack are the upgrades).
-//! Merging is gentle by design — enki's wind swirl is divergence-free.
+//! ponytail: plain bilinear SL over-diffuses slowly — the evolving noise source keeps
+//! detail alive (IBFV-style) and the shader adds fine sub-grid Worley. 3D-Cartesian
+//! back-trace dodges the pole singularity; latitude CLAMPS at the seam (fold +
+//! MacCormack are the upgrades). Merging is gentle by design (div-free wind — the
+//! convergence upgrade is in `docs/wind-convergence-research.md`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,11 +27,15 @@ use std::time::{Duration, Instant};
 use enki_planet::height::HeightField;
 use glam::{DVec3, Vec3};
 
-pub(crate) const GRID_W: usize = 256;
-pub(crate) const GRID_H: usize = 128;
+pub(crate) const GRID_W: usize = 512;
+pub(crate) const GRID_H: usize = 256;
 const CELLS: usize = GRID_W * GRID_H;
 /// Worker tick (Hz). SL is stable at any dt; this just paces CPU.
 const TICK_HZ: f32 = 30.0;
+/// Cloud-clump size in the injected source noise (higher = smaller clumps).
+const NOISE_FREQ: f32 = 9.0;
+/// How fast clumps form/dissipate (slow evolution of the injected detail).
+const NOISE_EVOLVE: f32 = 0.04;
 
 /// Live-tunable advection knobs (pushed from the GUI each frame).
 #[derive(Clone, Copy)]
@@ -49,7 +56,7 @@ impl Default for AdvectParams {
         // CFL target) needs effective |u| in the kilometres-per-second range. 1500 puts a
         // full-speed cell crossing near ~0.8 s; weaker form_rate (τ≈33 s, was 10 s) lets
         // advection transport features faster than the static moisture target re-forms.
-        Self { wind_speed: 1500.0, form_rate: 0.06, decay_rate: 0.02 }
+        Self { wind_speed: 1500.0, form_rate: 0.15, decay_rate: 0.05 }
     }
 }
 
@@ -135,6 +142,7 @@ fn worker_loop(
     let cell_dirs = precompute_cell_dirs();
     let mut wind_vel = vec![[0.0f32; 3]; CELLS];
     let mut target = vec![0.0f32; CELLS];
+    let mut noise_buf = vec![0.0f32; CELLS];
     let mut c_prev = vec![0.0f32; CELLS];
     let mut c_next = vec![0.0f32; CELLS];
     let tick = Duration::from_secs_f32(1.0 / TICK_HZ);
@@ -154,10 +162,10 @@ fn worker_loop(
             match hf {
                 Some(hf) => {
                     bake(hf.as_ref(), &cell_dirs, &mut wind_vel, &mut target);
-                    // Seed with the climate coverage so clouds are present immediately.
-                    c_prev.copy_from_slice(&target);
-                    c_next.copy_from_slice(&target);
-                    latest.lock().unwrap().copy_from_slice(&target);
+                    // Seed empty — clouds build up from the noisy source + advect.
+                    c_prev.fill(0.0);
+                    c_next.fill(0.0);
+                    latest.lock().unwrap().fill(0.0);
                     ready.store(true, Ordering::Relaxed);
                     elapsed = 0.0;
                     last = Instant::now();
@@ -182,10 +190,20 @@ fn worker_loop(
         let dt = (now - last).as_secs_f32().clamp(1e-4, 0.2);
         last = now;
         elapsed += dt;
-        // Unsteady gust so the steady-state pattern never freezes (sways ±~70°).
-        let gust = 1.2 * (elapsed * 0.12).sin();
+        // Injected cloud-shape source: evolving clumpy noise, gated by moisture in
+        // `step`. This is what gives the ADVECTED field real cloud shape (not just a
+        // smooth placement mask) — the shader samples this field directly, so motion =
+        // pure advection (continuous, never resets, never shears).
+        let ez = elapsed * NOISE_EVOLVE;
+        for idx in 0..CELLS {
+            let d = cell_dirs[idx];
+            let n = fbm(Vec3::new(d.x * NOISE_FREQ, d.y * NOISE_FREQ, d.z * NOISE_FREQ + ez));
+            noise_buf[idx] = smoothstep(0.4, 0.7, n); // clumpy
+        }
+        // Gentle unsteady gust so the flow never settles to a static steady state.
+        let gust = 0.6 * (elapsed * 0.08).sin();
         let p = *params.lock().unwrap();
-        step(radius, &cell_dirs, &wind_vel, &target, &c_prev, &mut c_next, dt, gust, &p);
+        step(radius, &cell_dirs, &wind_vel, &target, &noise_buf, &c_prev, &mut c_next, dt, gust, &p);
         std::mem::swap(&mut c_prev, &mut c_next);
         latest.lock().unwrap().copy_from_slice(&c_prev);
 
@@ -242,6 +260,7 @@ fn step(
     cell_dirs: &[Vec3],
     wind_vel: &[[f32; 3]],
     target: &[f32],
+    noise: &[f32],
     c_prev: &[f32],
     c_next: &mut [f32],
     dt: f32,
@@ -263,12 +282,11 @@ fn step(
         let p_dep = dep.normalize_or_zero();
         let p_dep = if p_dep == Vec3::ZERO { dir } else { p_dep };
         let c_adv = bilinear(c_prev, p_dep);
-        // ONE-WAY source: clouds FORM where it's humid (target high), saturating at 1,
-        // and DECAY everywhere. So coverage builds in humid zones, gets carried
-        // downwind by the advection, and fades as it travels = visible moving
-        // streamers. (A two-way `form·(target−c)` relax instead pins the field to the
-        // static climate mask → advecting a smooth mask is imperceptible = no motion.)
-        let s = p.form_rate * target[idx] * (1.0 - c_adv) - p.decay_rate * c_adv;
+        // Source = inject cloud SHAPE where humid (target) AND the evolving clump noise
+        // is high, saturating at 1; decay everywhere. The advection (above) transports
+        // this shaped field continuously → clouds flow + form/dissipate, never reset.
+        let potential = target[idx] * noise[idx];
+        let s = p.form_rate * potential * (1.0 - c_adv) - p.decay_rate * c_adv;
         c_next[idx] = (c_adv + dt * s).clamp(0.0, 1.0);
     }
 }
@@ -303,6 +321,44 @@ fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+// ── Value-noise fBm (CPU, for the injected cloud-shape source) ──────────────────
+
+fn hash13(p: Vec3) -> f32 {
+    let mut q = (p * 0.1031).fract();
+    q += Vec3::splat(q.dot(Vec3::new(q.z, q.y, q.x) + Vec3::splat(31.32)));
+    ((q.x + q.y) * q.z).fract()
+}
+
+fn vnoise(x: Vec3) -> f32 {
+    let i = x.floor();
+    let f = x.fract();
+    let u = f * f * (Vec3::splat(3.0) - 2.0 * f);
+    let c = |dx: f32, dy: f32, dz: f32| hash13(i + Vec3::new(dx, dy, dz));
+    let x00 = lerp(c(0.0, 0.0, 0.0), c(1.0, 0.0, 0.0), u.x);
+    let x10 = lerp(c(0.0, 1.0, 0.0), c(1.0, 1.0, 0.0), u.x);
+    let x01 = lerp(c(0.0, 0.0, 1.0), c(1.0, 0.0, 1.0), u.x);
+    let x11 = lerp(c(0.0, 1.0, 1.0), c(1.0, 1.0, 1.0), u.x);
+    lerp(lerp(x00, x10, u.y), lerp(x01, x11, u.y), u.z)
+}
+
+fn fbm(p0: Vec3) -> f32 {
+    // 2 octaves — cheap (this runs per cell per worker tick over the whole grid); the
+    // shader adds fine sub-grid detail on top.
+    let mut p = p0;
+    let mut amp = 0.5;
+    let mut sum = 0.0;
+    for _ in 0..2 {
+        sum += amp * vnoise(p);
+        p *= 2.03;
+        amp *= 0.5;
+    }
+    sum / 0.75
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,7 +378,7 @@ mod tests {
         let bump = 100 * GRID_W + 50;
         c_prev[bump] = 1.0;
         let mut c_next = vec![0.0f32; CELLS];
-        step(R, &dirs, &wind, &target, &c_prev, &mut c_next, 0.1, 0.0, &zero_p(0.0, 0.0, 0.0));
+        step(R, &dirs, &wind, &target, &vec![1.0f32; CELLS], &c_prev, &mut c_next, 0.1, 0.0, &zero_p(0.0, 0.0, 0.0));
         // Backtrace to the same cell centre → field unchanged.
         assert!((c_next[bump] - 1.0).abs() < 1e-4, "bump should persist, got {}", c_next[bump]);
         assert!(c_next[bump + 2] < 1e-4, "neighbour should stay empty");
@@ -337,7 +393,7 @@ mod tests {
         let target = vec![0.0f32; CELLS];
         let c_prev = vec![0.5f32; CELLS];
         let mut c_next = vec![0.0f32; CELLS];
-        step(R, &dirs, &wind, &target, &c_prev, &mut c_next, 0.1, 0.0, &zero_p(120.0, 0.0, 0.0));
+        step(R, &dirs, &wind, &target, &vec![1.0f32; CELLS], &c_prev, &mut c_next, 0.1, 0.0, &zero_p(120.0, 0.0, 0.0));
         for &v in &c_next {
             assert!((v - 0.5).abs() < 1e-4, "uniform field must stay uniform, got {v}");
         }
@@ -372,7 +428,7 @@ mod tests {
         // wind_speed chosen so dt·|u|/R == one longitude cell (TAU/GRID_W rad).
         let dt = 0.1f32;
         let ws = R * (std::f32::consts::TAU / GRID_W as f32) / dt;
-        step(R, &dirs, &wind, &target, &c_prev, &mut c_next, dt, 0.0, &zero_p(ws, 0.0, 0.0));
+        step(R, &dirs, &wind, &target, &vec![1.0f32; CELLS], &c_prev, &mut c_next, dt, 0.0, &zero_p(ws, 0.0, 0.0));
         // Backtrace steps UPWIND, so cell `col` samples its empty (col−1) neighbour and
         // the bump arrives one cell downwind at `col+1`.
         assert!(
@@ -395,7 +451,7 @@ mod tests {
         let c_prev = vec![0.0f32; CELLS];
         let mut c_next = vec![0.0f32; CELLS];
         // c_next = 0 + dt·(form·(1−0) − 0) = 0.1
-        step(R, &dirs, &wind, &target, &c_prev, &mut c_next, 0.1, 0.0, &zero_p(0.0, 1.0, 0.0));
+        step(R, &dirs, &wind, &target, &vec![1.0f32; CELLS], &c_prev, &mut c_next, 0.1, 0.0, &zero_p(0.0, 1.0, 0.0));
         assert!((c_next[0] - 0.1).abs() < 1e-3, "expected 0.1, got {}", c_next[0]);
     }
 }

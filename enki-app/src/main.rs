@@ -41,6 +41,7 @@ mod loading;
 mod ocean;
 mod wind;
 mod atmosphere;
+mod aerial;
 mod clouds;
 mod clouds_advect;
 mod markers;
@@ -87,6 +88,7 @@ use fps::FpsMeter;
 use ocean::{Ocean, WaveSurface};
 use wind::WindOverlay;
 use atmosphere::{Atmosphere, AtmoParams};
+use aerial::{Aerial, AerialParams};
 use clouds::{Clouds, CloudParams};
 use markers::Markers;
 use rivers::Rivers;
@@ -129,6 +131,8 @@ struct App {
     wind:         Option<WindOverlay>,
     /// Translucent atmosphere shell (halo + the wind's home altitude).
     atmosphere:   Option<Atmosphere>,
+    /// Depth-aware atmospheric scattering (aerial perspective; water split, TAA-on only).
+    aerial:       Option<Aerial>,
     /// Wind-driven volumetric clouds (drawn in the water split; TAA-on only).
     clouds:       Option<Clouds>,
     /// Equator + pole reference markers.
@@ -245,6 +249,9 @@ struct App {
     atmo_enabled:      bool,
     /// Atmosphere tunables (height + density).
     atmo_params:       AtmoParams,
+    /// Depth-aware atmospheric scattering (aerial perspective + sky dome).
+    aerial_enabled:    bool,
+    aerial_params:     AerialParams,
     /// Draw the volumetric clouds.
     clouds_enabled:    bool,
     /// Cloud tunables (coverage / density / altitude / wind speed / …).
@@ -301,6 +308,7 @@ impl App {
             wave:          None,
             wind:          None,
             atmosphere:    None,
+            aerial:        None,
             clouds:        None,
             markers:       None,
             rivers:        None,
@@ -343,11 +351,11 @@ impl App {
             surface_speed: 0.0,
             sun_dir_body:  glam::Vec3::Y,
             shadow_map_enabled: true,
-            shadow_size:   4096,
-            shadow_half_extent: 60.0,  // 120 m box @ 4096² ≈ 0.029 m/texel
+            shadow_size:   4096, // per-cascade; 3×4096²×FiF ≈ 400 MB (halve-on-VRAM-fail)
+            shadow_half_extent: 20.0,  // BASE (cascade 0) half-extent → 20/40/80 m cascades
             shadow_depth:       200.0,
             shadow_depth_bias:  0.001,
-            shadow_normal_bias: 0.05,  // ~1.5 texels of a 120 m box (was 0.4 = ~14)
+            shadow_normal_bias: 0.03,  // base; scaled ×2^cascade in the shader
             cursor_ndc:    (0.0, 0.0),
             height_field:  None,
             terrain_height_scale: 0.0,
@@ -361,6 +369,8 @@ impl App {
             wind_enabled:      false,
             atmo_enabled:      true,
             atmo_params:       AtmoParams::default(),
+            aerial_enabled:    true,
+            aerial_params:     AerialParams::default(),
             clouds_enabled:    true,
             cloud_params:      CloudParams::default(),
             cloud_time:        0.0,
@@ -711,6 +721,11 @@ impl ApplicationHandler for App {
                     Ok(a)  => self.atmosphere = Some(a),
                     Err(e) => log::error!("Atmosphere::new failed: {e}"),
                 }
+                // Atmospheric scattering (depth-aware aerial perspective + sky dome).
+                match Aerial::new(&mut rhi, color_format, PLANET_RADIUS) {
+                    Ok(a)  => self.aerial = Some(a),
+                    Err(e) => log::error!("Aerial::new failed: {e}"),
+                }
                 // Volumetric clouds (fullscreen raymarch in the water split).
                 match Clouds::new(&mut rhi, color_format, PLANET_RADIUS) {
                     Ok(c)  => self.clouds = Some(c),
@@ -859,6 +874,9 @@ impl ApplicationHandler for App {
                     // Free caller-owned GPU resources before RHI teardown.
                     if let Some(wave) = &self.wave {
                         wave.destroy(rhi);
+                    }
+                    if let Some(aerial) = &self.aerial {
+                        aerial.destroy(rhi);
                     }
                     if let Some(clouds) = &self.clouds {
                         clouds.destroy(rhi);
@@ -1167,9 +1185,12 @@ impl App {
                                         nodes.len(),
                                         clusters,
                                     );
-                                    // Sun shadow map: allocate + point the Nanite draw
-                                    // set at it (bindings 8/9) before the first frame.
-                                    match rhi.create_shadow_map(self.shadow_size) {
+                                    // Sun shadow map: allocate N cascades + point the
+                                    // Nanite draw set at them before the first frame.
+                                    match rhi.create_shadow_map(
+                                        self.shadow_size,
+                                        enki_nanite::render::SHADOW_CASCADES,
+                                    ) {
                                         Ok(()) => r.bind_shadow_map(rhi),
                                         Err(e) => log::error!("create_shadow_map failed: {e}"),
                                     }
@@ -1232,6 +1253,8 @@ impl App {
             let wind_enabled      = self.wind_enabled;
             let atmo_enabled      = self.atmo_enabled;
             let atmo_params       = self.atmo_params;
+            let aerial_enabled    = self.aerial_enabled;
+            let aerial_params     = self.aerial_params;
             let clouds_enabled    = self.clouds_enabled;
             let cloud_params      = self.cloud_params;
             let markers_poles     = self.markers_poles;
@@ -1261,6 +1284,7 @@ impl App {
                 self.sky.time_scale, self.sky.paused,
                 wind_enabled, wind_params,
                 atmo_enabled, atmo_params,
+                aerial_enabled, aerial_params,
                 clouds_enabled, cloud_params,
                 markers_poles, markers_equator, rivers_enabled,
                 planet_stats.as_ref(), load_stats.as_ref(),
@@ -1304,6 +1328,8 @@ impl App {
             }
             self.atmo_enabled      = out.atmo_enabled;
             self.atmo_params       = out.atmo;
+            self.aerial_enabled    = out.aerial_enabled;
+            self.aerial_params     = out.aerial;
             self.clouds_enabled    = out.clouds_enabled;
             self.cloud_params      = out.clouds;
             self.markers_poles     = out.markers_poles;
@@ -1400,32 +1426,29 @@ impl App {
                 };
                 let camera_world_pos = camera.position;
 
-                // Sun shadow map: the light's reversed-Z ortho, built in the SAME
-                // camera-relative world space the Nanite draw + casters use (so
-                // caster and receiver agree). `[depth_bias, normal_bias, strength,
-                // enabled]`. Hoisted here so the cull/update AND the caster pass below
-                // share it.
+                // Sun shadow map: 3 cascade light matrices, built in the SAME
+                // camera-relative world space the Nanite draw + casters use (so caster
+                // and receiver agree). Centred on the player's feet in Surface mode so
+                // the small near cascade reaches the wedge ahead; camera otherwise.
+                // `shadow_params = [depth_bias, normal_bias, strength, enabled]`.
+                // Hoisted here so cull/update AND the caster pass below share them.
                 #[cfg(feature = "nanite")]
-                let (sun_lvp, shadow_params) = if self.shadow_map_enabled && rhi.has_shadow_map() {
-                    // Centre the (small, sharp) cascade on the player's feet in Surface
-                    // mode so its forward reach covers the wedge ahead; camera otherwise.
-                    let focus = if nav_mode == NavMode::Surface {
-                        self.surface
-                            .as_ref()
-                            .map(|tpc| tpc.feet_position())
-                            .unwrap_or(camera_world_pos)
-                    } else {
-                        camera_world_pos
-                    };
+                let shadow_focus = if nav_mode == NavMode::Surface {
+                    self.surface.as_ref().map(|tpc| tpc.feet_position()).unwrap_or(camera_world_pos)
+                } else {
+                    camera_world_pos
+                };
+                #[cfg(feature = "nanite")]
+                let (cascade_mvps, shadow_params) = if self.shadow_map_enabled && rhi.has_shadow_map() {
                     (
-                        sun_light_view_proj(
-                            self.sun_dir_body, camera_world_pos, focus,
+                        sun_cascade_matrices(
+                            self.sun_dir_body, camera_world_pos, shadow_focus,
                             self.shadow_half_extent, self.shadow_depth, self.shadow_size,
                         ),
                         [self.shadow_depth_bias, self.shadow_normal_bias, 1.0, 1.0],
                     )
                 } else {
-                    (glam::Mat4::IDENTITY, [0.0; 4])
+                    ([glam::Mat4::IDENTITY; 3], [0.0; 4])
                 };
 
                 // Mutual exclusivity: Nanite is an LOD system that REPLACES the
@@ -1498,7 +1521,7 @@ impl App {
                         let _ = n.update(
                             rhi, fi, camera_world_pos, &fu, screen_h_px,
                             camera.fov_y_radians, self.nanite_tau, terrain_view,
-                            self.taa_enabled, self.frame_counter as u32, sun_lvp, shadow_params,
+                            self.taa_enabled, self.frame_counter as u32, cascade_mvps, shadow_params,
                         );
                         let _ = n.record_cull(rhi, fi);
                     }
@@ -1601,51 +1624,55 @@ impl App {
                     }
                 }
 
-                // Sun shadow caster pass (depth-only, before the main instance):
-                // render the casters into the shadow map from the light — terrain
-                // (Nanite cut), the character, and nearby trees. The terrain then
-                // samples this map (PCF) in fs_color, so all three cast onto it.
+                // Sun shadow caster pass (depth-only, before the main instance): one
+                // pass PER CASCADE — render the casters (terrain Nanite cut, character,
+                // nearby trees) into each cascade map from the light. The terrain then
+                // PCF-samples the tightest covering cascade in fs_color.
                 #[cfg(feature = "nanite")]
                 if nanite_active && self.shadow_map_enabled && rhi.has_shadow_map() {
-                    rhi.begin_shadow_pass(fi);
-                    if let Some(n) = self.nanite.as_ref() {
-                        let _ = n.record_shadow_draw(rhi, fi);
-                    }
-                    // Character caster (real mesh silhouette).
-                    if draw_character {
-                        if let (Some(ch), Some(tpc)) =
-                            (self.character.as_ref(), self.surface.as_ref())
-                        {
-                            let _ = ch.record_shadow(
-                                rhi, fi, &camera, tpc.feet_position(), tpc.facing(), sun_lvp,
-                            );
+                    for c in 0..rhi.shadow_cascade_count() {
+                        let lvp = cascade_mvps[c as usize];
+                        // Cascade c covers ±(base·2^c) around the focus; cast within that
+                        // + a margin for shadows reaching inward from just outside.
+                        let cast_radius =
+                            (self.shadow_half_extent * (1u32 << c) as f32 * 1.5) as f64;
+                        rhi.begin_shadow_pass(fi, c);
+                        if let Some(n) = self.nanite.as_ref() {
+                            let _ = n.record_shadow_draw(rhi, fi, c);
                         }
-                    }
-                    // Tree casters: only instances within the cascade (camera-relative
-                    // |xz| < ~HALF_EXTENT) cast — far trees fall outside the map, and
-                    // casting all ~7k would double the flora draw cost. ponytail:
-                    // distance gate, not a real light-frustum cull.
-                    #[cfg(feature = "flora")]
-                    if draw_trees {
-                        if let (Some(rend), Some(tree)) =
-                            (self.flora_renderer.as_ref(), self.flora_tree.as_ref())
-                        {
-                            const CAST_RADIUS_M: f64 = 200.0;
-                            let wind = [self.flora_clock, 0.6, 1.0, 0.0];
-                            for inst in &self.flora_instances {
-                                if (inst.origin - camera_world_pos).length() > CAST_RADIUS_M {
-                                    continue;
-                                }
-                                let model = flora_scatter::instance_model(
-                                    inst.origin, inst.yaw, inst.scale, camera_world_pos,
-                                );
-                                let _ = tree.record_shadow_model(
-                                    rhi, rend, fi, model, sun_lvp, wind, LeafLod::FULL,
+                        // Character caster (real mesh silhouette) — always near the focus.
+                        if draw_character {
+                            if let (Some(ch), Some(tpc)) =
+                                (self.character.as_ref(), self.surface.as_ref())
+                            {
+                                let _ = ch.record_shadow(
+                                    rhi, fi, &camera, tpc.feet_position(), tpc.facing(), lvp,
                                 );
                             }
                         }
+                        // Tree casters within this cascade's radius (smaller cascade →
+                        // fewer trees). ponytail: distance gate, not a sun-frustum cull.
+                        #[cfg(feature = "flora")]
+                        if draw_trees {
+                            if let (Some(rend), Some(tree)) =
+                                (self.flora_renderer.as_ref(), self.flora_tree.as_ref())
+                            {
+                                let wind = [self.flora_clock, 0.6, 1.0, 0.0];
+                                for inst in &self.flora_instances {
+                                    if (inst.origin - shadow_focus).length() > cast_radius {
+                                        continue;
+                                    }
+                                    let model = flora_scatter::instance_model(
+                                        inst.origin, inst.yaw, inst.scale, camera_world_pos,
+                                    );
+                                    let _ = tree.record_shadow_model(
+                                        rhi, rend, fi, model, lvp, wind, LeafLod::FULL,
+                                    );
+                                }
+                            }
+                        }
+                        rhi.end_shadow_pass(fi, c);
                     }
-                    rhi.end_shadow_pass(fi);
                 }
 
                 // 3D opaque pass.
@@ -1761,6 +1788,7 @@ impl App {
                 // if EITHER the ocean or the clouds want it; both need TAA on (the split
                 // returns false otherwise). Clouds are independent of the ocean toggle.
                 let want_split = (self.ocean_enabled && self.wave.is_some())
+                    || (self.aerial_enabled && self.aerial.is_some())
                     || (self.clouds_enabled && self.clouds.is_some());
                 if want_split || self.ocean_enabled {
                     let sea = self.sea_level_m;
@@ -1784,6 +1812,20 @@ impl App {
                                 scene_view, scene_depth, (ext.width, ext.height), draw_waves,
                             ) {
                                 log::error!("WaveSurface::record error: {e}");
+                            }
+                        }
+                        // ...then atmospheric scattering over the opaque scene + ocean
+                        // (reads the opaque pre-ocean depth → distance-graded aerial
+                        // perspective on terrain/sea + a sky dome on the cleared pixels).
+                        // Before clouds so it doesn't tint the cloud tops.
+                        if self.aerial_enabled {
+                            if let Some(a) = self.aerial.as_mut() {
+                                if let Err(e) = a.record(
+                                    rhi, fi, &fu, &camera, scene_depth,
+                                    (ext.width, ext.height), self.aerial_params, false,
+                                ) {
+                                    log::error!("Aerial::record error: {e}");
+                                }
                             }
                         }
                         // ...then clouds on top: a shell above sea level, so they
@@ -1958,6 +2000,24 @@ fn sun_light_view_proj(
 
     let proj = reversed_z_orthographic(-half_extent, half_extent, -half_extent, half_extent, 1.0, depth);
     proj * snap * view
+}
+
+/// Build the 3 cascade light matrices — concentric player-centred boxes with
+/// geometrically-growing half-extents (`base`, `base*2`, `base*4`): cascade 0 sharp
+/// + near, cascade 2 coarse + far. The `3` MUST match `enki_nanite::render::SHADOW_CASCADES`.
+#[cfg_attr(not(feature = "nanite"), allow(dead_code))]
+fn sun_cascade_matrices(
+    sun_dir: glam::Vec3,
+    cam_world: glam::DVec3,
+    focus_world: glam::DVec3,
+    base_half_extent: f32,
+    depth: f32,
+    shadow_size: u32,
+) -> [glam::Mat4; 3] {
+    std::array::from_fn(|c| {
+        let half = base_half_extent * (1u32 << c) as f32;
+        sun_light_view_proj(sun_dir, cam_world, focus_world, half, depth, shadow_size)
+    })
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────

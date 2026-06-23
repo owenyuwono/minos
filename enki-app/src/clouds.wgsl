@@ -57,10 +57,6 @@ struct CloudParams {
 // worker (clouds_advect.rs). Clouds translate + merge by THIS field moving, not by
 // warping noise. 1 f32 per cell, bilinearly sampled (matches the worker's bilinear).
 @group(0) @binding(4) var<storage, read> coverage_grid: array<f32>;
-// Per-location wind VELOCITY (world tangent × speed), 3 f32/cell — the SAME local
-// wind the streaks follow. The cloud texture advects along this so it curves with
-// the flow (not a global vector). Shear bounded by the reset-blend in density_at.
-@group(0) @binding(5) var<storage, read> wind_grid: array<f32>;
 
 // ── Hashes (Dave Hoskins) ───────────────────────────────────────────────────
 fn hash13(p3in: vec3<f32>) -> f32 {
@@ -184,31 +180,6 @@ fn sample_coverage(d: vec3<f32>) -> f32 {
     return mix(mix(c00, c10, g.tx), mix(c01, c11, g.tx), g.ty);
 }
 
-// Bilinear local wind VELOCITY (world tangent × speed) at a direction.
-fn sample_wind(d: vec3<f32>) -> vec3<f32> {
-    if (cloud.grid.w < 0.5) { return vec3<f32>(0.0); } // grid not baked yet
-    let g = grid_lerp(d);
-    let b00 = (g.iy0 * g.gw + g.ix0) * 3;
-    let b10 = (g.iy0 * g.gw + g.ix1) * 3;
-    let b01 = (g.iy1 * g.gw + g.ix0) * 3;
-    let b11 = (g.iy1 * g.gw + g.ix1) * 3;
-    let w00 = vec3<f32>(wind_grid[b00], wind_grid[b00 + 1], wind_grid[b00 + 2]);
-    let w10 = vec3<f32>(wind_grid[b10], wind_grid[b10 + 1], wind_grid[b10 + 2]);
-    let w01 = vec3<f32>(wind_grid[b01], wind_grid[b01 + 1], wind_grid[b01 + 2]);
-    let w11 = vec3<f32>(wind_grid[b11], wind_grid[b11 + 1], wind_grid[b11 + 2]);
-    return mix(mix(w00, w10, g.tx), mix(w01, w11, g.tx), g.ty);
-}
-
-// Effective coverage at a direction: base scale × the advected climate coverage.
-// `moisture_influence` blends uniform (0) ↔ full advected climate coverage (1).
-fn coverage_at(dir: vec3<f32>) -> f32 {
-    var cov = cloud.shell.z;
-    if (cloud.grid.z > 0.5) {
-        cov = cloud.shell.z * mix(1.0, sample_coverage(dir), cloud.extra.w);
-    }
-    return cov;
-}
-
 // Vertical density window, blended stratus(low,thin) ↔ cumulus(tall,billowy).
 fn height_gradient(h: f32, cloud_type: f32) -> f32 {
     let strat = clamp(h / 0.08, 0.0, 1.0) * clamp((0.45 - h) / 0.35, 0.0, 1.0);
@@ -216,35 +187,29 @@ fn height_gradient(h: f32, cloud_type: f32) -> f32 {
     return mix(strat, cumu, cloud_type);
 }
 
-// Cloud density at a planet-centric position. `warp` (metres) advects the SHAPE noise
-// — pass the per-location wind drift so the texture flows along the wind like the
-// streaks. `cheap` skips Worley erosion + curl (empty-space scout + sun light-march).
-fn density_at(pos: vec3<f32>, hfrac: f32, cheap: bool, warp: vec3<f32>) -> f32 {
+// Cloud density at a planet-centric position. The SHAPE comes from the ADVECTED
+// coverage field (`sample_coverage`) — the worker flows + evolves it, so all motion is
+// pure advection: continuous, never resets, never shears (no domain-warp). `cheap`
+// skips the fine static detail (empty-space scout + sun light-march).
+fn density_at(pos: vec3<f32>, hfrac: f32, cheap: bool) -> f32 {
     let dir = normalize(pos);
-    let cov = coverage_at(dir);
-    if (cov <= 0.001) { return 0.0; }
-
-    let inv = 1.0 / cloud.march.z; // 1 / noise_scale (m)
-    let base_p = (pos + warp) * inv;
-    var shape = fbm(base_p);
-    shape *= height_gradient(hfrac, cloud.extra.x);
-
-    // Coverage gate, then re-multiply by coverage (the bit ki omits → rounded edges).
-    var d = clamp(remap(shape, 1.0 - cov, 1.0, 0.0, 1.0), 0.0, 1.0) * cov;
+    // Sharpen the advected field into defined clouds; scale by the coverage slider.
+    // The advected field's mean sits ~0.3, so the gate is low + tight: most of a moist
+    // clump reads as cloud, dry gaps stay clear.
+    let field = sample_coverage(dir);
+    let cov = clamp(smoothstep(0.04, 0.26, field) * cloud.shell.z * 2.2, 0.0, 1.0);
+    if (cov <= 0.01) { return 0.0; }
+    var d = cov * height_gradient(hfrac, cloud.extra.x);
     if (d <= 0.0 || cheap) { return d; }
-
-    // Detail erosion (edge-only): drifting Worley + pseudo-curl turbulence.
-    var det = (pos + warp) * (inv * 4.0);
-    if (cloud.extra.z > 0.0) {
-        det += noise3(det * 0.5) * cloud.extra.z;
-    }
-    let er = worley(det);
-    d = clamp(remap(d, er * 0.3, 1.0, 0.0, 1.0), 0.0, 1.0);
-    return d;
+    // Fine sub-grid static detail (crispness on top of the bilinear-smooth field).
+    let inv = 1.0 / cloud.march.z;
+    let er = worley(pos * (inv * 6.0));
+    d = d * (0.6 + 0.4 * er);
+    return clamp(d, 0.0, 1.0);
 }
 
-// Optical depth toward the sun (short, cheap light-march; warped consistently).
-fn light_optical_depth(pos: vec3<f32>, sun_dir: vec3<f32>, ri: f32, ro: f32, warp: vec3<f32>) -> f32 {
+// Optical depth toward the sun (short, cheap light-march).
+fn light_optical_depth(pos: vec3<f32>, sun_dir: vec3<f32>, ri: f32, ro: f32) -> f32 {
     let ls = (ro - ri) * 0.12;
     var lp = pos;
     var acc = 0.0;
@@ -253,7 +218,7 @@ fn light_optical_depth(pos: vec3<f32>, sun_dir: vec3<f32>, ri: f32, ro: f32, war
         let r = length(lp);
         let hf = (r - ri) / (ro - ri);
         if (hf >= 0.0 && hf <= 1.0) {
-            acc += density_at(lp, hf, true, warp) * cloud.shell.w * ls;
+            acc += density_at(lp, hf, true) * cloud.shell.w * ls;
         }
     }
     return acc;
@@ -342,7 +307,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let powder_amt = cloud.extra.y;
     let steps = max(i32(cloud.march.x), 1);
     let seg = t_exit - t_enter;
-    let dt = seg / f32(steps);
+    // Cap the step size so grazing/limb rays (huge chord through the shell) don't
+    // jump too far per step → that under-sampling is the black/white speckle. We may
+    // not reach the far end of a grazing chord, but transmittance has saturated by then.
+    let dt = min(seg / f32(steps), (ro - ri) * 0.2);
 
     // STATIC ray-start dither (not animated): TAA doesn't denoise this depth-off
     // overlay, so a per-frame-animated dither would flicker. A fixed spatial pattern
@@ -352,9 +320,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let jitter = ign(px, 0.0);
 
     let sun_col = frame.sun0_color.xyz;
-    // Brighter, whiter fill so clouds read as light cloud, not dark grey: stronger
-    // sky ambient + a neutral white floor that keeps shadowed/interior cloud pale.
-    let amb = frame.hemi_sky.xyz * 1.1 + frame.hemi_ground.xyz * 0.3 + vec3<f32>(0.25);
+    // WHITE clouds: neutral ambient (not sky-blue tinted), scaled by sky brightness so
+    // it still dims at night. The sky's colour only nudges it slightly.
+    let sky_lum = max(frame.hemi_sky.x, max(frame.hemi_sky.y, frame.hemi_sky.z));
+    let amb = vec3<f32>(0.45 + 0.55 * sky_lum) + frame.hemi_sky.xyz * 0.08;
 
     var transmit = 1.0;
     var scattered = vec3<f32>(0.0);
@@ -365,36 +334,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let r = length(pos);
         let hfrac = (r - ri) / (ro - ri);
         if (hfrac >= 0.0 && hfrac <= 1.0) {
-            // Per-location wind advection (texture flows along the local wind like the
-            // streaks), 2-phase reset-blend. The reset period scales INVERSELY with wind
-            // speed so the warp DISTANCE is capped (≤0.6 feature) regardless of speed —
-            // high wind just resets faster, it never stretches/tears.
-            let sdir = normalize(pos);
-            let wv = sample_wind(sdir) * cloud.wind.w;        // local velocity (m/s)
-            let wlen = max(length(wv), 1e-3);
-            let tau = clamp(cloud.march.z * 0.8 / wlen, 2.0, 30.0);
-            let tt = cloud.march.w / tau;
-            let cyc0 = floor(tt);
-            let cyc1 = floor(tt + 0.5);
-            let ph0 = tt - cyc0;
-            let ph1 = (tt + 0.5) - cyc1;
-            // Per-cycle random offset (metres) so each reset shows DIFFERENT noise —
-            // the cross-fade reads as clouds EVOLVING, not the same pattern looping.
-            // Changes only while the resetting phase has zero blend weight → seamless.
-            let dec = cloud.march.z * 120.0;
-            let off0 = (hash33(vec3<f32>(cyc0, 7.0, 3.0)) - vec3<f32>(0.5)) * dec;
-            let off1 = (hash33(vec3<f32>(cyc1, 1.0, 9.0)) - vec3<f32>(0.5)) * dec;
-            let warp0 = -wv * (ph0 * tau) + off0;             // −: move WITH the wind
-            let warp1 = -wv * (ph1 * tau) + off1;
-            let bl = abs(ph0 - 0.5) * 2.0;
-            // Empty-space scout: cheap density first; only do erosion + the sun
-            // light-march where there's actually cloud.
-            let cheap = density_at(pos, hfrac, true, warp0);
+            // Empty-space scout: cheap density (advected field) first; only do the fine
+            // detail + sun light-march where there's actually cloud. Motion is entirely
+            // in the field (advected by the worker) → continuous, no reset, no shear.
+            let cheap = density_at(pos, hfrac, true);
             if (cheap > 0.01) {
-                let dens = mix(density_at(pos, hfrac, false, warp0), density_at(pos, hfrac, false, warp1), bl);
+                let dens = density_at(pos, hfrac, false);
                 if (dens > 0.0) {
                     let sigma_t = dens * cloud.shell.w;
-                    let tau = light_optical_depth(pos, sun_dir, ri, ro, warp0);
+                    let tau = light_optical_depth(pos, sun_dir, ri, ro);
                     // Hillaire multiscatter octaves (a=b=c=0.5): soft interior glow.
                     var msum = 0.0;
                     var oa = 1.0; var ob = 1.0; var oc2 = 1.0;

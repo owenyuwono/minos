@@ -78,12 +78,17 @@ struct GpuFrameData {
     /// True camera world position (xyz); shader reconstructs radial up =
     /// normalize(world_rel + cam_world) for the terrain self-shadow horizon query.
     cam_world: [f32; 4],
-    /// Sun shadow map: world(camera-relative) → light clip. Used by `vs_depth`
-    /// (caster) and `sample_shadow` (receiver).
-    light_view_proj: [[f32; 4]; 4],
+    /// Per-cascade sun shadow maps: world(camera-relative) → light clip. The caster
+    /// (`vs_depth`) picks one via the push-constant cascade index; the receiver
+    /// (`sample_shadow`) selects by distance.
+    light_view_proj_cascades: [[[f32; 4]; 4]; SHADOW_CASCADES as usize],
     /// `[depth_bias, normal_bias, strength, enabled]` for the shadow-map sample.
     shadow_params: [f32; 4],
 }
+
+/// Number of sun shadow cascades (near→far). Fixed so the WGSL array + the
+/// 3-texture binding ladder stay in lockstep; MUST match `nanite_draw.wgsl` `N`.
+pub const SHADOW_CASCADES: u32 = 3;
 
 /// Gribb–Hartmann frustum planes from a view-projection matrix, normalized.
 /// Plane test: a point `p` is inside iff `dot(plane.xyz, p) + plane.w >= 0`.
@@ -226,11 +231,13 @@ impl NaniteRenderer {
                 stages,
             })
             .collect();
-        // 8 = sun shadow map (depth texture), 9 = comparison sampler — FRAGMENT
-        // only (the receiver samples them in `fs_color`; cull/caster ignore them).
+        // 8..8+N = per-cascade sun shadow maps (depth textures), then the comparison
+        // sampler — FRAGMENT only (the receiver samples them in `fs_color`).
         let frag = vk::ShaderStageFlags::FRAGMENT;
-        bindings.push(BindingDesc { binding: 8, ty: vk::DescriptorType::SAMPLED_IMAGE, stages: frag });
-        bindings.push(BindingDesc { binding: 9, ty: vk::DescriptorType::SAMPLER, stages: frag });
+        for c in 0..SHADOW_CASCADES {
+            bindings.push(BindingDesc { binding: 8 + c, ty: vk::DescriptorType::SAMPLED_IMAGE, stages: frag });
+        }
+        bindings.push(BindingDesc { binding: 8 + SHADOW_CASCADES, ty: vk::DescriptorType::SAMPLER, stages: frag });
         let set_layout = rhi.create_descriptor_set_layout(&bindings)?;
 
         // Cull (compute) pipeline.
@@ -266,7 +273,7 @@ impl NaniteRenderer {
             shader: shadow_mod,
             vs_entry: "vs_depth",
             fs_entry: "fs_color", // ignored (depth-only)
-            push_constant_size: 0,
+            push_constant_size: 4, // u32 cascade index (selects light_view_proj_cascades[c])
             set0_layout: set_layout,
             color_format, // ignored (no color attachment)
             depth_format: vk::Format::D32_SFLOAT,
@@ -506,10 +513,10 @@ impl NaniteRenderer {
         // `frame_index`: varies the dither pattern each frame for TAA to average.
         dither: bool,
         frame_index: u32,
-        // Sun shadow map: world(camera-relative) → light clip, and
-        // `[depth_bias, normal_bias, strength, enabled]`. Built camera-relative in
-        // the same space as `node_xlat` so the caster + receiver agree.
-        light_view_proj: Mat4,
+        // Per-cascade sun shadow matrices (world camera-relative → light clip), built
+        // in the same space as `node_xlat` so caster + receiver agree, and
+        // `[depth_bias, normal_bias, strength, enabled]`.
+        cascades: [Mat4; SHADOW_CASCADES as usize],
         shadow_params: [f32; 4],
     ) -> Result<(), RhiError> {
         self.debug_mode = debug_mode;
@@ -563,7 +570,7 @@ impl NaniteRenderer {
             // debug: [debug_mode, dither_enabled, frame_index, _]
             debug: [debug_mode, dither as u32, frame_index, 0],
             cam_world: [camera_world.x as f32, camera_world.y as f32, camera_world.z as f32, 0.0],
-            light_view_proj: light_view_proj.to_cols_array_2d(),
+            light_view_proj_cascades: cascades.map(|m| m.to_cols_array_2d()),
             shadow_params,
         };
         rhi.write_storage_bytes(frame_buf, bytemuck::bytes_of(&data))?;
@@ -621,33 +628,42 @@ impl NaniteRenderer {
         Ok(())
     }
 
-    /// Point each frame's descriptor set at the RHI's per-frame shadow map (binding
-    /// 8) + comparison sampler (binding 9). Call once after [`Rhi::create_shadow_map`]
-    /// and before the first frame (bindings 8/9 must be valid when the draw binds).
+    /// Point each frame's descriptor set at the RHI's per-cascade shadow maps
+    /// (bindings 8..8+N) + the comparison sampler (binding 8+N). Call once after
+    /// [`Rhi::create_shadow_map`] and before the first frame.
     pub fn bind_shadow_map(&self, rhi: &Rhi) {
         let sampler = rhi.shadow_map_sampler();
         for (fi, f) in self.frames.iter().enumerate() {
-            rhi.write_sampled_image_binding(
-                f.set,
-                8,
-                rhi.shadow_map_view(fi as u32),
-                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            );
-            rhi.write_sampler_binding(f.set, 9, sampler);
+            for c in 0..SHADOW_CASCADES {
+                rhi.write_sampled_image_binding(
+                    f.set,
+                    8 + c,
+                    rhi.shadow_map_view(fi as u32, c),
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                );
+            }
+            rhi.write_sampler_binding(f.set, 8 + SHADOW_CASCADES, sampler);
         }
     }
 
-    /// Record the depth-only caster draw into the (already-open) sun shadow pass.
-    /// MUST be called between [`Rhi::begin_shadow_pass`] and [`Rhi::end_shadow_pass`]
-    /// (both BEFORE `begin_rendering`). Reuses the cull's indirect args + visible
-    /// list, so casters = the camera-visible cut. ponytail: camera-visible only →
-    /// off-screen casters miss (same reach limit as the screen-space shadow it
-    /// replaces); add a sun-frustum cull pass for true off-screen casters.
-    pub fn record_shadow_draw(&self, rhi: &Rhi, fi: u32) -> Result<(), RhiError> {
+    /// Record the depth-only caster draw for `cascade` into the (already-open) sun
+    /// shadow pass. MUST be called between [`Rhi::begin_shadow_pass`] and
+    /// [`Rhi::end_shadow_pass`] for the same cascade (both BEFORE `begin_rendering`).
+    /// The cascade index is pushed so `vs_depth` picks `light_view_proj_cascades[c]`.
+    /// Reuses the cull's indirect args + visible list (camera-visible cut). ponytail:
+    /// camera-visible casters only → off-screen casters miss; a sun-frustum cull is
+    /// the upgrade.
+    pub fn record_shadow_draw(&self, rhi: &Rhi, fi: u32, cascade: u32) -> Result<(), RhiError> {
         let f = &self.frames[fi as usize];
         let layout = rhi.pipeline_layout(self.shadow_pipeline)?;
         rhi.cmd_bind_pipeline(fi, vk::PipelineBindPoint::GRAPHICS, self.shadow_pipeline)?;
         rhi.cmd_bind_descriptor_set(fi, vk::PipelineBindPoint::GRAPHICS, layout, 0, f.set);
+        rhi.cmd_push_constants(
+            fi,
+            layout,
+            vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            bytemuck::bytes_of(&cascade),
+        );
         rhi.cmd_draw_indirect(fi, f.args_buf, 0, 1, 16)?;
         Ok(())
     }

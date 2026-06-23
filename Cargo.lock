@@ -600,6 +600,7 @@ version = "0.1.0"
 dependencies = [
  "enki-render",
  "glam",
+ "image",
  "serde",
  "serde_json",
 ]

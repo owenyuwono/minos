@@ -207,6 +207,8 @@ pub struct Rhi {
     /// Owned by the RHI; created in [`Self::create_shadow_map`], freed in Drop.
     shadow_sampler: vk::Sampler,
     shadow_extent: vk::Extent2D,
+    /// Number of shadow cascades; `shadow_maps` is flat-indexed `fi*shadow_cascades + c`.
+    shadow_cascades: u32,
 }
 
 impl Rhi {
@@ -339,6 +341,7 @@ impl Rhi {
             shadow_map_layouts: Vec::new(),
             shadow_sampler: vk::Sampler::null(),
             shadow_extent: vk::Extent2D { width: 0, height: 0 },
+            shadow_cascades: 1,
         })
     }
 
@@ -716,44 +719,78 @@ impl Rhi {
         unsafe { self.device.handle.create_sampler(&info, None) }.map_err(RhiError::Vulkan)
     }
 
-    /// Allocate the sun shadow-map depth targets (`size`×`size`, one per
-    /// frame-in-flight) + the comparison sampler. Idempotent (replaces any
-    /// existing). Call once after the swapchain is sized.
-    pub fn create_shadow_map(&mut self, size: u32) -> Result<(), RhiError> {
-        let extent = vk::Extent2D { width: size, height: size };
+    /// Allocate the sun shadow-map depth targets (`size`×`size`, `cascades` per
+    /// frame-in-flight, flat-indexed `fi*cascades + c`) + the comparison sampler.
+    /// Idempotent (replaces any existing). Call once after the swapchain is sized.
+    pub fn create_shadow_map(&mut self, size: u32, cascades: u32) -> Result<(), RhiError> {
         let dev_h: *const ash::Device = &self.device.handle;
         let dev_a: *mut gpu_allocator::vulkan::Allocator = &mut *self.device.allocator;
         for old in std::mem::take(&mut self.shadow_maps) {
             old.destroy(unsafe { &*dev_h }, unsafe { &mut *dev_a });
         }
+        let cascades = cascades.max(1);
         let fif = self.frames_in_flight;
-        let mut maps = Vec::with_capacity(fif);
-        for _ in 0..fif {
-            maps.push(image::AllocatedImage::new_render_target(
-                unsafe { &*dev_h },
-                unsafe { &mut *dev_a },
-                extent,
-                vk::Format::D32_SFLOAT,
-                vk::SampleCountFlags::TYPE_1,
-                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-                vk::ImageAspectFlags::DEPTH,
-                "sun_shadow_map",
-            )?);
-        }
+        let count = fif * cascades as usize;
+        // A 8192² D32 map is ~256 MB *per frame-in-flight*; on a VRAM-tight GPU the
+        // allocation fails. Rather than silently disable shadows (the map just never
+        // appears), HALVE and retry down to 1024² so shadows always show, just coarser.
+        let mut sz = size.max(1024);
+        let (maps, last_err) = loop {
+            let extent = vk::Extent2D { width: sz, height: sz };
+            let mut maps = Vec::with_capacity(count);
+            let mut err = None;
+            for _ in 0..count {
+                match image::AllocatedImage::new_render_target(
+                    unsafe { &*dev_h },
+                    unsafe { &mut *dev_a },
+                    extent,
+                    vk::Format::D32_SFLOAT,
+                    vk::SampleCountFlags::TYPE_1,
+                    vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                    vk::ImageAspectFlags::DEPTH,
+                    "sun_shadow_map",
+                ) {
+                    Ok(img) => maps.push(img),
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                }
+            }
+            if err.is_none() {
+                break (Some(maps), None);
+            }
+            // Free the partial set, then halve (or give up at the floor).
+            for m in maps {
+                m.destroy(unsafe { &*dev_h }, unsafe { &mut *dev_a });
+            }
+            log::warn!("Sun shadow map {sz}² alloc failed; halving");
+            if sz <= 1024 {
+                break (None, err);
+            }
+            sz /= 2;
+        };
+        let Some(maps) = maps else {
+            return Err(last_err.unwrap_or(RhiError::Other("shadow map alloc".to_string().into())));
+        };
         self.shadow_maps = maps;
-        self.shadow_map_layouts = vec![vk::ImageLayout::UNDEFINED; fif];
-        self.shadow_extent = extent;
+        self.shadow_map_layouts = vec![vk::ImageLayout::UNDEFINED; count];
+        self.shadow_cascades = cascades;
+        self.shadow_extent = vk::Extent2D { width: sz, height: sz };
         if self.shadow_sampler == vk::Sampler::null() {
             self.shadow_sampler = self.create_comparison_sampler()?;
         }
-        log::info!("Sun shadow map: {fif}× {size}² D32 + comparison sampler");
+        if sz != size {
+            log::warn!("Sun shadow map: requested {size}² → fell back to {sz}² (VRAM)");
+        }
+        log::info!("Sun shadow map: {cascades} cascade(s) × {} FiF × {sz}² D32", self.frames_in_flight);
         Ok(())
     }
 
-    /// Image view of frame `fi`'s shadow map (for the receiver's descriptor set).
-    pub fn shadow_map_view(&self, fi: u32) -> vk::ImageView {
+    /// Image view of frame `fi`'s cascade `c` shadow map (for the receiver's set).
+    pub fn shadow_map_view(&self, fi: u32, cascade: u32) -> vk::ImageView {
         self.shadow_maps
-            .get(fi as usize)
+            .get((fi * self.shadow_cascades + cascade) as usize)
             .map(|m| m.view)
             .unwrap_or(vk::ImageView::null())
     }
@@ -761,6 +798,11 @@ impl Rhi {
     /// The shadow-map comparison sampler.
     pub fn shadow_map_sampler(&self) -> vk::Sampler {
         self.shadow_sampler
+    }
+
+    /// Number of shadow cascades (1 until [`Self::create_shadow_map`] sets it).
+    pub fn shadow_cascade_count(&self) -> u32 {
+        self.shadow_cascades
     }
 
     /// `true` once [`Self::create_shadow_map`] has run.
@@ -772,18 +814,19 @@ impl Rhi {
     /// map to a depth attachment, clear it, set the viewport to the map extent.
     /// Record the caster draw(s), then call [`Self::end_shadow_pass`]. MUST be
     /// called BEFORE `begin_rendering` (it opens its own rendering instance).
-    pub fn begin_shadow_pass(&mut self, fi: u32) {
+    pub fn begin_shadow_pass(&mut self, fi: u32, cascade: u32) {
         if fi == u32::MAX || self.shadow_maps.is_empty() {
             return;
         }
         let fi_idx = fi as usize;
+        let idx = (fi * self.shadow_cascades + cascade) as usize;
         let cmd = self.commands.frames[fi_idx].buffer;
         let (image, view) = {
-            let m = &self.shadow_maps[fi_idx];
+            let m = &self.shadow_maps[idx];
             (m.image, m.view)
         };
         let extent = self.shadow_extent;
-        let old = self.shadow_map_layouts[fi_idx];
+        let old = self.shadow_map_layouts[idx];
         let depth = depth_subresource_range();
         let barrier = img_barrier(
             image,
@@ -827,18 +870,19 @@ impl Rhi {
             self.device.handle.cmd_set_viewport(cmd, 0, std::slice::from_ref(&vp));
             self.device.handle.cmd_set_scissor(cmd, 0, std::slice::from_ref(&sc));
         }
-        self.shadow_map_layouts[fi_idx] = vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL;
+        self.shadow_map_layouts[idx] = vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL;
     }
 
     /// Close the sun-shadow caster pass and transition the map to
     /// `SHADER_READ_ONLY` for sampling in the main pass.
-    pub fn end_shadow_pass(&mut self, fi: u32) {
+    pub fn end_shadow_pass(&mut self, fi: u32, cascade: u32) {
         if fi == u32::MAX || self.shadow_maps.is_empty() {
             return;
         }
         let fi_idx = fi as usize;
+        let idx = (fi * self.shadow_cascades + cascade) as usize;
         let cmd = self.commands.frames[fi_idx].buffer;
-        let image = self.shadow_maps[fi_idx].image;
+        let image = self.shadow_maps[idx].image;
         let depth = depth_subresource_range();
         let barrier = img_barrier(
             image,
@@ -857,7 +901,7 @@ impl Rhi {
                 &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier)),
             );
         }
-        self.shadow_map_layouts[fi_idx] = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        self.shadow_map_layouts[idx] = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
     }
 
     // ── TAA (temporal anti-aliasing) ─────────────────────────────────────────

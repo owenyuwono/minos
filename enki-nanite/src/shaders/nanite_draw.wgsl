@@ -32,9 +32,11 @@ struct FrameData {
     planes: array<vec4<f32>, 6>,
     debug: vec4<u32>,
     cam_world: vec4<f32>, // true camera world pos (xyz) — for radial-up reconstruction
-    light_view_proj: mat4x4<f32>, // sun shadow map: world(camera-relative) → light clip
+    light_view_proj_cascades: array<mat4x4<f32>, 3>, // per-cascade world(cam-rel) → light clip
     shadow_params: vec4<f32>,     // [depth_bias, normal_bias, strength, enabled]
 };
+
+const SHADOW_CASCADES: u32 = 3u; // MUST match render.rs SHADOW_CASCADES
 
 struct Push {
     mode: u32,
@@ -46,9 +48,11 @@ struct Push {
 @group(0) @binding(3) var<storage, read> visible:   array<u32>;
 @group(0) @binding(5) var<storage, read> frame:     FrameData;
 @group(0) @binding(6) var<storage, read> node_xlat: array<vec4<f32>>;
-// Sun shadow map (depth) + comparison sampler — receiver side (fs_color).
-@group(0) @binding(8) var shadow_map:  texture_depth_2d;
-@group(0) @binding(9) var shadow_samp: sampler_comparison;
+// Per-cascade sun shadow maps (depth) + shared comparison sampler — receiver side.
+@group(0) @binding(8)  var shadow_map0: texture_depth_2d;
+@group(0) @binding(9)  var shadow_map1: texture_depth_2d;
+@group(0) @binding(10) var shadow_map2: texture_depth_2d;
+@group(0) @binding(11) var shadow_samp: sampler_comparison;
 
 var<immediate> pc: Push;
 
@@ -199,7 +203,8 @@ fn vs_depth(@builtin(vertex_index) vid: u32) -> DepthOut {
     let vidx = tris[gt * 3u + corner];
     let base = vidx * 20u;
     let world_rel = vec3<f32>(verts[base + 0u], verts[base + 1u], verts[base + 2u]) + t;
-    out.clip = frame.light_view_proj * vec4<f32>(world_rel, 1.0);
+    // pc.mode carries the cascade index for the shadow pipeline (per-draw push).
+    out.clip = frame.light_view_proj_cascades[pc.mode] * vec4<f32>(world_rel, 1.0);
     return out;
 }
 
@@ -343,31 +348,51 @@ fn terrain_shadow(world_rel: vec3<f32>, horizon: vec4<f32>, sun: vec3<f32>) -> f
     return 1.0 - clamp((h - sun_elev) * HORIZON_STRENGTH, 0.0, 1.0);
 }
 
-// Sun shadow map (PCF). 1 = lit, 0 = fully shadowed. Reversed-Z: the caster (closest
-// to the light) stored the GREATER depth, so a receiver behind it has a SMALLER
-// ndc.z → the GREATER_OR_EQUAL comparison fails → shadowed. `depth_bias` is ADDED to
-// the reference (pushes toward lit → kills self-shadow acne); `normal_bias` offsets
-// the sample point along the surface normal (helps grazing slopes). Outside the
-// light frustum → lit (the border sampler + the uv/z guard).
+// Pick the tightest cascade whose light-space uv contains `world_rel` (offset along
+// `n` by the cascade-scaled normal bias). Returns the cascade index (or
+// SHADOW_CASCADES = "outside all"), and writes uv + reversed-Z reference depth.
+fn select_cascade(world_rel: vec3<f32>, n: vec3<f32>, uv_out: ptr<function, vec2<f32>>, ref_out: ptr<function, f32>) -> u32 {
+    for (var i = 0u; i < SHADOW_CASCADES; i = i + 1u) {
+        let scale = f32(1u << i); // coarser cascade → bigger texels → more bias
+        let p = world_rel + n * (frame.shadow_params.y * scale);
+        let clip = frame.light_view_proj_cascades[i] * vec4<f32>(p, 1.0);
+        if (clip.w <= 0.0) { continue; }
+        let ndc = clip.xyz / clip.w;
+        let u = ndc.xy * 0.5 + vec2<f32>(0.5, 0.5);
+        let m = 0.02; // margin so the 3×3 PCF kernel never reads past the cascade edge
+        if (u.x > m && u.x < 1.0 - m && u.y > m && u.y < 1.0 - m && ndc.z > 0.0 && ndc.z < 1.0) {
+            *uv_out = u;
+            *ref_out = ndc.z + frame.shadow_params.x * scale;
+            return i;
+        }
+    }
+    return SHADOW_CASCADES;
+}
+
+// Cascaded sun shadow (PCF). 1 = lit, 0 = fully shadowed. Reversed-Z: the caster
+// (closest to light) stored the GREATER depth → a receiver behind it has a SMALLER
+// ndc.z → GREATER_OR_EQUAL fails → shadowed. Picks the tightest covering cascade
+// (sharp near, coarse far); outside all → lit. ponytail: hard cascade boundary — a
+// cross-cascade blend band is the seam-hiding upgrade.
 fn sample_shadow(world_rel: vec3<f32>, n: vec3<f32>) -> f32 {
     if (frame.shadow_params.w < 0.5) { return 1.0; } // disabled
-    let p = world_rel + n * frame.shadow_params.y;
-    let clip = frame.light_view_proj * vec4<f32>(p, 1.0);
-    if (clip.w <= 0.0) { return 1.0; }
-    let ndc = clip.xyz / clip.w;
-    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, ndc.y * 0.5 + 0.5);
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z <= 0.0 || ndc.z >= 1.0) {
-        return 1.0;
-    }
-    let ref_depth = ndc.z + frame.shadow_params.x;
-    // 3×3 PCF (each tap is itself 2×2 hardware PCF via the linear comparison
-    // sampler → ~6×6 effective), softening the texel stair-steps into a penumbra.
-    let texel = 1.0 / f32(textureDimensions(shadow_map).x);
+    var uv = vec2<f32>(0.0, 0.0);
+    var ref_depth = 0.0;
+    let c = select_cascade(world_rel, n, &uv, &ref_depth);
+    if (c >= SHADOW_CASCADES) { return 1.0; } // outside every cascade → lit
+    // 3×3 PCF (each tap is 2×2 hardware PCF → ~6×6 effective). Texture picked by a
+    // switch — WGSL can't dynamically index separate texture bindings. All cascades
+    // share the same pixel size, so shadow_map0's dimensions set the texel step.
+    let texel = 1.0 / f32(textureDimensions(shadow_map0).x);
     var sum = 0.0;
     for (var dy = -1; dy <= 1; dy = dy + 1) {
         for (var dx = -1; dx <= 1; dx = dx + 1) {
-            let o = vec2<f32>(f32(dx), f32(dy)) * texel;
-            sum = sum + textureSampleCompareLevel(shadow_map, shadow_samp, uv + o, ref_depth);
+            let o = uv + vec2<f32>(f32(dx), f32(dy)) * texel;
+            switch (c) {
+                case 0u: { sum = sum + textureSampleCompareLevel(shadow_map0, shadow_samp, o, ref_depth); }
+                case 1u: { sum = sum + textureSampleCompareLevel(shadow_map1, shadow_samp, o, ref_depth); }
+                default: { sum = sum + textureSampleCompareLevel(shadow_map2, shadow_samp, o, ref_depth); }
+            }
         }
     }
     return sum / 9.0;
@@ -390,26 +415,18 @@ fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
     if (pc.mode == 0u) {
         // Lit — matches terrain.wgsl mode 0 (ambient + hemisphere + 2 suns + ACES).
         let n = normalize(in.normal);
-        // Rivers + lakes: blend a deep-water albedo by the per-vertex wetness mask
-        // (acc∪lake, baked at tessellation). Water fills the valleys the heightfield
-        // already carves and the flattened lake basins. A sharpened sun term fakes a
-        // wet sheen (no view vector here). ponytail: flat-shaded water — true planar
-        // reflection is the tracked RiverNetwork ribbon-mesh follow-up.
-        let wet = clamp(in.wetness, 0.0, 1.0);
-        let water = vec3<f32>(0.045, 0.11, 0.17);
-        let albedo = mix(in.color, water, wet);
+        let albedo = in.color;
         let ambient_term = frame.ambient.xyz * albedo;
         let hemi = hemisphere_ambient(n, frame.hemi_sky.xyz, frame.hemi_ground.xyz) * albedo;
         let d0 = max(dot(n, frame.sun0_dir.xyz), 0.0) * frame.sun0_color.xyz * albedo;
         let d1 = max(dot(n, frame.sun1_dir.xyz), 0.0) * frame.sun1_color.xyz * albedo;
-        let sheen = wet * pow(max(dot(n, frame.sun0_dir.xyz), 0.0), 32.0) * frame.sun0_color.xyz;
         // Sun occlusion: terrain self-shadow × the character's cast shadow. Darken
-        // the primary-sun direct terms (diffuse + sheen), leaving ambient/hemisphere/
-        // fill so shadowed ground isn't black.
+        // the primary-sun direct term, leaving ambient/hemisphere/fill so shadowed
+        // ground isn't black.
         let sun_dir = normalize(frame.sun0_dir.xyz);
         var sh = terrain_shadow(in.world_rel, in.horizon, sun_dir);
         sh = sh * sample_shadow(in.world_rel, n); // sun shadow map (objects + terrain)
-        rgb = aces_filmic(ambient_term + hemi + (d0 + sheen) * sh + d1);
+        rgb = aces_filmic(ambient_term + hemi + d0 * sh + d1);
     } else if (pc.mode == 1u) {
         // Unlit — flat biome albedo (no lighting, no ACES).
         rgb = in.color;
@@ -434,18 +451,16 @@ fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
     } else if (pc.mode == 9u) {
         rgb = wetness_ramp(clamp(in.wetness, 0.0, 1.0));
     } else if (pc.mode == 14u) {
-        // DEBUG: |ndc.xy| of this point in the LIGHT's clip space.
-        //   * dark near the camera fading to bright at the cascade edge (a smooth
-        //     radial gradient) = the light matrix is VALID (cascade may be too small);
-        //   * UNIFORM BRIGHT everywhere (incl. the ground under the camera) = the
-        //     matrix is identity/broken (geometry projects to metres, not [-1,1]).
-        // GREEN tint where inside the [-1,1] frustun (would be shadow-mapped); plain
-        // grey where outside.
-        let clip = frame.light_view_proj * vec4<f32>(in.world_rel, 1.0);
-        let ndc = clip.xyz / clip.w;
-        let m = clamp(length(ndc.xy) / 3.0, 0.0, 1.0);
-        let inside = abs(ndc.x) <= 1.0 && abs(ndc.y) <= 1.0;
-        rgb = select(vec3<f32>(m, m, m), vec3<f32>(0.0, m + 0.2, 0.0), inside);
+        // DEBUG: tint by the selected shadow cascade — c0 = RED, c1 = GREEN,
+        // c2 = BLUE, BLACK = outside all cascades. Visualizes cascade coverage/rings.
+        let n14 = normalize(in.normal);
+        var uv14 = vec2<f32>(0.0, 0.0);
+        var ref14 = 0.0;
+        let c14 = select_cascade(in.world_rel, n14, &uv14, &ref14);
+        if (c14 == 0u) { rgb = vec3<f32>(0.8, 0.2, 0.2); }
+        else if (c14 == 1u) { rgb = vec3<f32>(0.2, 0.8, 0.2); }
+        else if (c14 == 2u) { rgb = vec3<f32>(0.2, 0.4, 0.9); }
+        else { rgb = vec3<f32>(0.05, 0.05, 0.05); }
     } else {
         rgb = volcano_ramp(clamp(in.volcanism, 0.0, 1.0));
     }

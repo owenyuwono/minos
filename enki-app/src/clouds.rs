@@ -24,7 +24,7 @@ use bytemuck::{cast_slice, Pod, Zeroable};
 use enki_planet::height::HeightField;
 use enki_render::{camera::Camera, frame::FrameUniforms};
 use enki_rhi::{vk, BindingDesc, BufferHandle, GraphicsPipelineDesc, PipelineHandle, Rhi, RhiError};
-use glam::{DVec3, Vec3};
+use glam::Vec3;
 
 use crate::clouds_advect::{AdvectParams, CloudAdvect, GRID_H, GRID_W};
 
@@ -66,8 +66,8 @@ pub struct CloudParams {
 impl Default for CloudParams {
     fn default() -> Self {
         Self {
-            coverage: 0.5,
-            density: 0.08,
+            coverage: 0.6,
+            density: 0.12,
             base_alt_m: 2000.0,
             thickness_m: 3000.0,
             wind_speed: 1500.0,
@@ -117,18 +117,11 @@ pub struct Clouds {
     /// 3-index buffer feeding `vertex_index` for the fullscreen triangle.
     idx: BufferHandle,
     frames: Vec<CloudFrame>,
-    /// Background semi-Lagrangian coverage advection.
+    /// Background semi-Lagrangian advection — flows + evolves the cloud field. The
+    /// shader samples this field directly, so all motion is advection (no warp).
     advect: CloudAdvect,
     /// CPU staging for the per-frame coverage upload.
     cov_scratch: Vec<f32>,
-    /// Wind source (kept to bake the GPU wind grid below).
-    src: Option<Arc<dyn HeightField>>,
-    /// Baked per-location wind VELOCITY grid (3 f32/cell), uploaded once. The shader
-    /// advects the cloud SHAPE noise along THIS — the same local wind the streaks
-    /// follow — so clouds curve with the flow (not a global vector). Shear is bounded
-    /// in-shader by a reset-and-cross-fade so it never tears.
-    wind_buf: BufferHandle,
-    wind_baked: bool,
     base_radius: f64,
 }
 
@@ -146,7 +139,6 @@ impl Clouds {
             BindingDesc { binding: 2, ty: vk::DescriptorType::SAMPLED_IMAGE, stages: frag },
             BindingDesc { binding: 3, ty: vk::DescriptorType::SAMPLER, stages: frag },
             BindingDesc { binding: 4, ty: vk::DescriptorType::STORAGE_BUFFER, stages: frag },
-            BindingDesc { binding: 5, ty: vk::DescriptorType::STORAGE_BUFFER, stages: frag },
         ])?;
         let sampler = rhi.create_sampler()?;
 
@@ -171,13 +163,6 @@ impl Clouds {
         // Index buffer values ARE the vertex indices the VS reads (no vertex buffer).
         let idx = rhi.create_index_buffer(&[0u32, 1, 2])?;
 
-        // Shared per-location wind grid (3 f32/cell), baked once from the planet.
-        let wind_buf = rhi.create_gpu_buffer(
-            (GRID_W * GRID_H * 3 * std::mem::size_of::<f32>()) as u64,
-            true,
-            vk::BufferUsageFlags::STORAGE_BUFFER,
-        )?;
-
         let fif = rhi.frames_in_flight();
         let cov_bytes = (GRID_W * GRID_H * std::mem::size_of::<f32>()) as u64;
         let mut frames = Vec::with_capacity(fif);
@@ -198,7 +183,6 @@ impl Clouds {
             rhi.write_uniform_binding(set, 1, cloud_ubo)?;
             rhi.write_sampler_binding(set, 3, sampler);
             rhi.write_storage_binding(set, 4, cov_buf)?;
-            rhi.write_storage_binding(set, 5, wind_buf)?;
             // Binding 2 (scene depth) is written per-frame in `record`.
             frames.push(CloudFrame { frame_ubo, cloud_ubo, cov_buf, set });
         }
@@ -211,9 +195,6 @@ impl Clouds {
             frames,
             advect: CloudAdvect::new(base_radius),
             cov_scratch: vec![0.0; GRID_W * GRID_H],
-            src: None,
-            wind_buf,
-            wind_baked: false,
             base_radius,
         })
     }
@@ -245,14 +226,6 @@ impl Clouds {
         self.advect.copy_latest(&mut self.cov_scratch);
         let has_coverage = self.advect.is_ready();
 
-        // Lazily bake the per-location wind grid the shader advects the texture along.
-        if !self.wind_baked {
-            if let Some(hf) = self.src.clone() {
-                rhi.write_storage_bytes(self.wind_buf, cast_slice(&bake_wind(hf.as_ref())))?;
-                self.wind_baked = true;
-            }
-        }
-
         let f = &self.frames[fi as usize];
         rhi.write_sampled_image_binding(
             f.set,
@@ -282,7 +255,7 @@ impl Clouds {
             fwd: [fwd.x, fwd.y, fwd.z, 0.0],
             center_rel: [center_rel.x, center_rel.y, center_rel.z, self.base_radius as f32],
             shell: [params.base_alt_m, params.thickness_m, params.coverage, params.density],
-            wind: [0.0, 0.0, 0.0, params.wind_speed], // w = advection speed (m/s)
+            wind: [0.0, 0.0, 0.0, 0.0], // unused (motion is in the advected field)
             march: [params.steps, params.hg_g, params.noise_scale, time],
             screen: [extent.0 as f32, extent.1 as f32, tan_half, aspect],
             misc: [if debug { 1.0 } else { 0.0 }, proj_a, proj_b, 0.0],
@@ -291,7 +264,7 @@ impl Clouds {
                 GRID_W as f32,
                 GRID_H as f32,
                 if has_coverage { 1.0 } else { 0.0 },
-                if self.wind_baked { 1.0 } else { 0.0 },
+                0.0,
             ],
         };
         rhi.write_storage_bytes(f.cloud_ubo, bytemuck::bytes_of(&gpu))?;
@@ -306,7 +279,6 @@ impl Clouds {
     /// Supply the planet as the wind + moisture source once loaded; the worker
     /// bakes its grids and starts advecting. Until then clouds use uniform coverage.
     pub fn set_source(&mut self, hf: Arc<dyn HeightField>) {
-        self.src = Some(Arc::clone(&hf));
         self.advect.set_source(hf);
     }
 
@@ -321,28 +293,6 @@ impl Clouds {
     pub fn destroy(&self, rhi: &Rhi) {
         rhi.destroy_sampler(self.sampler);
     }
-}
-
-/// Bake the per-location wind VELOCITY (tangent × speed, world-space) into an equirect
-/// grid (3 f32/cell) the shader advects the cloud texture along — same convention as
-/// the worker / `grid_lerp`: dir = (cosLat·sinLon, sinLat, cosLat·cosLon).
-fn bake_wind(hf: &dyn HeightField) -> Vec<f32> {
-    let mut out = vec![0.0f32; GRID_W * GRID_H * 3];
-    for iy in 0..GRID_H {
-        let lat = ((iy as f64 + 0.5) / GRID_H as f64 - 0.5) * std::f64::consts::PI;
-        let (sl, cl) = lat.sin_cos();
-        for ix in 0..GRID_W {
-            let lon = ((ix as f64 + 0.5) / GRID_W as f64 - 0.5) * std::f64::consts::TAU;
-            let (so, co) = lon.sin_cos();
-            let dir = DVec3::new(cl * so, sl, cl * co).normalize();
-            let w = hf.wind_at(dir);
-            let b = (iy * GRID_W + ix) * 3;
-            out[b] = w.x * w.speed;
-            out[b + 1] = w.y * w.speed;
-            out[b + 2] = w.z * w.speed;
-        }
-    }
-    out
 }
 
 #[cfg(test)]
