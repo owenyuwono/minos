@@ -1598,6 +1598,11 @@ impl App {
                     if let Err(e) = renderer.update_leaf_texture(rhi, &f.leaf_genes(), single) {
                         log::error!("FloraRenderer::update_leaf_texture failed: {e}");
                     }
+                    // Bake the TOP/SIDE impostor atlas from this tree (leaf textures
+                    // are now SHADER_READ + IBL ready + GPU idle — rebuild wait_idles).
+                    if let Err(e) = renderer.bake_impostor(rhi, &f) {
+                        log::error!("FloraRenderer::bake_impostor failed: {e}");
+                    }
                 }
                 let fov_y = 60_f32.to_radians();
                 let (min, max) = f.local_bounds();
@@ -1959,6 +1964,11 @@ impl App {
                     light_view_proj: lvp.to_cols_array_2d(),
                     // (1/size, normalBias 0.02 [dryad], enabled, dappled)
                     params: [texel, 0.02, 1.0, if self.dappled { 1.0 } else { 0.0 }],
+                    // Viewer = single tree-local cascade: count=1, use_view_pos=0
+                    // (sample tree-local shadow_pos), dryad depth bias 0.0005.
+                    light_view_proj1: Mat4::IDENTITY.to_cols_array_2d(),
+                    light_view_proj2: Mat4::IDENTITY.to_cols_array_2d(),
+                    params2: [1.0, 0.0, 0.0005, 0.0],
                 };
                 (su, Some(lvp))
             }
@@ -1966,6 +1976,9 @@ impl App {
                 ShadowUniforms {
                     light_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
                     params: [1.0 / 2048.0, 0.02, 0.0, 0.0], // disabled
+                    light_view_proj1: Mat4::IDENTITY.to_cols_array_2d(),
+                    light_view_proj2: Mat4::IDENTITY.to_cols_array_2d(),
+                    params2: [1.0, 0.0, 0.0005, 0.0],
                 },
                 None,
             ),

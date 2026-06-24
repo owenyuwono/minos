@@ -33,7 +33,11 @@ const CELLS: usize = GRID_W * GRID_H;
 /// Worker tick (Hz). SL is stable at any dt; this just paces CPU.
 const TICK_HZ: f32 = 30.0;
 /// Cloud-clump size in the injected source noise (higher = smaller clumps).
-const NOISE_FREQ: f32 = 9.0;
+const NOISE_FREQ: f32 = 10.0;
+/// Large-scale weather-region size (lower = bigger cloudy/clear regions). The baked
+/// moisture saturates to ~1 over the oceans, so WITHOUT this mask clouds form everywhere
+/// moist = the whole planet; this carves big drifting cloudy/clear regions instead.
+const WEATHER_FREQ: f32 = 2.5;
 /// How fast clumps form/dissipate (slow evolution of the injected detail).
 const NOISE_EVOLVE: f32 = 0.04;
 
@@ -197,8 +201,17 @@ fn worker_loop(
         let ez = elapsed * NOISE_EVOLVE;
         for idx in 0..CELLS {
             let d = cell_dirs[idx];
-            let n = fbm(Vec3::new(d.x * NOISE_FREQ, d.y * NOISE_FREQ, d.z * NOISE_FREQ + ez));
-            noise_buf[idx] = smoothstep(0.4, 0.7, n); // clumpy
+            // Large-scale weather mask: big, slowly-drifting cloudy/clear REGIONS so the
+            // (mostly-moist) planet isn't blanketed. ~1/3 of the sky is "active weather".
+            let big = fbm(Vec3::new(
+                d.x * WEATHER_FREQ,
+                d.y * WEATHER_FREQ,
+                d.z * WEATHER_FREQ + ez * 0.5,
+            ));
+            let region = smoothstep(0.48, 0.72, big);
+            // Medium-scale clumps within the active regions.
+            let clump = fbm(Vec3::new(d.x * NOISE_FREQ, d.y * NOISE_FREQ, d.z * NOISE_FREQ + ez));
+            noise_buf[idx] = region * smoothstep(0.35, 0.65, clump);
         }
         // Gentle unsteady gust so the flow never settles to a static steady state.
         let gust = 0.6 * (elapsed * 0.08).sin();

@@ -47,8 +47,8 @@ struct FrameUniforms {
 struct ChunkPush {
     model         : mat4x4<f32>,
     material_mode : u32,
-    _pad0         : u32,
-    _pad1         : u32,
+    dbg_id        : u32,   // per-mesh-unit id (leaf/cluster) — modes 3/4
+    dbg_level     : u32,   // LOD level — mode 5
     _pad2         : u32,
 }
 
@@ -57,6 +57,7 @@ var<immediate> pc: ChunkPush;
 // ── Vertex stage ─────────────────────────────────────────────────────────────
 
 struct VertexIn {
+    @builtin(vertex_index) vid: u32,
     @location(0) position   : vec3<f32>,
     @location(1) normal     : vec3<f32>,
     @location(2) color      : vec3<f32>,
@@ -72,6 +73,8 @@ struct VertexOut {
     // dead-strips unused interpolants, and harmless otherwise.
     @location(2)       world_pos   : vec3<f32>,
     @location(3)       plate_color : vec3<f32>,
+    // Provoking-vertex index (flat) → a per-triangle seed for the Triangle view.
+    @location(4) @interpolate(flat) vid : u32,
 }
 
 @vertex
@@ -105,6 +108,7 @@ fn vs_main(v: VertexIn) -> VertexOut {
     // world-space — consistent with the camera-relative rendering contract.
     out.world_pos   = world_pos.xyz;
     out.plate_color = v.plate_color;
+    out.vid         = v.vid;
 
     return out;
 }
@@ -141,6 +145,43 @@ fn aces_filmic(x: vec3<f32>) -> vec3<f32> {
     return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+// ── Geometry-debug colouring (modes 3/4/5) ────────────────────────────────────
+// Distinct, well-separated colours per integer id. Copied from nanite_draw.wgsl so
+// the voxel path's Triangle/Cluster/LOD views read the same as the old Nanite ones.
+fn hash_u32(x: u32) -> u32 {
+    var h = x * 0x9E3779B1u;
+    h = h ^ (h >> 16u);
+    h = h * 0x85EBCA77u;
+    h = h ^ (h >> 13u);
+    return h;
+}
+fn hash2(a: u32, b: u32) -> u32 {
+    var h = a * 0x9E3779B1u ^ b * 0x85EBCA77u;
+    h = h ^ (h >> 15u);
+    return h;
+}
+fn hsv2rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
+    let c = v * s;
+    let hp = h / 60.0;
+    let x = c * (1.0 - abs(hp % 2.0 - 1.0));
+    var rgb: vec3<f32>;
+    let hi = i32(hp);
+    if (hi == 0) { rgb = vec3<f32>(c, x, 0.0); }
+    else if (hi == 1) { rgb = vec3<f32>(x, c, 0.0); }
+    else if (hi == 2) { rgb = vec3<f32>(0.0, c, x); }
+    else if (hi == 3) { rgb = vec3<f32>(0.0, x, c); }
+    else if (hi == 4) { rgb = vec3<f32>(x, 0.0, c); }
+    else { rgb = vec3<f32>(c, 0.0, x); }
+    return rgb + vec3<f32>(v - c);
+}
+fn id_color(id: u32) -> vec3<f32> {
+    let h = hash_u32(id);
+    let hue = f32(h % 3600u) / 10.0;
+    let sat = 0.55 + f32((h >> 8u) & 0xFFu) / 255.0 * 0.30;
+    let val = 0.80 + f32((h >> 16u) & 0xFFu) / 255.0 * 0.20;
+    return hsv2rgb(hue, sat, val);
+}
+
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let n = normalize(in.world_normal);
@@ -148,7 +189,9 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // ── Mode 1: Unlit ──────────────────────────────────────────────────────────
     // Biome albedo, flat — no lighting, no ACES (the _SRGB swapchain still applies
     // its hardware OETF on write).
-    if pc.material_mode == 1u {
+    // Modes 7–10 (Height/Material/Wetness/Volcano) bake their field into vertex color
+    // on the voxel path (the mesher) and show it raw here, exactly like Unlit.
+    if pc.material_mode == 1u || (pc.material_mode >= 7u && pc.material_mode <= 10u) {
         return vec4<f32>(in.albedo, 1.0);
     }
 
@@ -164,10 +207,26 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
         return vec4<f32>(in.plate_color, 1.0);
     }
 
+    // ── Modes 3/4/5: geometry debug (per-mesh-unit ids pushed in ChunkPush) ──────
+    // 3 Triangle: hash the provoking-vertex index with the leaf id → a unique colour
+    //   per triangle (denser = finer LOD, same as the old Nanite triangle view).
+    // 4 Cluster : one colour per resident leaf (shows the cube-sphere LOD tiling).
+    // 5 LOD     : one colour per octree level → concentric LOD rings reveal whether
+    //   selection is splitting near the camera / merging far away.
+    if pc.material_mode == 3u {
+        return vec4<f32>(id_color(hash2(pc.dbg_id, in.vid)), 1.0);
+    }
+    if pc.material_mode == 4u {
+        return vec4<f32>(id_color(pc.dbg_id), 1.0);
+    }
+    if pc.material_mode == 5u {
+        return vec4<f32>(id_color(pc.dbg_level + 1u), 1.0);
+    }
+
     // ── Mode 0 Lit + fallback ──────────────────────────────────────────────────
     // Ambient isotropic + hemisphere + two directional lights, biome-color albedo,
-    // ACES filmic tonemap. Modes the classic path can't yet serve (3/4/5 Nanite-only;
-    // 7/8/9/10 need vertex channels the 4×vec3 format lacks) also land here.
+    // ACES filmic tonemap. (3/4/5 are Nanite-only; on the classic quadtree path 7–10
+    // have no baked data and fall back to Lit here — the voxel path handles them above.)
     let albedo = in.albedo;
     let ambient_term = frame.ambient.xyz * albedo;
     let hemi_term    = hemisphere_ambient(n, frame.hemi_sky.xyz, frame.hemi_ground.xyz) * albedo;

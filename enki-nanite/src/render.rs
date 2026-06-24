@@ -19,7 +19,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::bake::cluster_build::{MAX_CLUSTER_TRIS, MAX_CLUSTER_VERTS};
-use crate::cluster::ClusterAsset;
+use crate::cluster::{Cluster, ClusterAsset};
 use crate::residency::ClusterEntry;
 use crate::stream::PagePool;
 
@@ -28,7 +28,7 @@ use enki_rhi::{
     vk, BindingDesc, BufferHandle, ComputePipelineDesc, GraphicsPipelineDesc, PipelineHandle, Rhi,
     RhiError,
 };
-use glam::{DVec3, Mat4};
+use glam::{DVec3, Mat4, Vec3};
 
 /// Cull / LOD-cut compute shader (WGSL). Entry point: `cs_cull`.
 pub const CULL_WGSL: &str = include_str!("shaders/nanite_cull.wgsl");
@@ -48,6 +48,11 @@ pub struct GpuClusterMeta {
     /// `[tri_offset, tri_count, node_index, _pad]` — index range into `tris`, plus
     /// the node this cluster belongs to (selects its per-node origin/translation).
     pub range: [u32; 4],
+    /// Backface normal cone: `[axis.xyz, sin(half_angle)]`. `axis` is the cluster's
+    /// outward average normal; the cull skips the cluster when `dot(axis, view) >
+    /// sin(half_angle)` (every face points away). A sentinel `w >= 2` (degenerate /
+    /// >hemisphere cone) disables the test — never culls.
+    pub cone: [f32; 4],
 }
 
 /// Stable per-cluster id for the debug view (face/node in the high bits, cluster
@@ -55,6 +60,45 @@ pub struct GpuClusterMeta {
 /// so debug colors stay put when the streaming set is re-packed.
 fn stable_id(node: u32, cluster: u32) -> u32 {
     (node << 20) | (cluster & 0x000F_FFFF)
+}
+
+/// Backface normal cone for a cluster: `(outward axis, sin(half_angle))`.
+///
+/// The axis is the mean **face** normal (oriented outward to agree with the
+/// authored vertex normals, so winding can't flip it), and the half-angle bounds
+/// every face normal's deviation — a conservative cone, so the cull never drops a
+/// cluster with any face still pointing at the camera. A cone spanning a hemisphere
+/// or more (or a degenerate cluster) returns `sin = 2.0`, a sentinel the runtime
+/// test `dot(axis, view) > sin` can never satisfy → that cluster is never culled.
+fn cluster_cone(c: &Cluster) -> ([f32; 3], f32) {
+    let pos = |i: u8| Vec3::from_array(c.vertices[i as usize].position);
+    // Face normal, flipped to agree with the triangle's authored vertex normals.
+    let face = |t: &[u8; 3]| -> Vec3 {
+        let n = (pos(t[1]) - pos(t[0])).cross(pos(t[2]) - pos(t[0])).normalize_or_zero();
+        let vn = Vec3::from_array(c.vertices[t[0] as usize].normal)
+            + Vec3::from_array(c.vertices[t[1] as usize].normal)
+            + Vec3::from_array(c.vertices[t[2] as usize].normal);
+        if n.dot(vn) < 0.0 { -n } else { n }
+    };
+    let mut axis = Vec3::ZERO;
+    for t in &c.triangles {
+        axis += face(t);
+    }
+    let axis = axis.normalize_or_zero();
+    if axis == Vec3::ZERO {
+        return ([0.0, 1.0, 0.0], 2.0); // no coherent direction → never cull
+    }
+    let mut min_dot = 1.0f32;
+    for t in &c.triangles {
+        let n = face(t);
+        if n != Vec3::ZERO {
+            min_dot = min_dot.min(n.dot(axis));
+        }
+    }
+    if min_dot <= 0.0 {
+        return (axis.to_array(), 2.0); // ≥ hemisphere spread → never cull
+    }
+    (axis.to_array(), (1.0 - min_dot * min_dot).max(0.0).sqrt())
 }
 
 // ── Per-frame uniform (std430, matches WGSL `FrameData`) ─────────────────────
@@ -373,6 +417,13 @@ impl NaniteRenderer {
         self.resident.len()
     }
 
+    /// Triangles drawn by the last cull pass = visible clusters × the fixed cluster
+    /// tri stride. This is the GPU's actual per-frame load (includes the degenerate
+    /// padding tris past each cluster's real `tri_count`). ~2 frames stale.
+    pub fn last_visible_triangles(&self) -> u32 {
+        self.last_visible * MAX_CLUSTER_TRIS as u32
+    }
+
     /// Write one cluster's geometry + meta into GPU `slot` (fixed-stride). Only
     /// ever called on a FREE slot, so it never races an in-flight frame.
     fn write_cluster(
@@ -420,6 +471,10 @@ impl NaniteRenderer {
             err: [c.self_error, c.parent_error, c.lod as f32, 0.0],
             // range[0] (tri_offset) is implicit (slot * MAX_TRIS) with fixed stride.
             range: [0, c.triangles.len() as u32, face, stable_id(face, cluster_idx as u32)],
+            cone: {
+                let (axis, sin) = cluster_cone(c);
+                [axis[0], axis[1], axis[2], sin]
+            },
         };
         let meta_off = slot as u64 * std::mem::size_of::<GpuClusterMeta>() as u64;
         rhi.write_storage_bytes_at(self.meta_buf, meta_off, bytemuck::bytes_of(&meta))?;
@@ -739,6 +794,62 @@ mod tests {
                 .validate(&module)
                 .unwrap_or_else(|e| panic!("{name} WGSL validation failed:\n{e:?}"));
         }
+    }
+
+    fn cvert(p: [f32; 3], n: [f32; 3]) -> crate::cluster::ClusterVertex {
+        crate::cluster::ClusterVertex {
+            position: p, normal: n, color: [0.0; 3],
+            material: 0.0, wetness: 0.0, volcanism: 0.0, elevation: 0.0,
+            plate: [0.0; 3], horizon: [0.0; 4],
+        }
+    }
+    fn cone_cluster(vertices: Vec<crate::cluster::ClusterVertex>, triangles: Vec<[u8; 3]>) -> Cluster {
+        let unit = crate::cluster::BoundingSphere { center: Vec3::ZERO, radius: 1.0 };
+        Cluster {
+            vertices, triangles, bounds: unit, self_error: 0.0,
+            parent_error: f32::INFINITY, parent_bounds: unit, group: 0, lod: 0,
+        }
+    }
+
+    #[test]
+    fn cluster_cone_culls_backface_keeps_frontface() {
+        // CCW quad in the XY plane → outward face normal +Z, vertex normals +Z.
+        let c = cone_cluster(
+            vec![
+                cvert([0.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+                cvert([1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+                cvert([1.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+                cvert([0.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+            ],
+            vec![[0, 1, 2], [0, 2, 3]],
+        );
+        let (axis, sin) = cluster_cone(&c);
+        let axis = Vec3::from_array(axis);
+        assert!((axis - Vec3::Z).length() < 1e-4, "axis should be the outward +Z normal");
+        assert!(sin < 0.05, "a flat cluster has a tight cone (sin≈0), got {sin}");
+        // Shader cull predicate `dot(axis, view) > sin`, view = camera→cluster dir.
+        // Camera on −Z (view = +Z, cluster faces away) → culled.
+        assert!(axis.dot(Vec3::Z) > sin, "back-facing cluster must be culled");
+        // Camera on +Z (view = −Z, cluster faces the camera) → kept.
+        assert!(!(axis.dot(-Vec3::Z) > sin), "front-facing cluster must be kept");
+    }
+
+    #[test]
+    fn cluster_cone_wide_spread_disables_cull() {
+        // Two triangles facing opposite ways (+Z, −Z): a ≥-hemisphere cone → sentinel.
+        let c = cone_cluster(
+            vec![
+                cvert([0.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+                cvert([1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+                cvert([0.0, 1.0, 0.0], [0.0, 0.0, 1.0]),
+                cvert([0.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
+                cvert([0.0, 1.0, 0.0], [0.0, 0.0, -1.0]),
+                cvert([1.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
+            ],
+            vec![[0, 1, 2], [3, 4, 5]],
+        );
+        let (_, sin) = cluster_cone(&c);
+        assert!(sin >= 2.0, "a ≥hemisphere cone must disable the cull (sentinel), got {sin}");
     }
 
     #[test]

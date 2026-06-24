@@ -281,13 +281,15 @@ struct LeafPush {
     wind: [f32; 4],
 }
 
-/// `ImpostorPush` mirror (staging.wgsl) — 80 bytes: camera-facing billboard model
-/// + (rgb canopy pigment, crossfade alpha). Drawn alpha-blended in the scene pass.
+/// `ImpostorPush` mirror (staging.wgsl) — 96 bytes: camera-facing billboard model
+/// + (rgb canopy pigment, crossfade alpha) + the tree radial up (for the TOP/SIDE
+/// atlas-tile blend). Drawn alpha-blended in the scene pass.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ImpostorPush {
     model: [[f32; 4]; 4],
-    color: [f32; 4], // rgb = pigment (linear HDR); w = crossfade alpha
+    color: [f32; 4], // rgb = pigment tint (linear HDR); w = crossfade alpha
+    up: [f32; 4],    // xyz = tree radial up (camera-relative world space); w unused
 }
 
 /// One uploaded indexed mesh in the 4×vec3 layout (positions/normals/uv3/attr3).
@@ -785,6 +787,24 @@ impl FloraView {
         0.5 * (dx * dx + dy * dy + dz * dz).sqrt()
     }
 
+    /// FEET-anchored cull radius (m, local scale): the farthest branch-AABB corner
+    /// from the local origin (= the instance's feet), padded ~20% for leaf cards
+    /// that reach past the branch mesh. The scatter draw / shadow-caster culls build
+    /// a bounding sphere at `origin` with `cull_radius() * instance_scale`.
+    pub fn cull_radius(&self) -> f32 {
+        let (mn, mx) = self.bounds;
+        let mut r2 = 0.0f32;
+        for i in 0..8u32 {
+            let c = [
+                if i & 1 == 0 { mn[0] } else { mx[0] },
+                if i & 2 == 0 { mn[1] } else { mx[1] },
+                if i & 4 == 0 { mn[2] } else { mx[2] },
+            ];
+            r2 = r2.max(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+        }
+        r2.sqrt() * 1.2
+    }
+
     /// Distance-driven leaf LOD for this frame (the "Leaf optimization" master
     /// toggle). `enabled == false` forces [`LeafLod::FULL`] (byte-identical to the
     /// pre-optimization render). Distance is in tree-radii so the bands hold for
@@ -914,10 +934,28 @@ impl FloraView {
         model: Mat4,
         wind: [f32; 4],
     ) -> Result<(), RhiError> {
-        // The scatter renders every tree at FULL leaf detail — no per-instance LOD
-        // or impostor fade, so trees stay fully visible at any distance.
+        self.record_at_lod(rhi, renderer, fi, model, wind, LeafLod::FULL)
+    }
+
+    /// Like [`record_at`] but threads a per-instance [`LeafLod`] into the leaf
+    /// draw (the Tier-2 planet-scatter impostor crossfade). The branch mesh ALWAYS
+    /// draws (mirrors the viewer's `record`, which never drops the trunk); the
+    /// leaves honour `lod.density_frac` (thinning to a `MIN_DENSITY` floor as the
+    /// impostor fades in — coverage-conserving). The far IMPOSTOR billboard is a
+    /// SEPARATE call (`record_impostor_at`), recorded AFTER this since it is
+    /// alpha-blended; this method draws geometry only. `LeafLod::FULL` ⇒ identical
+    /// to the old `record_at`.
+    pub fn record_at_lod(
+        &self,
+        rhi: &mut Rhi,
+        renderer: &FloraRenderer,
+        fi: u32,
+        model: Mat4,
+        wind: [f32; 4],
+        lod: LeafLod,
+    ) -> Result<(), RhiError> {
         self.draw_branch(rhi, renderer, fi, model, wind)?;
-        self.draw_leaves(rhi, renderer, fi, model, wind, LeafLod::FULL)
+        self.draw_leaves(rhi, renderer, fi, model, wind, lod)
     }
 
     /// Branch draw at a given camera-relative `model` (shared by `record_branch`
@@ -1108,11 +1146,15 @@ impl FloraView {
         Ok(())
     }
 
-    /// Draw the far-distance leaf IMPOSTOR billboard (#3): one camera-facing quad
-    /// painted as a soft canopy blob in the per-tree pigment, alpha = `blend` (the
-    /// `LeafLod::impostor_blend` crossfade). A no-op at `blend <= 0`. `cam_right` /
-    /// `cam_up` are the camera basis vectors (the billboard faces the camera). Must
-    /// be recorded INSIDE the scene pass, AFTER the tree (it's alpha-blended).
+    /// Draw the far-distance IMPOSTOR billboard (#3): one camera-facing quad that
+    /// samples the baked TOP/SIDE atlas (so it's correct from above), tinted toward
+    /// `canopy_color`, alpha = `blend` (the crossfade). A no-op at `blend <= 0`.
+    /// `cam_right` / `cam_up` are the camera basis vectors (the billboard faces the
+    /// camera); `tree_up` is the tree's radial up (camera-relative world space) the
+    /// FS uses to pick the TOP vs SIDE tile. Must be recorded INSIDE the scene pass,
+    /// AFTER the tree (it's alpha-blended). The planet scatter passes the instance's
+    /// `origin.normalize()`; the viewer wrapper passes its tree's model up.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_impostor_at(
         &self,
         rhi: &mut Rhi,
@@ -1121,7 +1163,9 @@ impl FloraView {
         model: Mat4,
         cam_right: Vec3,
         cam_up: Vec3,
+        canopy_color: Vec3,
         blend: f32,
+        tree_up: Vec3,
     ) -> Result<(), RhiError> {
         if blend <= 0.0 {
             return Ok(());
@@ -1146,14 +1190,19 @@ impl FloraView {
             center.extend(1.0),
         );
         let color = [
-            self.leaf_pigment[0],
-            self.leaf_pigment[1],
-            self.leaf_pigment[2],
+            canopy_color.x,
+            canopy_color.y,
+            canopy_color.z,
             blend.clamp(0.0, 1.0),
         ];
         renderer.bind(rhi, fi, FloraPipeline::Impostor);
         rhi.set_viewport_scissor_full(fi);
-        let push = ImpostorPush { model: model.to_cols_array_2d(), color };
+        let up = tree_up.normalize_or(Vec3::Y);
+        let push = ImpostorPush {
+            model: model.to_cols_array_2d(),
+            color,
+            up: [up.x, up.y, up.z, 0.0],
+        };
         rhi.bind_vertex_buffers(
             fi,
             &[
@@ -1182,7 +1231,17 @@ impl FloraView {
         blend: f32,
     ) -> Result<(), RhiError> {
         let model = self.model(camera_world_pos);
-        self.record_impostor_at(rhi, renderer, fi, model, cam_right, cam_up, blend)
+        // Viewer keeps the per-tree leaf pigment for its far-LOD disc.
+        let pigment = Vec3::new(
+            self.leaf_pigment[0],
+            self.leaf_pigment[1],
+            self.leaf_pigment[2],
+        );
+        // Tree radial up = the model's Y axis (at the origin it's +Y).
+        let tree_up = self.origin.normalize_or(DVec3::Y).as_vec3();
+        self.record_impostor_at(
+            rhi, renderer, fi, model, cam_right, cam_up, pigment, blend, tree_up,
+        )
     }
 
     /// Camera-relative model matrix: rotation aligning local +Y to the surface
@@ -1210,6 +1269,120 @@ impl FloraView {
         m.w_axis.z = rel.z;
         m.w_axis.w = 1.0;
         m
+    }
+
+    /// Record the branch + leaf draws for the IMPOSTOR BAKE into a caller-supplied
+    /// RAW command buffer (the one-shot transient buffer `FloraRenderer::bake_impostor`
+    /// owns — NOT `current_command_buffer`, so the `rhi.bind_*` helpers can't be
+    /// used; this records with raw ash). The caller has already bound the
+    /// rendering instance + tile viewport and seeded set0 (`view_proj = ortho`),
+    /// set1 (neutral shadow + identity bone matrices). Push payloads are built with
+    /// `model = identity` (the ortho carries the whole transform), neutral wind
+    /// (strength 0 → exact static rest pose), and the LINEAR-HDR lane (in_scene 0)
+    /// so the atlas stores pre-ACES color (the `fs_impostor` output ACES-es once).
+    ///
+    /// `branch_pipe`/`leaf_pipe` are the flora-owned BAKE pipelines (built at the
+    /// atlas sample count). `pipeline_layout` is flora's shared [set0,set1] layout.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_bake_draws(
+        &self,
+        rhi: &Rhi,
+        device: &ash::Device,
+        cmd: ash::vk::CommandBuffer,
+        pipeline_layout: ash::vk::PipelineLayout,
+        set0: ash::vk::DescriptorSet,
+        set1: ash::vk::DescriptorSet,
+        branch_pipe: ash::vk::Pipeline,
+        leaf_pipe: ash::vk::Pipeline,
+    ) -> Result<(), RhiError> {
+        use ash::vk;
+        let model = Mat4::IDENTITY.to_cols_array_2d();
+        let wind = [0.0f32, 0.0, 0.0, 0.0]; // strength 0 → static rest pose
+        let bind_sets = |pipe: vk::Pipeline| unsafe {
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipe);
+            device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::GRAPHICS,
+                pipeline_layout,
+                0,
+                &[set0, set1],
+                &[],
+            );
+        };
+        let push = |bytes: &[u8]| unsafe {
+            device.cmd_push_constants(
+                cmd,
+                pipeline_layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                0,
+                bytes,
+            );
+        };
+        let bind_vbufs = |handles: &[BufferHandle]| -> Result<(), RhiError> {
+            let mut bufs = Vec::with_capacity(handles.len());
+            for &h in handles {
+                bufs.push(rhi.vk_buffer(h)?);
+            }
+            let offsets = vec![0u64; handles.len()];
+            unsafe { device.cmd_bind_vertex_buffers(cmd, 0, &bufs, &offsets) };
+            Ok(())
+        };
+
+        // ── Branch (6-stream lit pipeline). bark2[3] = 0 → LINEAR HDR (no ACES). ──
+        let mut bark2 = self.bark2;
+        bark2[2] = 0.0; // debug mode = Lit
+        bark2[3] = 0.0; // in_scene = 0 → store pre-ACES linear HDR
+        let bpush = BranchPush {
+            model,
+            wind,
+            bark0: self.bark0,
+            bark1: self.bark1,
+            bark2,
+        };
+        bind_sets(branch_pipe);
+        bind_vbufs(&[
+            self.branch.pos,
+            self.branch.nrm,
+            self.branch.uv,
+            self.branch.attr,
+            self.branch_tangent,
+            self.branch_frame_u,
+        ])?;
+        unsafe {
+            device.cmd_bind_index_buffer(cmd, rhi.vk_buffer(self.branch.idx)?, 0, vk::IndexType::UINT32);
+        }
+        push(bytemuck::bytes_of(&bpush));
+        unsafe { device.cmd_draw_indexed(cmd, self.branch.index_count, 1, 0, 0, 0) };
+
+        // ── Leaves (4-stream). leaf_params2[3] = 0 → LINEAR HDR. ──
+        if let Some(leaf) = &self.leaf {
+            let mut leaf_params2 = self.leaf_params2;
+            leaf_params2[2] = 0.0; // debug mode = Lit
+            leaf_params2[3] = 0.0; // in_scene = 0
+            let lpush = LeafPush {
+                model,
+                pigment: self.leaf_pigment,
+                leaf_params: self.leaf_params,
+                leaf_params2,
+                wind,
+            };
+            bind_sets(leaf_pipe);
+            bind_vbufs(&[leaf.pos, leaf.nrm, leaf.uv, leaf.attr])?;
+            unsafe {
+                device.cmd_bind_index_buffer(cmd, rhi.vk_buffer(leaf.idx)?, 0, vk::IndexType::UINT32);
+            }
+            push(bytemuck::bytes_of(&lpush));
+            unsafe { device.cmd_draw_indexed(cmd, leaf.index_count, 1, 0, 0, 0) };
+        }
+        Ok(())
+    }
+
+    /// The tree-LOCAL-WORLD AABB (min, max) the impostor bake fits its ortho tiles
+    /// to — same frame `record_bake_draws` records in (model = identity at the
+    /// origin → this equals `world_bounds()`). Exposed so `bake_impostor` can size
+    /// the TOP/SIDE ortho frustums without reaching into private fields.
+    pub fn bake_bounds(&self) -> (Vec3, Vec3) {
+        self.world_bounds()
     }
 }
 

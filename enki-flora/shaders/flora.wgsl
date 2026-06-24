@@ -43,12 +43,23 @@ struct FrameUniforms {
 //   binding 2 : ShadowUniforms — the light-space view-proj that the shadow PASS
 //               rendered with, plus the texel size + normalBias + enable flag.
 struct ShadowUniforms {
-    light_view_proj : mat4x4<f32>,  // world → light clip (same matrix the depth pass used)
-    params          : vec4<f32>,    // (1/shadowMapSize, normalBias, enabled, dappled)
+    light_view_proj  : mat4x4<f32>,  // cascade 0: world → light clip (depth pass matrix)
+    params           : vec4<f32>,    // (1/shadowMapSize, normalBias, enabled, dappled)
+    // ── 3-cascade CSM extension (planet receiver). APPENDED after params so the
+    // viewer-ground staging.wgsl, which declares only {light_view_proj, params},
+    // keeps its byte offsets and needs no change. ──
+    light_view_proj1 : mat4x4<f32>,  // cascade 1 (planet CSM; identity in the viewer)
+    light_view_proj2 : mat4x4<f32>,  // cascade 2
+    params2          : vec4<f32>,    // (cascade_count, use_view_pos, depth_bias, _)
 }
-@group(1) @binding(0) var shadow_map     : texture_depth_2d;
-@group(1) @binding(1) var shadow_sampler : sampler_comparison;
-@group(1) @binding(2) var<uniform> shadow : ShadowUniforms;
+@group(1) @binding(0)  var shadow_map     : texture_depth_2d; // cascade 0
+@group(1) @binding(1)  var shadow_sampler : sampler_comparison;
+@group(1) @binding(2)  var<uniform> shadow : ShadowUniforms;
+// Planet CSM cascades 1 & 2 (high bindings so the viewer's existing 0-9 layout is
+// unperturbed). In the viewer these point at the single self-shadow map (unused;
+// cascade_count = 1).
+@group(1) @binding(10) var shadow_map1    : texture_depth_2d; // cascade 1
+@group(1) @binding(11) var shadow_map2    : texture_depth_2d; // cascade 2
 
 // ── IBL (set 1, bindings 3-5) — dryad's HDRI lighting, baked on the CPU. ──────
 //   binding 3 : the equirect HDRI as a roughness-indexed MIP CHAIN (texture_2d).
@@ -187,59 +198,77 @@ const SHADOW_NORMAL_BIAS : f32 = 0.02;   // dryad shadow.normalBias (world units
 // // ponytail: 3×3 (9 taps) is the smallest grid that reads as "soft" not
 // // "stair-stepped"; dryad's PCFSoftShadowMap is a ~5-tap poisson-ish kernel of
 // // similar radius, so 3×3 over a 2× hardware compare matches its blur closely.
-fn sample_shadow(world_pos: vec3<f32>, world_normal: vec3<f32>, ndl: f32) -> f32 {
-    if (shadow.params.z < 0.5) {
-        return 1.0;                       // shadows disabled → fully lit
-    }
-    // normalBias: push the receiver point out along its normal before projecting,
-    // proportional to the grazing angle (more offset when the sun is glancing).
-    let slope = clamp(1.0 - ndl, 0.0, 1.0);
-    let biased = world_pos + world_normal * (SHADOW_NORMAL_BIAS * (0.4 + slope));
+// WGSL can't dynamically index either the matrix struct fields or the separate
+// texture bindings, so both go through a small switch.
+fn cascade_matrix(i: u32) -> mat4x4<f32> {
+    if (i == 0u) { return shadow.light_view_proj; }
+    if (i == 1u) { return shadow.light_view_proj1; }
+    return shadow.light_view_proj2;
+}
 
-    let clip = shadow.light_view_proj * vec4<f32>(biased, 1.0);
-    if (clip.w <= 0.0) {
-        return 1.0;
+fn cascade_sample(c: u32, uv: vec2<f32>, ref_depth: f32) -> f32 {
+    // textureSampleCompareLevel (explicit LOD, no derivatives) → safe inside the
+    // non-uniform cascade switch (textureSampleCompare would need uniform flow).
+    switch (c) {
+        case 0u:  { return textureSampleCompareLevel(shadow_map,  shadow_sampler, uv, ref_depth); }
+        case 1u:  { return textureSampleCompareLevel(shadow_map1, shadow_sampler, uv, ref_depth); }
+        default:  { return textureSampleCompareLevel(shadow_map2, shadow_sampler, uv, ref_depth); }
     }
-    let ndc = clip.xyz / clip.w;
-    // Outside the light frustum (XY) → unshadowed. Vulkan clip XY is [-1,1].
-    if (ndc.x < -1.0 || ndc.x > 1.0 || ndc.y < -1.0 || ndc.y > 1.0) {
-        return 1.0;
-    }
-    // Light-space UV: NDC [-1,1] → [0,1]; Vulkan +Y is down so V is not flipped.
-    let uv = ndc.xy * 0.5 + vec2<f32>(0.5, 0.5);
-    // Reversed-Z: depth INCREASES toward the light (near→1, far→0), and the map
-    // keeps the closest (GREATEST) caster depth. The receiver is lit where its
-    // depth >= the stored caster depth. To kill self-shadow acne we push the
-    // receiver's compare depth TOWARD the light (ADD the bias) so true surfaces
-    // sit just in front of their own caster sample. (Forward-Z would subtract;
-    // reversed-Z flips the sign — matching dryad's -0.0005 magnitude.)
-    let ref_depth = clamp(ndc.z + SHADOW_DEPTH_BIAS, 0.0, 1.0);
+}
 
-    let texel = shadow.params.x;
-    // DAPPLED (params.w): the high-res 4096 map resolves the leaf gaps into hard
-    // sun-spots; a wider 5×5 grid (literal-bounded → naga-safe) softens those
-    // edges back to a dryad-like penumbra so the dappling reads as soft light, not
-    // stair-stepped aliasing. OFF keeps the exact 3×3 (9-tap) kernel → byte-
-    // identical to today's look.
+// Pick the tightest cascade whose [0,1] uv contains the normal-biased point. Bias
+// scales ×2^c (coarser cascade → bigger texels). 1:1 with nanite_draw.wgsl.
+fn select_cascade(p: vec3<f32>, n: vec3<f32>, count: u32, uv_out: ptr<function, vec2<f32>>, ref_out: ptr<function, f32>) -> u32 {
+    let normal_bias = shadow.params.y;
+    let depth_bias  = shadow.params2.z;
+    for (var i = 0u; i < 3u; i = i + 1u) {
+        if (i >= count) { break; }
+        let scale = f32(1u << i);
+        let pb = p + n * (normal_bias * scale);
+        let clip = cascade_matrix(i) * vec4<f32>(pb, 1.0);
+        if (clip.w <= 0.0) { continue; }
+        let ndc = clip.xyz / clip.w;
+        let uv = ndc.xy * 0.5 + vec2<f32>(0.5, 0.5);
+        let m = 0.02; // margin so the PCF kernel never reads past the cascade edge
+        if (uv.x > m && uv.x < 1.0 - m && uv.y > m && uv.y < 1.0 - m && ndc.z > 0.0 && ndc.z < 1.0) {
+            *uv_out = uv;
+            *ref_out = clamp(ndc.z + depth_bias * scale, 0.0, 1.0);
+            return i;
+        }
+    }
+    return 3u; // outside every cascade
+}
+
+// Cascaded sun shadow (PCF). 1 = lit, 0 = fully shadowed. ONE path for both the
+// viewer (cascade_count = 1, tree-local) and the planet (3 cascades, camera-
+// relative) — the caller passes the matching receiver position (params2.y selects
+// view_pos). Mirrors nanite_draw.wgsl / character.wgsl so trees sit in the SAME
+// shadows as the ground they grow on.
+fn sample_shadow(recv_pos: vec3<f32>, world_normal: vec3<f32>) -> f32 {
+    if (shadow.params.z < 0.5) { return 1.0; }    // shadows disabled → fully lit
+    let count = max(u32(shadow.params2.x + 0.5), 1u);
+    var uv = vec2<f32>(0.0, 0.0);
+    var ref_depth = 0.0;
+    let c = select_cascade(recv_pos, world_normal, count, &uv, &ref_depth);
+    if (c >= 3u) { return 1.0; }                  // outside every cascade → lit
+    // Texel from the actual map dimension (robust to the planet vs viewer map size
+    // and the VRAM-fail halving) — all cascades share the same pixel size.
+    let texel = 1.0 / f32(textureDimensions(shadow_map).x);
+    // DAPPLED (params.w): wider 5×5 kernel softens the high-res leaf-gap sun-spots
+    // into a dryad-like penumbra. OFF keeps the 3×3 (9-tap) kernel.
     let dappled = shadow.params.w > 0.5;
     var sum = 0.0;
     if (dappled) {
-        // 5×5 grid (25 taps) over the comparison sampler.
         for (var dy = -2; dy <= 2; dy = dy + 1) {
             for (var dx = -2; dx <= 2; dx = dx + 1) {
-                let ofs = vec2<f32>(f32(dx), f32(dy)) * texel;
-                sum = sum + textureSampleCompare(shadow_map, shadow_sampler, uv + ofs, ref_depth);
+                sum = sum + cascade_sample(c, uv + vec2<f32>(f32(dx), f32(dy)) * texel, ref_depth);
             }
         }
         return sum / 25.0;
     }
-    // 3×3 grid (literal-bounded → naga-safe).
     for (var dy = -1; dy <= 1; dy = dy + 1) {
         for (var dx = -1; dx <= 1; dx = dx + 1) {
-            let ofs = vec2<f32>(f32(dx), f32(dy)) * texel;
-            // Reversed-Z compare: lit where receiver depth >= caster depth, i.e.
-            // textureSampleCompare with GREATER_OR_EQUAL semantics (sampler op).
-            sum = sum + textureSampleCompare(shadow_map, shadow_sampler, uv + ofs, ref_depth);
+            sum = sum + cascade_sample(c, uv + vec2<f32>(f32(dx), f32(dy)) * texel, ref_depth);
         }
     }
     return sum / 9.0;
@@ -881,8 +910,10 @@ fn fs_branch(in: BranchVsOut) -> @location(0) vec4<f32> {
 
     let ao = clamp(in.ao, 0.0, 1.0);
     let v  = normalize(-in.view_pos);
-    let ndl0   = dot(n, frame.sun0_dir.xyz);
-    let shadow_f = sample_shadow(in.shadow_pos, n, ndl0);
+    // Receiver pos: tree-local (viewer) or camera-relative (planet CSM), matching
+    // the bound cascade matrices' space (params2.y = use_view_pos).
+    let recv = select(in.shadow_pos, in.view_pos, shadow.params2.y > 0.5);
+    let shadow_f = sample_shadow(recv, n);
 
     // DAPPLED: trim the bark's INDIRECT (sky/IBL) fill in shadowed regions so the
     // canopy's sun-spots read on the trunk too. OFF → 1.0 (byte-identical).
@@ -1231,8 +1262,10 @@ fn fs_leaf(in: LeafVsOut, @builtin(front_facing) front: bool) -> @location(0) ve
     let v = normalize(-in.view_pos);
     // SUN0 (key) is the shadow-caster: PCF-gate it. The leaf casts cutout shadows
     // (alpha-tested depth pass), so leaves shadow each other + the ground.
-    let ndl0 = dot(n, frame.sun0_dir.xyz);
-    let shadow_f = sample_shadow(in.shadow_pos, n, ndl0);
+    let ndl0 = dot(n, frame.sun0_dir.xyz); // also drives the backlit sun_exp below
+    // Receiver pos: tree-local (viewer) or camera-relative (planet) — see fs_branch.
+    let recv = select(in.shadow_pos, in.view_pos, shadow.params2.y > 0.5);
+    let shadow_f = sample_shadow(recv, n);
     // DAPPLED: trim the INDIRECT (sky/IBL) fill in shadowed leaves so the sun-spots
     // punch through instead of being filled back in by un-shadowed IBL. Floor 0.4
     // keeps shaded interior leaves from going black. OFF → 1.0 (byte-identical).

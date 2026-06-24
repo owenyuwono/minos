@@ -15,14 +15,38 @@
 
 #![allow(dead_code)]
 
-use bytemuck::cast_slice;
+use bytemuck::{cast_slice, Pod, Zeroable};
 use enki_render::{
     camera::Camera, frame::FrameUniforms, material::ChunkPush, terrain_pass::TERRAIN_WGSL,
 };
 use enki_rhi::{
-    vk, BufferHandle, GraphicsPipelineDesc, PipelineHandle, Rhi, RhiError, ShaderModule,
+    vk, BindingDesc, BufferHandle, GraphicsPipelineDesc, PipelineHandle, Rhi, RhiError, ShaderModule,
 };
 use glam::{DVec3, Mat4, Vec3, Vec4};
+
+/// Lit character shader that RECEIVES the 3-cascade sun CSM (own descriptor set:
+/// frame + 3 cascade depth maps + comparison sampler). See `character.wgsl`.
+const CHARACTER_WGSL: &str = include_str!("character.wgsl");
+
+/// Number of sun shadow cascades — MUST match `character.wgsl` SHADOW_CASCADES and
+/// `enki_nanite::render::SHADOW_CASCADES`.
+const SHADOW_CASCADES: u32 = 3;
+
+/// GPU mirror of `character.wgsl`'s `CharFrame` UBO (std140-friendly, all vec4/mat4).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CharFrame {
+    view_proj:     [[f32; 4]; 4],
+    sun0_dir:      [f32; 4],
+    sun0_color:    [f32; 4],
+    sun1_dir:      [f32; 4],
+    sun1_color:    [f32; 4],
+    hemi_sky:      [f32; 4],
+    hemi_ground:   [f32; 4],
+    ambient:       [f32; 4],
+    cascade_vp:    [[[f32; 4]; 4]; SHADOW_CASCADES as usize], // camera-relative world → light clip
+    shadow_params: [f32; 4], // [depth_bias, normal_bias, strength, enabled]
+}
 
 /// Depth-only sun-shadow caster shader: project the skinned position by the
 /// light's (view-proj × model). No fragment (depth-only). Reads only location 0
@@ -224,7 +248,18 @@ fn solve_pose(phase: f32, speed: f32) -> [Mat4; NUM_BONES] {
 /// A CPU-skinned humanoid the third-person controller drives. Owns its draw
 /// pipeline + the static colour/index buffers + a per-frame position/normal ring.
 pub struct Character {
+    /// Fallback lit pipeline (shared terrain shader, NO shadow receiving). Used
+    /// only when no sun shadow map exists (e.g. the classic `--no-default-features`
+    /// build, or before Nanite finishes loading).
     pipeline: PipelineHandle,
+    /// Lit pipeline that RECEIVES the 3-cascade CSM (own set: frame + cascades +
+    /// comparison sampler). The default path on the planet.
+    csm_pipeline: PipelineHandle,
+    csm_layout: vk::DescriptorSetLayout,
+    /// Per-frame-in-flight CharFrame UBO + descriptor set (cascade views re-pointed
+    /// each frame; the comparison sampler + UBO binding are written here too).
+    csm_frame_ubo: Vec<BufferHandle>,
+    csm_set: Vec<vk::DescriptorSet>,
     /// Depth-only caster pipeline for the sun shadow map (1× D32).
     shadow_pipeline: PipelineHandle,
 
@@ -290,6 +325,44 @@ impl Character {
         })?;
         rhi.destroy_shader_module(depth_shader);
 
+        // CSM-receiving lit pipeline: own descriptor set (set0) = frame UBO + 3
+        // cascade depth textures + comparison sampler. Same 4×vec3 vertex layout +
+        // ChunkPush as the terrain pipeline, so the skinned streams bind unchanged.
+        let vf = vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT;
+        let frag = vk::ShaderStageFlags::FRAGMENT;
+        let mut csm_bindings = vec![BindingDesc {
+            binding: 0,
+            ty: vk::DescriptorType::UNIFORM_BUFFER,
+            stages: vf,
+        }];
+        for c in 0..SHADOW_CASCADES {
+            csm_bindings.push(BindingDesc {
+                binding: 1 + c,
+                ty: vk::DescriptorType::SAMPLED_IMAGE,
+                stages: frag,
+            });
+        }
+        csm_bindings.push(BindingDesc {
+            binding: 1 + SHADOW_CASCADES,
+            ty: vk::DescriptorType::SAMPLER,
+            stages: frag,
+        });
+        let csm_layout = rhi.create_descriptor_set_layout(&csm_bindings)?;
+        let csm_shader = rhi.create_shader_module(CHARACTER_WGSL)?;
+        let csm_pipeline = rhi.create_graphics_pipeline(&GraphicsPipelineDesc {
+            shader: csm_shader,
+            vs_entry: "vs_main",
+            fs_entry: "fs_main",
+            push_constant_size: std::mem::size_of::<ChunkPush>() as u32,
+            set0_layout: csm_layout,
+            color_format,
+            depth_format: vk::Format::D32_SFLOAT,
+            samples,
+            blend: false,
+            fill: true,
+        })?;
+        rhi.destroy_shader_module(csm_shader);
+
         // Static colour stream; the plate slot reuses it (mode 0 ignores plate).
         let col = rhi.create_vertex_buffer(cast_slice(&rest.col))?;
         let idx = rhi.create_index_buffer(&rest.idx)?;
@@ -299,13 +372,28 @@ impl Character {
         let frames = rhi.frames_in_flight();
         let mut pos_ring = Vec::with_capacity(frames);
         let mut nrm_ring = Vec::with_capacity(frames);
+        let mut csm_frame_ubo = Vec::with_capacity(frames);
+        let mut csm_set = Vec::with_capacity(frames);
         for _ in 0..frames {
             pos_ring.push(rhi.create_gpu_buffer(stream_bytes, true, vk::BufferUsageFlags::VERTEX_BUFFER)?);
             nrm_ring.push(rhi.create_gpu_buffer(stream_bytes, true, vk::BufferUsageFlags::VERTEX_BUFFER)?);
+            let ubo = rhi.create_gpu_buffer(
+                std::mem::size_of::<CharFrame>() as u64,
+                true,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+            )?;
+            let set = rhi.allocate_descriptor_set(csm_layout)?;
+            rhi.write_uniform_binding(set, 0, ubo)?;
+            csm_frame_ubo.push(ubo);
+            csm_set.push(set);
         }
 
         Ok(Self {
             pipeline,
+            csm_pipeline,
+            csm_layout,
+            csm_frame_ubo,
+            csm_set,
             shadow_pipeline,
             col,
             idx,
@@ -350,6 +438,7 @@ impl Character {
 
     /// Draw the character at `feet` (world f64) facing `facing` (unit tangent).
     /// Call inside the opaque 3D pass, after terrain/Nanite and before the ocean.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
         rhi: &mut Rhi,
@@ -358,6 +447,8 @@ impl Character {
         camera: &Camera,
         feet: DVec3,
         facing: Vec3,
+        cascade_vps: [Mat4; SHADOW_CASCADES as usize],
+        shadow_params: [f32; 4],
     ) -> Result<(), RhiError> {
         // Local→world basis: +Y = surface up, +Z = facing, +X = up × forward
         // (right-handed, det +1 → winding preserved for cull-BACK).
@@ -374,12 +465,49 @@ impl Character {
 
         let fidx = fi as usize;
         rhi.set_viewport_scissor_full(fi);
-        rhi.bind_pipeline(fi, self.pipeline)?;
-        rhi.update_frame_uniforms(fi, bytemuck::bytes_of(fu))?;
-        rhi.bind_vertex_buffers(fi, &[self.pos_ring[fidx], self.nrm_ring[fidx], self.col, self.col])?;
-        rhi.bind_index_buffer(fi, self.idx)?;
-        rhi.push_constants(fi, bytemuck::bytes_of(&push))?;
-        rhi.draw_indexed(fi, self.index_count);
+
+        // CSM-receiving path (the planet default). Falls back to the shared terrain
+        // pipeline (no shadows) only when no shadow map exists.
+        if rhi.has_shadow_map() {
+            let cf = CharFrame {
+                view_proj: fu.view_proj,
+                sun0_dir: fu.sun0_dir,
+                sun0_color: fu.sun0_color,
+                sun1_dir: fu.sun1_dir,
+                sun1_color: fu.sun1_color,
+                hemi_sky: fu.hemi_sky,
+                hemi_ground: fu.hemi_ground,
+                ambient: fu.ambient,
+                cascade_vp: cascade_vps.map(|m| m.to_cols_array_2d()),
+                shadow_params,
+            };
+            rhi.write_storage_bytes(self.csm_frame_ubo[fidx], bytemuck::bytes_of(&cf))?;
+            let set = self.csm_set[fidx];
+            let read = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+            for c in 0..SHADOW_CASCADES {
+                rhi.write_sampled_image_binding(set, 1 + c, rhi.shadow_map_view(fi, c), read);
+            }
+            rhi.write_sampler_binding(set, 1 + SHADOW_CASCADES, rhi.shadow_map_sampler());
+            let layout = rhi.pipeline_layout(self.csm_pipeline)?;
+            rhi.cmd_bind_pipeline(fi, vk::PipelineBindPoint::GRAPHICS, self.csm_pipeline)?;
+            rhi.cmd_bind_descriptor_set(fi, vk::PipelineBindPoint::GRAPHICS, layout, 0, set);
+            rhi.bind_vertex_buffers(fi, &[self.pos_ring[fidx], self.nrm_ring[fidx], self.col, self.col])?;
+            rhi.bind_index_buffer(fi, self.idx)?;
+            rhi.cmd_push_constants(
+                fi,
+                layout,
+                vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                bytemuck::bytes_of(&push),
+            );
+            rhi.draw_indexed(fi, self.index_count);
+        } else {
+            rhi.bind_pipeline(fi, self.pipeline)?;
+            rhi.update_frame_uniforms(fi, bytemuck::bytes_of(fu))?;
+            rhi.bind_vertex_buffers(fi, &[self.pos_ring[fidx], self.nrm_ring[fidx], self.col, self.col])?;
+            rhi.bind_index_buffer(fi, self.idx)?;
+            rhi.push_constants(fi, bytemuck::bytes_of(&push))?;
+            rhi.draw_indexed(fi, self.index_count);
+        }
         Ok(())
     }
 
@@ -445,6 +573,27 @@ mod tests {
         validator
             .validate(&module)
             .unwrap_or_else(|e| panic!("character depth WGSL failed to validate: {e:?}"));
+    }
+
+    #[test]
+    fn character_wgsl_validates() {
+        let module = naga::front::wgsl::parse_str(CHARACTER_WGSL)
+            .unwrap_or_else(|e| panic!("character WGSL failed to parse: {e:?}"));
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        validator
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("character WGSL failed to validate: {e:?}"));
+    }
+
+    /// The CharFrame UBO must stay std140-friendly (all 16-byte lanes).
+    #[test]
+    fn char_frame_is_16b_aligned() {
+        assert_eq!(std::mem::size_of::<CharFrame>() % 16, 0);
+        // 64 (mat4) + 7×16 + 3×64 (cascades) + 16 = 384.
+        assert_eq!(std::mem::size_of::<CharFrame>(), 384);
     }
 
     #[test]

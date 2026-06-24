@@ -131,9 +131,15 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // Albedo: intrinsic water color × vertex tint (vertex color used as multiplier)
     let albedo = WATER_COLOR * in.vert_color;
 
+    // Day/night: fade the sky-fill (ambient + hemisphere) by local sun elevation so
+    // the night hemisphere darkens and the terminator reads from orbit (matches the
+    // terrain + wave-ocean fade). `n` is the outward sphere normal = local radial up;
+    // the directional terms already fade via N·L. 0.05 = night floor (vs space).
+    let day = mix(0.05, 1.0, smoothstep(-0.2, 0.0, dot(n, frame.sun0_dir.xyz)));
+
     // Diffuse lighting
-    let ambient_term = frame.ambient.xyz * albedo;
-    let hemi_term    = hemisphere_ambient(n, frame.hemi_sky.xyz, frame.hemi_ground.xyz) * albedo;
+    let ambient_term = frame.ambient.xyz * albedo * day;
+    let hemi_term    = hemisphere_ambient(n, frame.hemi_sky.xyz, frame.hemi_ground.xyz) * albedo * day;
     let diff0        = directional_diffuse(n, frame.sun0_dir.xyz, frame.sun0_color.xyz) * albedo;
     let diff1        = directional_diffuse(n, frame.sun1_dir.xyz, frame.sun1_color.xyz) * albedo;
 

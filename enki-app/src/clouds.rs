@@ -67,7 +67,12 @@ impl Default for CloudParams {
     fn default() -> Self {
         Self {
             coverage: 0.6,
-            density: 0.12,
+            // Extinction/m. The OLD 0.12 was opaque + textured but read WHITE (no tonemap)
+            // and as a SHEET (saturated coverage). Now that the body is ACES-tonemapped and
+            // coverage is region-masked, density can sit high enough for dense, self-shadowed
+            // BILLOW texture without going white/sheet — 0.015 gives opaque cores (strong
+            // self-shadow detail) with a few-step soft edge. (0.12→1-step opaque slab.)
+            density: 0.015,
             base_alt_m: 2000.0,
             thickness_m: 3000.0,
             wind_speed: 1500.0,
@@ -76,10 +81,14 @@ impl Default for CloudParams {
             hg_g: 0.4,
             cloud_type: 0.6,
             powder: 0.3,
-            curl: 0.3,
-            moisture_influence: 0.7,
-            form_rate: 0.06,
-            decay_rate: 0.02,
+            curl: 0.5,
+            moisture_influence: 1.0,
+            // form/decay set the worker's steady-state coverage c* = form·p/(form·p+decay).
+            // The old 0.06/0.02 left even mean-moisture cells at c*~0.35 (above threshold),
+            // so SL diffusion crept the field across the whole planet. Stronger decay keeps
+            // c* patchy (only genuinely moist cells stay cloudy) and bounds the spread.
+            form_rate: 0.12,
+            decay_rate: 0.06,
         }
     }
 }

@@ -41,39 +41,49 @@ use crate::cubemap::{neighbor_texel, sample_smooth, texel_index, texel_to_dir};
 // foot: RES=256 → ~610 m channel, and CARVE_AMP 0.10·1200 = 120 m deep with a 60 m
 // floor on EVERY brook. See the river-scale-fix design.)
 /// Carving cube-map resolution per face. Bake cost is `6·RES²` routing-height calls.
-/// 1024 = NANITE_BAKE_RES, so one carve cell ≈ one mesh cell (~77 m) — the finest a
-/// channel can faithfully render. (Below this the carve smears across mesh cells.)
-const RES: usize = 1024;
+/// MUST track `NANITE_BAKE_RES` (enki-app, currently 2048) so one carve cell ≈ one
+/// mesh cell (~38 m) — the finest a channel can faithfully render. If the carve lags
+/// the mesh, IT becomes the width bottleneck and rivers smear back into wide valleys
+/// (the whole reason for the 2048 bump). At 2048 a cube face ≈ 78.5 km/2048 ≈ 38 m
+/// per cell, so a 1-cell channel ≈ 38 m and the bank walls regrade over ~38 m steps.
+const RES: usize = 2048;
 /// `HeightField` LOD for the routing height (broad valleys drive the paths).
 const ROUTE_LEVEL: u32 = 6;
 /// Rainfall per land cell feeding accumulation = `RAIN_FLOOR + (1-floor)·moisture`,
 /// so wet "aquifer" highlands spawn rivers and arid land stays mostly dry, but no
 /// land is bone-dry (floor keeps a faint network everywhere).
 const RAIN_FLOOR: f64 = 0.15;
-/// A land cell becomes a river once this much upstream rainfall drains through it
-/// (≈ catchment cells × mean rain). THE density knob — lower = finer tributaries.
-/// Res-independent (keys off rainfall, not cell count) so the network is unchanged
-/// across RES.
-const RIVER_THRESHOLD: f64 = 35.0;
-/// Accumulation (above threshold) at which a channel hits full depth — the
-/// threshold→TRUNK_FULL band maps a headwater stream up to a major trunk.
-const TRUNK_FULL: f64 = 1200.0;
-/// Full-trunk valley-floor depth (normalized): 0.040·1200 ≈ 48 m. A major-river
-/// gorge on a 50 km planet, not the old 120 m rift.
-const CARVE_AMP: f64 = 0.040;
+/// Reference resolution the accumulation thresholds below are calibrated at. Rain is
+/// area-weighted to THIS grid (see `cell_weight`), so RIVER_THRESHOLD / TRUNK_FULL
+/// mean the same physical drainage area regardless of the actual `RES`.
+const THR_REF_RES: usize = 1024;
+/// Upstream drainage AREA (in THR_REF_RES-cell units) at which a cell becomes a river.
+/// THE scarcity knob — RAISE = fewer, only larger rivers (prunes small headwater
+/// tributaries); lower = denser. Area-weighted, so resolution-stable.
+const RIVER_THRESHOLD: f64 = 250.0;
+/// Accumulation at which a channel hits FULL depth. Accumulation is power-law
+/// (median ~few hundred, max ~90k), so this must sit high on that range or the depth
+/// SATURATES (the old 1200 pegged 80%+ of rivers at max → all looked "huge"). At 40k
+/// only the top few % of trunks reach full depth; everything below spreads down the
+/// `t^DEPTH_EXP` curve → real size variation, most rivers small.
+const TRUNK_FULL: f64 = 40_000.0;
+/// Full-trunk valley-floor depth (normalized): 0.065·1200 ≈ 78 m. A deep, sharply
+/// incised major-river gorge (was 48 m — too shallow/gentle a dish).
+const CARVE_AMP: f64 = 0.065;
 /// Depth-vs-discharge exponent (Leopold–Maddock hydraulic geometry, `d ∝ Q^~0.4`):
 /// `depth = CARVE_AMP·t^DEPTH_EXP`, so tributaries cut shallow and only big trunks
 /// cut deep (the old `DEPTH_FLOOR` made EVERY stream a 60 m trench).
 const DEPTH_EXP: f64 = 0.40;
-/// Floor depth for the faintest headwater (normalized): 0.0035·1200 ≈ 4.2 m — a
+/// Floor depth for the faintest headwater (normalized): 0.005·1200 ≈ 6 m — a
 /// believable brook ditch you can step across, not a canyon.
-const MIN_DEPTH: f64 = 0.0035;
-/// Valley-flank width in mesh cells the bank ramps outward → a gentle, sample-able
-/// valley (the only mesh-resolvable part). 2·~77 m ≈ 150 m flank each side.
+const MIN_DEPTH: f64 = 0.005;
+/// Valley-flank width in mesh cells the bank ramps outward → keeps the (good) width
+/// while STEEPENING the walls via the steeper falloff below. 2·~77 m ≈ 150 m each side.
 const BANK_CELLS: usize = 2;
-/// Depth lost per cell of bank ramp: 0.018·1200 ≈ 22 m/cell over ~77 m ≈ 1:3.5 bank,
-/// so a 48 m trunk valley rises back to grade in ~2 cells (tight, not a wide dish).
-const BANK_FALLOFF: f64 = 0.018;
+/// Depth lost per cell of bank ramp: 0.033·1200 ≈ 40 m/cell over ~77 m ≈ 1:1.9 wall
+/// (was 1:3.5). A 78 m trunk regrades in ~2 cells → a steep-sided V at the same
+/// footprint, not a gentle dish. THE steepness knob (raise = steeper walls).
+const BANK_FALLOFF: f64 = 0.033;
 
 const SINK: u32 = u32::MAX;
 const NB_DX: [i32; 8] = [-1, 0, 1, -1, 1, -1, 0, 1];
@@ -122,7 +132,13 @@ impl RiverCarve {
         let res = RES;
         let n = 6 * res * res;
 
-        // 1. Sample routing height + moisture.
+        // 1. Sample routing height + moisture. Rain is weighted by CELL AREA (relative
+        //    to the THR_REF_RES reference grid) so accumulation = physical drainage
+        //    AREA, not cell count — otherwise a finer grid (more cells per catchment)
+        //    inflates accumulation ∝ RES² and silently multiplies river density +
+        //    saturates the depth curve. With this weight, RIVER_THRESHOLD/TRUNK_FULL
+        //    are calibrated once (at THR_REF_RES) and stay stable across RES.
+        let cell_weight = (THR_REF_RES as f64 / res as f64).powi(2);
         let mut height = vec![0.0f32; n];
         let mut rain = vec![0.0f64; n];
         for face in 0..6usize {
@@ -131,7 +147,7 @@ impl RiverCarve {
                     let c = texel_index(face, x, y, res);
                     let dir = texel_to_dir(face, x, y, res);
                     height[c] = route_h(dir, ROUTE_LEVEL) as f32;
-                    rain[c] = RAIN_FLOOR + (1.0 - RAIN_FLOOR) * moisture(dir).clamp(0.0, 1.0);
+                    rain[c] = (RAIN_FLOOR + (1.0 - RAIN_FLOOR) * moisture(dir).clamp(0.0, 1.0)) * cell_weight;
                 }
             }
         }
@@ -196,6 +212,22 @@ impl RiverCarve {
                 let t = ((acc[c] - RIVER_THRESHOLD) / (TRUNK_FULL - RIVER_THRESHOLD)).clamp(0.0, 1.0);
                 depth[c] = MIN_DEPTH.max(CARVE_AMP * t.powf(DEPTH_EXP)) as f32;
             }
+        }
+
+        // Diagnostic (env-gated): accumulation + depth distribution among river cells,
+        // to calibrate the depth curve / TRUNK_FULL. `RIVER_STATS=1 cargo test ...`.
+        if std::env::var("RIVER_STATS").is_ok() {
+            let mut accs: Vec<f64> = (0..n).filter(|&c| is_river[c]).map(|c| acc[c]).collect();
+            let mut deps: Vec<f64> = (0..n).filter(|&c| is_river[c]).map(|c| depth[c] as f64 * 1200.0).collect();
+            accs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            deps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let pct = |v: &[f64], p: f64| v.get(((v.len() as f64 * p) as usize).min(v.len().saturating_sub(1))).copied().unwrap_or(0.0);
+            eprintln!(
+                "RIVER_STATS cells={} | acc p50={:.0} p80={:.0} p90={:.0} p99={:.0} max={:.0} (TRUNK_FULL={}) | depth_m p50={:.0} p80={:.0} p90={:.0} p99={:.0} max={:.0}",
+                accs.len(),
+                pct(&accs,0.5), pct(&accs,0.8), pct(&accs,0.9), pct(&accs,0.99), accs.last().copied().unwrap_or(0.0), TRUNK_FULL,
+                pct(&deps,0.5), pct(&deps,0.8), pct(&deps,0.9), pct(&deps,0.99), deps.last().copied().unwrap_or(0.0),
+            );
         }
 
         // 5. Dilate the depth into banks (grayscale dilation keeps the floor, ramps

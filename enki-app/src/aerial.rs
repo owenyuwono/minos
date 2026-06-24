@@ -44,7 +44,12 @@ impl Default for AerialParams {
         // Tuned for R≈50 km: a ~10 km optical top with a ~2 km scale height (limb
         // thins to vacuum well before the top), blue onset over ~10 km of path, a
         // modest in-scatter so the LDR composite doesn't blow out. USER-tuned live.
-        Self { height: 10_000.0, beta: 1.0e-4, intensity: 0.8, sky_strength: 1.0, falloff: 2_000.0 }
+        // sky_strength multiplies ONLY the overhead-dome (sky) pixels (no separate
+        // SkyModel pass — this dome IS the sky over the near-black clear). It's a
+        // narrow window: too low → dark blue, too high → the blue channel clips and
+        // the sky desaturates to grey/white. ~2.0 sits between; β raises depth/hue.
+        // All USER-tuned live via the Aerial GUI sliders.
+        Self { height: 10_000.0, beta: 1.0e-4, intensity: 0.8, sky_strength: 2.0, falloff: 2_000.0 }
     }
 }
 

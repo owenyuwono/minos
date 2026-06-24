@@ -584,6 +584,25 @@ mod tests {
         }
     }
 
+    /// Time the bake's STRUCTURAL cost (tessellate+cluster+DAG) vs resolution, with a
+    /// cheap height field — isolates the res² scaling from the real height() sampling.
+    /// Run: cargo test -p enki-nanite --release time_bake_res -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn time_bake_res() {
+        let hf = SimpleHeightField { noise: Noise3D::new(5) };
+        for res in [1024u32, 2048] {
+            let t = std::time::Instant::now();
+            let (assets, bt) = bake_planet(&hf, 50_000.0, 1_200.0, res);
+            let tris: usize = assets.iter().map(|a| a.clusters.iter().map(|c| c.triangles.len()).sum::<usize>()).sum();
+            let clusters: usize = assets.iter().map(|a| a.clusters.len()).sum();
+            eprintln!(
+                "BAKE res={res}: wall {:.1}s (tess {:.0} clu {:.0} dag {:.0} ms slowest-face) | {clusters} clusters, {tris} tris",
+                t.elapsed().as_secs_f64(), bt.tessellate_ms, bt.clusters_ms, bt.dag_ms,
+            );
+        }
+    }
+
     #[test]
     fn bake_planet_covers_six_faces() {
         let hf = SimpleHeightField { noise: Noise3D::new(5) };

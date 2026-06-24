@@ -8,6 +8,7 @@ members = [
     "enki-jobs",
     "enki-nanite",
     "enki-flora",
+    "enki-voxel",
 ]
 
 # The startup heightfield + Nanite bake is scalar-f64 transcendental-heavy

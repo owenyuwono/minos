@@ -56,6 +56,16 @@ pub const SHADOW_MAP_SIZE: u32 = 4096;
 /// The LINEAR-HDR offscreen scene format (dryad's composer targets HalfFloatType).
 const HDR_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
+/// IMPOSTOR ATLAS — one RGBA16F image holding TWO square tiles side-by-side:
+///   SIDE = u ∈ [0, TILE) (horizon-level view), TOP = u ∈ [TILE, 2·TILE) (top-down).
+/// `fs_impostor` blends them by view elevation. Baked ONCE at startup from the real
+/// tree (linear HDR, alpha = silhouette coverage). One tile is plenty at impostor
+/// distance (a tree is a few px); 512² keeps a crisp silhouette without VRAM cost.
+const IMPOSTOR_TILE: u32 = 512;
+/// Full atlas extent = 2 tiles wide × 1 tile tall (1024 × 512).
+const IMPOSTOR_ATLAS_W: u32 = IMPOSTOR_TILE * 2;
+const IMPOSTOR_ATLAS_H: u32 = IMPOSTOR_TILE;
+
 /// UnrealBloom mip count (nMips = 5). The bloom chain starts at half-res and
 /// halves each mip: res/2, res/4, res/8, res/16, res/32.
 const BLOOM_MIPS: usize = 5;
@@ -71,18 +81,28 @@ struct PostPush {
     params2: [f32; 4],
 }
 
-/// set1 / binding 2 — the light matrix + PCF params the main pass reads. Mirrors
-/// `ShadowUniforms` in flora.wgsl / staging.wgsl. 80 bytes (mat4 + vec4).
+/// set1 / binding 2 — the light matrices + PCF params the main pass reads. Mirrors
+/// `ShadowUniforms` in flora.wgsl (full) / staging.wgsl (the first {mat4,vec4}
+/// subset). 224 bytes (3×mat4 + 2×vec4).
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct ShadowUniforms {
-    /// World(tree-local) → light clip (the matrix the depth pass renders with).
+    /// Cascade 0: world → light clip (the depth-pass matrix). In the viewer this is
+    /// the single tree-local self-shadow matrix; on the planet it's CSM cascade 0.
     pub light_view_proj: [[f32; 4]; 4],
     /// (1/SHADOW_MAP_SIZE, normalBias, enabled, dappled).
     /// `.w` (dappled): 0 = today's look (real shadow + the soft canopy fakes);
     /// 1 = let the real high-res shadow dominate (soften the canopy-normal blend,
     /// lower the exposure floor, trim the ambient/IBL fill, extra PCF taps).
     pub params: [f32; 4],
+    /// Cascade 1 & 2 (planet 3-cascade CSM; identity/unused in the viewer).
+    /// APPENDED after `params` so the viewer-ground `staging.wgsl`, which declares
+    /// only `{light_view_proj, params}`, keeps its byte offsets unchanged.
+    pub light_view_proj1: [[f32; 4]; 4],
+    pub light_view_proj2: [[f32; 4]; 4],
+    /// (cascade_count, use_view_pos, depth_bias, _). cascade_count = 1 (viewer) or
+    /// 3 (planet); use_view_pos = 1 → the receiver samples camera-relative view_pos.
+    pub params2: [f32; 4],
 }
 
 /// Which owned pipeline to bind for a draw. Branch/leaf have wireframe twins;
@@ -364,6 +384,27 @@ pub struct FloraRenderer {
     /// `update_leaf_texture` (which must NOT destroy the placeholder twice).
     leaf_tex_built: bool,
 
+    // ── IMPOSTOR ATLAS (set1/binding 12) — the TOP+SIDE billboard texture baked
+    //    ONCE from the real tree in `bake_impostor`. RGBA16F linear HDR, alpha =
+    //    silhouette coverage. Sampled by `fs_impostor` with the IBL linear sampler
+    //    (binding 4). Created (cleared) at `new()`, filled at the first
+    //    `bake_impostor`; the VIEW is stable so the per-frame set1 write is
+    //    one-time (like the IBL/leaf handles). A dedicated D32 bake-depth (small,
+    //    transient-state-free) is kept only for the bake pass.
+    impostor_atlas: OwnedImage,
+    impostor_depth_image: vk::Image,
+    impostor_depth_memory: vk::DeviceMemory,
+    impostor_depth_view: vk::ImageView,
+    /// Branch/leaf BAKE pipelines (built at the atlas sample count = 1, into
+    /// HDR_FORMAT, clear-to-zero alpha). Separate from the scene pipelines because
+    /// those are MSAA / may be swapchain-format (in-scene); the bake target is a
+    /// single-sample HDR tile.
+    impostor_bake_branch: OwnedPipeline,
+    impostor_bake_leaf: OwnedPipeline,
+    /// Has the atlas been baked yet? Guards the one-shot bake + the UNDEFINED→
+    /// SHADER_READ first-transition (the cleared image starts UNDEFINED).
+    impostor_atlas_baked: bool,
+
     // ── POST (dryad RenderPass → UnrealBloomPass → OutputPass) ────────────────
     // The flora-owned offscreen HDR + bloom chain + composite/output pipelines.
     // Raw handles needed to recreate the resize-dependent targets are cached.
@@ -596,6 +637,38 @@ impl FloraRenderer {
             vk::ImageLayout::UNDEFINED,
         )?;
 
+        // ── IMPOSTOR ATLAS (set1/binding 12): a 1024×512 RGBA16F image, two square
+        //    tiles (SIDE | TOP). COLOR_ATTACHMENT (the bake renders into it) |
+        //    SAMPLED (fs_impostor reads it). Cleared/UNDEFINED until `bake_impostor`
+        //    fills it; the view is stable so the set1 write is one-time. A small
+        //    dedicated D32 bake-depth backs the tile rendering (own state, no fight
+        //    with the swapchain-sized scene depth). ──
+        let mem_props =
+            unsafe { rhi.instance_handle().get_physical_device_memory_properties(rhi.physical_device()) };
+        let impostor_atlas = create_color_image(
+            &device,
+            &mem_props,
+            vk::Extent2D { width: IMPOSTOR_ATLAS_W, height: IMPOSTOR_ATLAS_H },
+            1,
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+        )?;
+        let (impostor_depth_image, impostor_depth_memory, impostor_depth_view) =
+            create_bake_depth(&device, &mem_props, IMPOSTOR_ATLAS_W, IMPOSTOR_ATLAS_H)?;
+        // BAKE pipelines: single-sample, HDR_FORMAT, clear-to-zero-alpha tiles. The
+        // branch is 6-stream cull-BACK (same as the lit branch); the leaf 4-stream.
+        let impostor_bake_branch = build_pipeline_culled(
+            &device, pipeline_layout, flora_module, "vs_branch", "fs_branch",
+            HDR_FORMAT, vk::SampleCountFlags::TYPE_1, false, true, true,
+            vk::CullModeFlags::BACK, 6,
+        )?;
+        // Match the lit leaf pipeline's cull (BACK) so the baked canopy looks like
+        // the scene canopy (the leaf mesh emits both windings → still double-sided).
+        let impostor_bake_leaf = build_pipeline_culled(
+            &device, pipeline_layout, flora_module, "vs_leaf", "fs_leaf",
+            HDR_FORMAT, vk::SampleCountFlags::TYPE_1, false, true, true,
+            vk::CullModeFlags::BACK, 4,
+        )?;
+
         // ── Per-frame set1 (shadow) ring: each set points binding0→shadow view,
         //    binding1→compare sampler, binding2→this frame's ShadowUniforms UBO,
         //    plus the SHARED IBL bindings 3/4/5 (env mip image, linear sampler,
@@ -646,6 +719,9 @@ impl FloraRenderer {
                 leaf_normal_view,
                 leaf_tex_sampler,
             );
+            // binding 12 ← the impostor atlas (static after the one-shot bake; the
+            // image is cleared-UNDEFINED until then, but the view is valid to bind).
+            write_impostor_atlas_descriptor(&device, set, impostor_atlas.sample_view);
             // binding 6 ← this frame's bone-matrix storage buffer.
             let bone_buf = rhi.vk_buffer(bone_ubo)?;
             write_bone_descriptor(&device, set, bone_buf, bone_buf_size);
@@ -713,6 +789,13 @@ impl FloraRenderer {
             leaf_normal_view,
             leaf_tex_sampler,
             leaf_tex_built: false,
+            impostor_atlas,
+            impostor_depth_image,
+            impostor_depth_memory,
+            impostor_depth_view,
+            impostor_bake_branch,
+            impostor_bake_leaf,
+            impostor_atlas_baked: false,
             instance,
             physical_device,
             post,
@@ -754,6 +837,217 @@ impl FloraRenderer {
         Ok(())
     }
 
+    /// Bake the TWO-TILE impostor atlas (SIDE | TOP) from `view`'s real tree mesh,
+    /// ONCE at startup. Must run AFTER `update_leaf_texture` (the leaf textures must
+    /// be SHADER_READ) and after IBL (always ready post-`new()`). Records into a
+    /// transient one-shot fenced command buffer (like `upload_leaf_image`), OUTSIDE
+    /// the frame loop, so no `begin_frame`/`begin_rendering` is needed. The caller
+    /// MUST `wait_idle` first (the viewer's `rebuild` does).
+    ///
+    /// Each tile is a single-sample HDR rendering instance cleared to `[0,0,0,0]`
+    /// (so the leaf-card alpha cutout becomes the impostor silhouette), with an
+    /// ortho fit to the tree bounds along the tile's view dir (SIDE = +Z, TOP =
+    /// +Y). The branch + leaves draw at the LINEAR-HDR lane (no in-shader ACES), so
+    /// the atlas stores pre-ACES color the `fs_impostor` output ACES-es once. After
+    /// both tiles the atlas is barriered COLOR→SHADER_READ for the impostor sampler.
+    pub fn bake_impostor(
+        &mut self,
+        rhi: &mut Rhi,
+        view: &crate::flora_view::FloraView,
+    ) -> Result<(), RhiError> {
+        use enki_render::frame::FrameUniforms;
+        use enki_render::lights::Lights;
+
+        // ── Seed set0[0] base lighting (dryad rig) + set1[0] neutral shadow +
+        //    identity bone matrices (static rest pose). view_proj is overwritten
+        //    per tile below. ──
+        let base_fu = FrameUniforms::new(
+            &enki_render::camera::Camera::default_orbit(),
+            1.0,
+            &Lights::dryad_default(),
+        );
+        let neutral_shadow = ShadowUniforms {
+            light_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            params: [1.0 / SHADOW_MAP_SIZE as f32, 0.02, 0.0 /* DISABLED */, 0.0],
+            light_view_proj1: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            light_view_proj2: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            params2: [1.0, 0.0, 0.0, 0.0],
+        };
+        self.set_shadow_uniforms(rhi, 0, &neutral_shadow)?;
+        let identity_bones: Vec<f32> = {
+            let mut v = vec![0.0f32; enki_flora::mesh::MAX_WIND_BONES * 16];
+            for b in 0..enki_flora::mesh::MAX_WIND_BONES {
+                let m = glam::Mat4::IDENTITY.to_cols_array();
+                v[b * 16..b * 16 + 16].copy_from_slice(&m);
+            }
+            v
+        };
+        self.set_bone_matrices(rhi, 0, &identity_bones)?;
+
+        // Ortho fit to the tree bounds (mirrors flora_viewer::light_view_proj). A
+        // uniform cube fit (max extent) so all view dirs frame the whole tree.
+        let (bmin, bmax) = view.bake_bounds();
+        let center = (bmin + bmax) * 0.5;
+        let ext = bmax - bmin;
+        let half = 0.5 * ext.x.max(ext.y).max(ext.z).max(1.0) + 0.5;
+        let tile_vp = |dir: glam::Vec3| -> [[f32; 4]; 4] {
+            let d = dir.normalize_or(glam::Vec3::Y);
+            let eye = center + d * 50.0;
+            let up = if d.abs_diff_eq(glam::Vec3::Y, 1e-3) || d.abs_diff_eq(glam::Vec3::NEG_Y, 1e-3) {
+                glam::Vec3::Z
+            } else {
+                glam::Vec3::Y
+            };
+            let view_m = glam::Mat4::look_at_rh(eye, center, up);
+            let near_d = 1.0_f32;
+            let far_d = 100.0 + ext.y + 10.0;
+            let ortho = enki_render::projection::reversed_z_orthographic(
+                -half, half, -half, half, near_d, far_d,
+            );
+            (ortho * view_m).to_cols_array_2d()
+        };
+        // SIDE = look along +Z toward the tree; TOP = straight down (+Y).
+        let side_vp = tile_vp(glam::Vec3::Z);
+        let top_vp = tile_vp(glam::Vec3::Y);
+        // The bake eye (for the lit pass's view vector) — use the SIDE eye; a far
+        // billboard's specular is invisible, so a single representative eye is fine.
+        let se = center + glam::Vec3::Z * 50.0;
+        let side_eye = [se.x, se.y, se.z, 1.0];
+
+        // ── One-shot fenced command buffer (frame-0 pool, valid at startup). ──
+        let device = self.device.clone();
+        let pool = rhi.command_pool(0);
+        let queue = rhi.queue_handle();
+        let cmd = unsafe {
+            device.allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+        }
+        .map_err(RhiError::Vulkan)?[0];
+        unsafe {
+            device.begin_command_buffer(
+                cmd,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+        }
+        .map_err(RhiError::Vulkan)?;
+
+        // Barrier atlas UNDEFINED→COLOR_ATTACHMENT + depth UNDEFINED→DEPTH_ATTACHMENT
+        // (whole image; both tiles share one image, cleared once at instance start
+        // — but we open ONE instance per tile so the clear is scoped by the tile
+        // viewport+scissor; clearing the whole image twice is fine, the scissor
+        // confines the draw, and load_op CLEAR clears the whole render_area, which
+        // we set to the tile rect).
+        barrier_image(
+            &device, cmd, self.impostor_atlas.image, vk::ImageAspectFlags::COLOR, 0, 1,
+            vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            vk::AccessFlags::empty(), vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+        );
+        barrier_image(
+            &device, cmd, self.impostor_depth_image, vk::ImageAspectFlags::DEPTH, 0, 1,
+            vk::ImageLayout::UNDEFINED, vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+            vk::AccessFlags::empty(), vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+        );
+
+        // Record both tiles. Tile 0 = SIDE (x 0..TILE); tile 1 = TOP (x TILE..2·TILE).
+        for (tile_x, vp) in [(0u32, side_vp), (IMPOSTOR_TILE, top_vp)] {
+            // Per-tile FrameUniforms: dryad lights + this tile's ortho view_proj.
+            let mut fu = base_fu;
+            fu.view_proj = vp;
+            fu.camera_pos = side_eye;
+            self.set_frame_uniforms(rhi, 0, &fu)?;
+
+            let tile_extent = vk::Extent2D { width: IMPOSTOR_TILE, height: IMPOSTOR_TILE };
+            let color_attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(self.impostor_atlas.sample_view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                // *** alpha 0 → leaf-card coverage IS the impostor silhouette ***
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 0.0] },
+                });
+            let depth_attachment = vk::RenderingAttachmentInfo::default()
+                .image_view(self.impostor_depth_view)
+                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                .clear_value(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue { depth: 0.0, stencil: 0 },
+                });
+            // render_area = the tile rect (CLEAR clears only this rect).
+            let rendering_info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: tile_x as i32, y: 0 },
+                    extent: tile_extent,
+                })
+                .layer_count(1)
+                .color_attachments(std::slice::from_ref(&color_attachment))
+                .depth_attachment(&depth_attachment);
+            unsafe {
+                device.cmd_begin_rendering(cmd, &rendering_info);
+                // TILE-sized viewport+scissor (NOT set_viewport_scissor_full).
+                let viewport = vk::Viewport {
+                    x: tile_x as f32,
+                    y: 0.0,
+                    width: IMPOSTOR_TILE as f32,
+                    height: IMPOSTOR_TILE as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                };
+                let scissor = vk::Rect2D {
+                    offset: vk::Offset2D { x: tile_x as i32, y: 0 },
+                    extent: tile_extent,
+                };
+                device.cmd_set_viewport(cmd, 0, std::slice::from_ref(&viewport));
+                device.cmd_set_scissor(cmd, 0, std::slice::from_ref(&scissor));
+            }
+            // Branch + leaves (raw-ash binds into THIS transient cmd buffer).
+            view.record_bake_draws(
+                rhi,
+                &device,
+                cmd,
+                self.pipeline_layout,
+                self.set0[0],
+                self.set1[0],
+                self.impostor_bake_branch.pipeline,
+                self.impostor_bake_leaf.pipeline,
+            )?;
+            unsafe { device.cmd_end_rendering(cmd) };
+        }
+
+        // Atlas COLOR→SHADER_READ so `fs_impostor` can sample it.
+        barrier_image(
+            &device, cmd, self.impostor_atlas.image, vk::ImageAspectFlags::COLOR, 0, 1,
+            vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            vk::AccessFlags::COLOR_ATTACHMENT_WRITE, vk::AccessFlags::SHADER_READ,
+            vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT, vk::PipelineStageFlags::FRAGMENT_SHADER,
+        );
+
+        unsafe { device.end_command_buffer(cmd) }.map_err(RhiError::Vulkan)?;
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
+            .map_err(RhiError::Vulkan)?;
+        let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
+        unsafe {
+            device
+                .queue_submit(queue, std::slice::from_ref(&submit), fence)
+                .map_err(RhiError::Vulkan)?;
+            device
+                .wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)
+                .map_err(RhiError::Vulkan)?;
+            device.destroy_fence(fence, None);
+            device.free_command_buffers(pool, std::slice::from_ref(&cmd));
+        }
+        self.impostor_atlas_baked = true;
+        Ok(())
+    }
+
     /// The shadow-map resolution (square), for the viewer's PCF texel-size param.
     pub fn shadow_map_size(&self) -> u32 {
         SHADOW_MAP_SIZE
@@ -784,6 +1078,39 @@ impl FloraRenderer {
         su: &ShadowUniforms,
     ) -> Result<(), RhiError> {
         rhi.write_storage_bytes(self.shadow_ubos[fi as usize], bytemuck::bytes_of(su))
+    }
+
+    /// Re-point this frame's set1 shadow textures (cascade 0/1/2 = bindings 0/10/11)
+    /// at EXTERNAL depth views — the planet's 3-cascade CSM maps — so the trees
+    /// receive the SAME shadows as the ground instead of their own self-shadow map.
+    /// Call once per frame before the scene draw (with `cascade_count = 3`,
+    /// `use_view_pos = 1` in the `ShadowUniforms`). The views must already be in
+    /// `SHADER_READ_ONLY_OPTIMAL` (the CSM caster pass leaves them so).
+    pub fn set_shadow_cascade_views(&self, fi: u32, views: [vk::ImageView; 3]) {
+        let set = self.set1[fi as usize];
+        let infos: [vk::DescriptorImageInfo; 3] = std::array::from_fn(|i| {
+            vk::DescriptorImageInfo::default()
+                .image_view(views[i])
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+        });
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(std::slice::from_ref(&infos[0])),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(10)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(std::slice::from_ref(&infos[1])),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(11)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(std::slice::from_ref(&infos[2])),
+        ];
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
     }
 
     /// Upload this frame's hierarchical-wind bone matrices into the set1/binding 6
@@ -1638,6 +1965,13 @@ impl FloraRenderer {
             self.device.destroy_image_view(self.leaf_normal_view, None);
             self.device.destroy_image(self.leaf_normal_image, None);
             self.device.free_memory(self.leaf_normal_memory, None);
+            // ── Impostor atlas + bake depth + bake pipelines. ──
+            self.device.destroy_pipeline(self.impostor_bake_branch.pipeline, None);
+            self.device.destroy_pipeline(self.impostor_bake_leaf.pipeline, None);
+            self.impostor_atlas.destroy(&self.device);
+            self.device.destroy_image_view(self.impostor_depth_view, None);
+            self.device.destroy_image(self.impostor_depth_image, None);
+            self.device.free_memory(self.impostor_depth_memory, None);
             // ── POST resources (pipelines + sampler + pool + resize targets). ──
             for op in [
                 &self.post.bright,
@@ -1852,6 +2186,27 @@ fn create_set1_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout, R
         vk::DescriptorSetLayoutBinding::default()
             .binding(9)
             .descriptor_type(vk::DescriptorType::SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        // ── PLANET CSM cascades 1 & 2 (high bindings → viewer's 0-9 layout intact).
+        //   binding 10/11 : SAMPLED_IMAGE — cascade-1/2 depth textures. In the viewer
+        //   these point at the single self-shadow map (unused; cascade_count = 1);
+        //   on the planet `set_shadow_cascade_views` re-points them at the CSM maps.
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(10)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(11)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        // ── IMPOSTOR ATLAS (binding 12) — the baked TOP+SIDE billboard texture,
+        //   sampled by `fs_impostor` (with the IBL linear sampler at binding 4). ──
+        vk::DescriptorSetLayoutBinding::default()
+            .binding(12)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
             .descriptor_count(1)
             .stage_flags(vk::ShaderStageFlags::FRAGMENT),
     ];
@@ -2078,10 +2433,11 @@ fn create_pool(device: &ash::Device, frames: u32) -> Result<vk::DescriptorPool, 
         vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::UNIFORM_BUFFER)
             .descriptor_count(frames * 3),
-        // shadow depth + IBL mip + leaf color + leaf normal images, per frame.
+        // shadow depth (×3 cascades) + IBL mip + leaf color + leaf normal +
+        // impostor atlas images, per frame (= 7).
         vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::SAMPLED_IMAGE)
-            .descriptor_count(frames * 4),
+            .descriptor_count(frames * 7),
         // compare sampler + IBL linear sampler + leaf linear sampler, per frame.
         vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::SAMPLER)
@@ -2375,6 +2731,19 @@ fn write_shadow_descriptors(
             .dst_binding(2)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .buffer_info(std::slice::from_ref(&buffer_info)),
+        // Cascade-1/2 slots default to the same (self-shadow) view so they are valid
+        // for the viewer (cascade_count = 1 → never sampled). The planet re-points
+        // them at the real CSM maps via `set_shadow_cascade_views`.
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(10)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .image_info(std::slice::from_ref(&image_info)),
+        vk::WriteDescriptorSet::default()
+            .dst_set(set)
+            .dst_binding(11)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .image_info(std::slice::from_ref(&image_info)),
     ];
     unsafe { device.update_descriptor_sets(&writes, &[]) };
 }
@@ -2899,6 +3268,71 @@ fn write_leaf_tex_descriptors(
             .image_info(std::slice::from_ref(&sampler_info)),
     ];
     unsafe { device.update_descriptor_sets(&writes, &[]) };
+}
+
+/// Write the impostor atlas (set1/binding 12, SAMPLED_IMAGE). The view is bound in
+/// SHADER_READ_ONLY layout; the image is cleared-UNDEFINED until the one-shot bake
+/// transitions it (the descriptor is valid to write before the image is filled —
+/// it's only SAMPLED after the bake's COLOR→SHADER_READ barrier).
+fn write_impostor_atlas_descriptor(
+    device: &ash::Device,
+    set: vk::DescriptorSet,
+    atlas_view: vk::ImageView,
+) {
+    let info = vk::DescriptorImageInfo::default()
+        .image_view(atlas_view)
+        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+    let w = vk::WriteDescriptorSet::default()
+        .dst_set(set)
+        .dst_binding(12)
+        .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+        .image_info(std::slice::from_ref(&info));
+    unsafe { device.update_descriptor_sets(std::slice::from_ref(&w), &[]) };
+}
+
+/// Allocate a small dedicated D32 depth image for the impostor bake pass (its own
+/// state, no contention with the swapchain-sized scene depth). Mirrors
+/// `create_shadow_image`'s raw allocation but sized to the atlas.
+fn create_bake_depth(
+    device: &ash::Device,
+    mem_props: &vk::PhysicalDeviceMemoryProperties,
+    width: u32,
+    height: u32,
+) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView), RhiError> {
+    let format = vk::Format::D32_SFLOAT;
+    let image_info = vk::ImageCreateInfo::default()
+        .image_type(vk::ImageType::TYPE_2D)
+        .format(format)
+        .extent(vk::Extent3D { width, height, depth: 1 })
+        .mip_levels(1)
+        .array_layers(1)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .tiling(vk::ImageTiling::OPTIMAL)
+        .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)
+        .initial_layout(vk::ImageLayout::UNDEFINED);
+    let image = unsafe { device.create_image(&image_info, None) }.map_err(RhiError::Vulkan)?;
+    let reqs = unsafe { device.get_image_memory_requirements(image) };
+    let mem_type = find_memory_type(mem_props, reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        .ok_or_else(|| RhiError::Other("no device-local memory for bake depth".into()))?;
+    let alloc = vk::MemoryAllocateInfo::default()
+        .allocation_size(reqs.size)
+        .memory_type_index(mem_type);
+    let memory = unsafe { device.allocate_memory(&alloc, None) }.map_err(RhiError::Vulkan)?;
+    unsafe { device.bind_image_memory(image, memory, 0) }.map_err(RhiError::Vulkan)?;
+    let view_info = vk::ImageViewCreateInfo::default()
+        .image(image)
+        .view_type(vk::ImageViewType::TYPE_2D)
+        .format(format)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1),
+        );
+    let view = unsafe { device.create_image_view(&view_info, None) }.map_err(RhiError::Vulkan)?;
+    Ok((image, memory, view))
 }
 
 /// Add the IBL bindings (3 = env mip image, 4 = linear sampler, 5 = SH UBO) to an

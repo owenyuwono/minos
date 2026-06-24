@@ -24,6 +24,7 @@ use glam::DVec3;
 // ponytail: a COARSE per-patch grid is marched (cost decoupled from the ~1024²
 // mesh), then each vertex bilinearly samples it. Upgrade to a per-face horizon
 // *texture* (needs an enki-rhi set1) only if crisper edges are needed.
+
 const HORIZON_AZIMUTHS: usize = 4;
 /// March steps per azimuth (quadratic-spaced: dense near, sparse far).
 const HORIZON_STEPS: u32 = 16;
@@ -255,7 +256,9 @@ pub fn tessellate_patch(p: &PatchParams, hf: &dyn HeightField) -> PatchMesh {
             // view's albedo matches the quadtree terrain exactly.
             let slope = (1.0 - n.dot(dir)).clamp(0.0, 1.0) as f32;
             let (temp, moisture) = hf.climate(dir, h_cache[vi]);
-            colors[vi] = enki_planet::coloring::biome_color(temp, moisture, h_cache[vi] as f32, slope);
+            let color =
+                enki_planet::coloring::biome_color(temp, moisture, h_cache[vi] as f32, slope);
+            colors[vi] = color;
 
             // Debug-view scalars, sampled at the same `dir` as color (default hf → 0).
             material[vi] = hf.material(dir);

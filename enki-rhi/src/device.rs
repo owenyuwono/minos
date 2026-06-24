@@ -10,6 +10,9 @@ use crate::{surface::Surface, RhiError};
 pub(crate) struct Device {
     pub physical: vk::PhysicalDevice,
     pub graphics_queue_family: u32,
+    /// Nanoseconds per GPU timestamp tick; `0.0` if the graphics queue can't
+    /// timestamp (→ GPU timing disabled). Drives `gpu_timer::GpuTimer`.
+    pub timestamp_period: f32,
     // allocator must be in ManuallyDrop so we can drop it before destroying the device
     pub allocator: ManuallyDrop<Allocator>,
     pub handle: ash::Device,
@@ -79,9 +82,19 @@ impl Device {
             .unwrap_or("<unknown>");
         log::info!("Selected GPU: {}", name);
 
+        // GPU timestamps need a non-zero `timestamp_period` AND a queue that reports
+        // valid timestamp bits; otherwise leave it 0.0 so GpuTimer disables itself.
+        let qf_props = unsafe { instance.get_physical_device_queue_family_properties(physical) };
+        let valid_bits = qf_props
+            .get(queue_family as usize)
+            .map(|q| q.timestamp_valid_bits)
+            .unwrap_or(0);
+        let timestamp_period = if valid_bits > 0 { props.limits.timestamp_period } else { 0.0 };
+
         Ok(Self {
             physical,
             graphics_queue_family: queue_family,
+            timestamp_period,
             allocator: ManuallyDrop::new(allocator),
             handle,
         })

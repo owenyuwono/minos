@@ -107,6 +107,16 @@ impl ChunkPush {
             _pad: [0; 3],
         }
     }
+
+    /// Stamp per-draw geometry-debug ids into the spare pad slots (no size change):
+    /// `_pad[0]` = a stable per-mesh-unit id (leaf/cluster colour), `_pad[1]` = LOD
+    /// level. Read by `terrain.wgsl` view modes 3 (triangle) / 4 (cluster) / 5 (LOD).
+    /// No-op for the lit/data paths (they ignore the pads).
+    pub fn with_dbg(mut self, id: u32, level: u32) -> Self {
+        self._pad[0] = id;
+        self._pad[1] = level;
+        self
+    }
 }
 
 #[cfg(test)]

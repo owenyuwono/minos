@@ -17,6 +17,7 @@ struct ClusterMeta {
     parent_bounds: vec4<f32>,
     err: vec4<f32>,    // self_error, parent_error, lod, _
     range: vec4<u32>,  // tri_offset, tri_count, node, stable_id (debug color)
+    cone: vec4<f32>,   // backface normal cone (cull-only; unused here, layout match)
 };
 
 struct FrameData {
@@ -321,6 +322,12 @@ fn volcano_ramp(t: f32) -> vec3<f32> {
 // rebuild to change); promote to a push constant + GUI slider when iterating.
 const HORIZON_STRENGTH: f32 = 12.0;
 
+// Fraction of ambient + hemisphere sky-fill that survives on the deep night side.
+// 0 = pitch-black night; small floor keeps the night disc faintly visible vs space.
+// MUST match the floor + smoothstep band in enki-render ocean_surface.wgsl (shade_water)
+// so land and sea darken together across the terminator — no shared cross-crate const.
+const NIGHT_FILL: f32 = 0.05;
+
 // Mirror of enki_planet::face_bases::horizon_basis — MUST stay byte-identical so
 // the bake's azimuth-0 matches the runtime. Columns = (tan_a, tan_b, up).
 fn horizon_basis(up: vec3<f32>) -> mat3x3<f32> {
@@ -416,14 +423,23 @@ fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
         // Lit — matches terrain.wgsl mode 0 (ambient + hemisphere + 2 suns + ACES).
         let n = normalize(in.normal);
         let albedo = in.color;
-        let ambient_term = frame.ambient.xyz * albedo;
-        let hemi = hemisphere_ambient(n, frame.hemi_sky.xyz, frame.hemi_ground.xyz) * albedo;
+        let sun_dir = normalize(frame.sun0_dir.xyz);
+        // Planet-scale day/night: ambient + hemisphere are sky/bounce light that only
+        // exists where the sun is up. Fade them by the LOCAL sun elevation (radial up
+        // · sun) so the night hemisphere goes dark and the day/night terminator reads
+        // from orbit (otherwise the night side is as bright as the day side → a flat
+        // globe). Transition sits right at the terminator: full fill on the lit side
+        // (so shadowed valleys keep ambient), dropping to NIGHT_FILL just into the dark.
+        // ponytail: NIGHT_FILL + band are shader-const knobs; promote to GUI if tuned.
+        let up = normalize(in.world_rel + frame.cam_world.xyz);
+        let day = mix(NIGHT_FILL, 1.0, smoothstep(-0.2, 0.0, dot(up, sun_dir)));
+        let ambient_term = frame.ambient.xyz * albedo * day;
+        let hemi = hemisphere_ambient(n, frame.hemi_sky.xyz, frame.hemi_ground.xyz) * albedo * day;
         let d0 = max(dot(n, frame.sun0_dir.xyz), 0.0) * frame.sun0_color.xyz * albedo;
         let d1 = max(dot(n, frame.sun1_dir.xyz), 0.0) * frame.sun1_color.xyz * albedo;
         // Sun occlusion: terrain self-shadow × the character's cast shadow. Darken
         // the primary-sun direct term, leaving ambient/hemisphere/fill so shadowed
         // ground isn't black.
-        let sun_dir = normalize(frame.sun0_dir.xyz);
         var sh = terrain_shadow(in.world_rel, in.horizon, sun_dir);
         sh = sh * sample_shadow(in.world_rel, n); // sun shadow map (objects + terrain)
         rgb = aces_filmic(ambient_term + hemi + d0 * sh + d1);

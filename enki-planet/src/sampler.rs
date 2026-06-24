@@ -953,8 +953,24 @@ mod tests {
         }
     }
 
-    fn make_hf(seed: u32) -> TectonicHeightField {
+    /// Build a fresh heightfield (the expensive bake). Use for build-determinism.
+    fn build_hf(seed: u32) -> TectonicHeightField {
         TectonicHeightField::new(make_params(seed))
+    }
+
+    /// Per-seed CACHED heightfield — the bake is ~50 s at the shipping river RES, and
+    /// the suite reuses seed 42 across ~6 read-only tests; without this the suite is
+    /// minutes. Leaked to `&'static` (process-scoped test cache). Build-determinism is
+    /// covered by `height_deterministic` (which uses `build_hf`) + the golden, so a
+    /// shared instance here is fine for the read-only checks.
+    fn make_hf(seed: u32) -> &'static TectonicHeightField {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        static CACHE: OnceLock<Mutex<HashMap<u32, &'static TectonicHeightField>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut map = cache.lock().unwrap();
+        *map.entry(seed)
+            .or_insert_with(|| &*Box::leak(Box::new(build_hf(seed))))
     }
 
     /// TEMP diagnostic — is the river incision actually produced + reaching height()?
@@ -1116,8 +1132,9 @@ mod tests {
 
     #[test]
     fn height_deterministic() {
-        let hf1 = make_hf(77);
-        let hf2 = make_hf(77);
+        // Two INDEPENDENT builds (bypass the cache) must agree bit-for-bit.
+        let hf1 = build_hf(77);
+        let hf2 = build_hf(77);
         let dirs = sample_sphere_dirs(80);
         for level in [0u8, 3, 6] {
             for &d in &dirs {

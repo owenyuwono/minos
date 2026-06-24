@@ -270,16 +270,27 @@ fn shade_water(world_pos: vec3<f32>, N: vec3<f32>, fade: f32, frag_xy: vec2<f32>
     // day/night terminator + directional shading. The sky reflection (below) carries
     // its own brightness, so only the body is lit here.
     let radial = normalize(world_pos - ocean.center_rel.xyz);
-    let light = frame.ambient.xyz
-        + hemisphere_ambient(radial, frame.hemi_sky.xyz, frame.hemi_ground.xyz)
+    // Fade the sky-fill (ambient + hemisphere) by local sun elevation so the night
+    // hemisphere goes dark and the ocean shows the day/night terminator from orbit.
+    // The floor + band MUST match nanite_draw.wgsl NIGHT_FILL + smoothstep band so
+    // land and sea darken together across the terminator (named here as the contract —
+    // no shared cross-crate const). Directional terms already fade via N·L.
+    let NIGHT_FILL = 0.05;    // = nanite_draw.wgsl NIGHT_FILL
+    let TERMINATOR_LO = -0.2; // = nanite_draw.wgsl smoothstep low edge
+    let day = mix(NIGHT_FILL, 1.0, smoothstep(TERMINATOR_LO, 0.0, dot(radial, frame.sun0_dir.xyz)));
+    let light = (frame.ambient.xyz
+        + hemisphere_ambient(radial, frame.hemi_sky.xyz, frame.hemi_ground.xyz)) * day
         + max(dot(radial, frame.sun0_dir.xyz), 0.0) * frame.sun0_color.xyz
         + max(dot(radial, frame.sun1_dir.xyz), 0.0) * frame.sun1_color.xyz;
     body = body * light;
 
-    // Subsurface scatter on back-lit crests.
+    // Subsurface scatter on back-lit crests — a DIRECT-SUN effect, so fade it by the
+    // same `day` factor. Without this it blends raw bright scatter colour even on the
+    // night side (where its dot(V,-H) geometry is strongest), which was the day/night
+    // terminator's main leak on water: a uniformly bright night ocean.
     let H = normalize(-N + frame.sun0_dir.xyz);
     let sss = pow(clamp(dot(V, -H), 0.0, 1.0), 4.0) * ocean.shading.x;
-    body = mix(body, ocean.scatter_color.xyz, clamp(sss * fade, 0.0, 0.3));
+    body = mix(body, ocean.scatter_color.xyz, clamp(sss * fade * day, 0.0, 0.3));
 
     // Damp the sky reflection with altitude: the reflected `sky_color` is always
     // the bright near-surface gradient, so from high up a grazing ocean reads as a

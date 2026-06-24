@@ -521,28 +521,40 @@ fn fs_arrow(in: ArrowVsOut) -> @location(0) vec4<f32> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// (5) IMPOSTOR — far-distance LEAF BILLBOARD (the leaf-LOD impostor far-tier).
+// (5) IMPOSTOR — far-distance TEXTURED TREE BILLBOARD (the leaf-LOD impostor tier).
 //
 // Once a tree is tiny on screen, its thousands of alpha-cutout leaf cards are
 // pure overdraw for a few pixels. The leaf LOD crossfades the cards OUT and this
-// IN: ONE camera-facing quad (built CPU-side — model cols = right·r, up·r) painted
-// as a soft canopy blob in the per-tree pigment. Alpha-blended, so the crossfade
-// is just `alpha = coverage * blend`. // ponytail: a procedural round blob, NOT a
-// baked octahedral atlas — at the impostor distance the tree is ~10 px, so the
-// missing view-dependent parallax is invisible. Upgrade to a multi-view baked
-// atlas only if trees ever get large enough on screen to show it.
+// IN: ONE camera-facing quad (built CPU-side — model cols = right·r, up·r) that
+// samples a TWO-TILE atlas baked from the real tree (SIDE + TOP), so the disc is
+// correct both at horizon-level and straight down. Alpha-blended, so the
+// crossfade is just `alpha = coverage * blend`. The atlas (binding 12) is baked
+// ONCE at startup (linear HDR, pre-ACES, cleared to alpha 0 → leaf-card coverage
+// IS the silhouette). // ponytail: just 2 views (TOP+SIDE), blended by view
+// elevation — no full octahedral hemisphere. At impostor distance a tree is a few
+// px, so 2 views read identically to many; the only correctness that matters is
+// "not bare red sticks from above", which TOP fixes.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// model + (rgb pigment, crossfade alpha). Mirrors `ImpostorPush` in flora_view.rs.
+// 96-byte push: model + (rgb pigment tint, crossfade alpha) + tree radial up
+// (xyz; w unused). Mirrors `ImpostorPush` in flora_view.rs. The radial up lets
+// the FS reconstruct the view ELEVATION (top-down vs side-on) → tile blend.
 struct ImpostorPush {
     model : mat4x4<f32>,
-    color : vec4<f32>,   // rgb = canopy pigment (linear HDR); w = crossfade alpha
+    color : vec4<f32>,   // rgb = canopy pigment tint (linear HDR); w = crossfade alpha
+    up    : vec4<f32>,   // xyz = tree radial up (camera-relative world space); w unused
 }
 var<immediate> impostor_pc: ImpostorPush;
 
+// The baked impostor atlas (LINEAR HDR, alpha = silhouette coverage). Two tiles
+// side-by-side: SIDE = u ∈ [0, 0.5), TOP = u ∈ [0.5, 1]. Sampled with the LINEAR
+// CLAMP `ibl_sampler` (binding 4) — a flat atlas wants exactly that.
+@group(1) @binding(12) var impostor_atlas : texture_2d<f32>;
+
 struct ImpostorVsOut {
-    @builtin(position) clip_pos : vec4<f32>,
-    @location(0)       uv       : vec2<f32>,
+    @builtin(position) clip_pos   : vec4<f32>,
+    @location(0)       uv         : vec2<f32>,
+    @location(1)       view_dir   : vec3<f32>,  // billboard centre → camera (cam-rel)
 }
 
 @vertex
@@ -551,18 +563,32 @@ fn vs_impostor(v: StageVsIn) -> ImpostorVsOut {
     let world_pos = impostor_pc.model * vec4<f32>(v.position, 1.0);
     out.clip_pos = frame.view_proj * world_pos;
     out.uv = v.uv.xy;
+    // Camera-relative: the camera sits at the origin, so the billboard centre's
+    // world position (model translation) IS the camera→billboard vector; the view
+    // direction (billboard→camera) is its negation.
+    out.view_dir = normalize(-impostor_pc.model[3].xyz);
     return out;
 }
 
 @fragment
 fn fs_impostor(in: ImpostorVsOut) -> @location(0) vec4<f32> {
-    // Radial canopy blob: dense core, feathered rim (uv centre 0.5,0.5).
-    let r = length(in.uv - vec2<f32>(0.5, 0.5)) * 2.0;
-    let cov = 1.0 - smoothstep(0.55, 1.0, r);            // soft round silhouette
-    if (cov < 0.01) { discard; }
-    // Cheap round shading: brighten the top, darken the underside, so the blob
-    // reads as a lit canopy sphere, not a flat disc. uv.y=1 is the screen top.
-    let lift = clamp(0.55 + 0.6 * (in.uv.y - 0.5) + 0.2 * (0.5 - in.uv.x), 0.30, 1.25);
-    let col = impostor_pc.color.rgb * lift;
-    return vec4<f32>(col, cov * impostor_pc.color.w);   // LINEAR HDR; ACES later
+    let up = normalize(impostor_pc.up.xyz);
+    // view_dir = billboard→camera (cam-rel). Looking straight DOWN the tree, the
+    // camera is above the canopy so view_dir ≈ +up → dot ≈ 1 (TOP tile). Side-on,
+    // view_dir is roughly tangent → dot ≈ 0 (SIDE tile).
+    let topness = clamp(dot(in.view_dir, up), 0.0, 1.0);
+    let blend = smoothstep(0.35, 0.8, topness);
+
+    // Map the quad uv into each tile's sub-rect. SIDE = left half, TOP = right.
+    let side_uv = vec2<f32>(in.uv.x * 0.5,        in.uv.y);
+    let top_uv  = vec2<f32>(in.uv.x * 0.5 + 0.5,  in.uv.y);
+    let side = textureSampleLevel(impostor_atlas, ibl_sampler, side_uv, 0.0);
+    let top  = textureSampleLevel(impostor_atlas, ibl_sampler, top_uv,  0.0);
+
+    let rgb   = mix(side.rgb, top.rgb, blend);
+    let cover = mix(side.a,   top.a,   blend);     // baked silhouette coverage
+    if (cover < 0.3) { discard; }                  // alpha cutout
+    // The baked atlas already carries the real tree colours; just fade by the
+    // crossfade alpha (push color.w). LINEAR HDR — the OutputPass ACES once.
+    return vec4<f32>(rgb, cover * impostor_pc.color.w);
 }

@@ -7,6 +7,7 @@ pub mod buffer;
 pub mod command;
 pub mod descriptor;
 pub mod device;
+mod gpu_timer;
 pub mod image;
 pub mod instance;
 pub mod pipeline;
@@ -209,6 +210,9 @@ pub struct Rhi {
     shadow_extent: vk::Extent2D,
     /// Number of shadow cascades; `shadow_maps` is flat-indexed `fi*shadow_cascades + c`.
     shadow_cascades: u32,
+
+    /// Whole-frame GPU timer (timestamp queries). `None` if unsupported.
+    gpu_timer: Option<gpu_timer::GpuTimer>,
 }
 
 impl Rhi {
@@ -310,6 +314,9 @@ impl Rhi {
             )?
         };
 
+        // Whole-frame GPU timer (None if the queue can't timestamp).
+        let gpu_timer = gpu_timer::GpuTimer::new(&device.handle, frames_in_flight, device.timestamp_period);
+
         log::info!("RHI initialised ({} frames in flight)", frames_in_flight);
 
         Ok(Self {
@@ -342,6 +349,7 @@ impl Rhi {
             shadow_sampler: vk::Sampler::null(),
             shadow_extent: vk::Extent2D { width: 0, height: 0 },
             shadow_cascades: 1,
+            gpu_timer,
         })
     }
 
@@ -1771,6 +1779,12 @@ impl Rhi {
         }
         .map_err(RhiError::Vulkan)?;
 
+        // GPU timer: read this slot's previous result (the fence wait above made it
+        // ready), then stamp the frame start. Outside any render instance here.
+        if let Some(t) = self.gpu_timer.as_mut() {
+            t.begin(&self.device.handle, cmd, fi as u32);
+        }
+
         // ── Image layout transitions ────────────────────────────────────────
         //
         // Three barriers in one vkCmdPipelineBarrier2 call:
@@ -2085,6 +2099,12 @@ impl Rhi {
             vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&present_barrier));
         unsafe { self.device.handle.cmd_pipeline_barrier2(cmd, &dep_info) };
 
+        // GPU timer: stamp the frame end (outside any render instance — the UI
+        // instance was closed above).
+        if let Some(t) = self.gpu_timer.as_mut() {
+            t.end(&self.device.handle, cmd, frame_index);
+        }
+
         unsafe { self.device.handle.end_command_buffer(cmd) }
             .map_err(RhiError::Vulkan)?;
 
@@ -2195,6 +2215,12 @@ impl Rhi {
     /// Number of frames-in-flight (ring depth). Use to size per-frame resources.
     pub fn frames_in_flight(&self) -> usize {
         self.frames_in_flight
+    }
+
+    /// Whole-frame GPU time in milliseconds from timestamp queries (~`frames_in_flight`
+    /// frames stale). `0.0` if the device can't timestamp or before the first result.
+    pub fn gpu_time_ms(&self) -> f32 {
+        self.gpu_timer.as_ref().map(|t| t.ms()).unwrap_or(0.0)
     }
 
     // ── Raw Vulkan handle accessors (for egui integration) ─────────────────
@@ -2363,7 +2389,10 @@ impl Drop for Rhi {
             //    which drains the map.
             ManuallyDrop::drop(&mut self.pipelines);
 
-            // 2. Drop sync and command objects.
+            // 2. Drop sync and command objects (+ the GPU timer's query pool).
+            if let Some(t) = self.gpu_timer.take() {
+                t.destroy(&self.device.handle);
+            }
             ManuallyDrop::drop(&mut self.commands);
             ManuallyDrop::drop(&mut self.sync);
 

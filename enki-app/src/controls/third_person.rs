@@ -19,7 +19,7 @@ use enki_render::camera::Camera;
 use glam::{DVec3, Mat3, Quat, Vec3};
 
 use super::tangent::{project_onto_tangent_plane, surface_radius, MoveInput, SPRINT_MULTIPLIER};
-use super::terrain_grid::grid_surface_radius;
+use super::terrain_grid::SurfaceCollider;
 
 // ── Constants ─────────────────────────────────────────────────────────────
 
@@ -92,9 +92,10 @@ pub struct ThirdPersonController {
     hf: Arc<dyn HeightField>,
     base_radius: f64,
     height_scale: f64,
-    /// Quads per cube-face side of the rendered terrain grid (Nanite bake res).
-    /// Feet ride this faceted grid, not the full analytic curve.
-    grid_res: u32,
+    /// Live collision surface (the rendered voxel mesh). Feet AND camera occlusion both
+    /// query it, so they always agree — the fix for the boom snapping to the neck on a
+    /// feet/occlusion surface mismatch. `None` → analytic fallback (pre-streaming).
+    collider: Option<Arc<dyn SurfaceCollider>>,
 }
 
 impl ThirdPersonController {
@@ -108,7 +109,6 @@ impl ThirdPersonController {
         hf: Arc<dyn HeightField>,
         base_radius: f64,
         height_scale: f64,
-        grid_res: u32,
         initial_heading: Vec3,
     ) -> Self {
         let dir = feet_pos.normalize();
@@ -124,14 +124,33 @@ impl ThirdPersonController {
             hf,
             base_radius,
             height_scale,
-            grid_res,
+            collider: None,
         };
         ctrl.feet = ctrl.grounded(dir);
         ctrl
     }
 
-    /// Analytic point sample of the surface radius — used for the camera-occlusion
-    /// march (a conservative "is this above ground" probe), not for the feet.
+    /// Set the live collision surface (the voxel mesh). Called once per frame by the
+    /// app before `on_move`/`update`; `None` keeps the analytic fallback.
+    pub fn set_collider(&mut self, collider: Option<Arc<dyn SurfaceCollider>>) {
+        self.collider = collider;
+    }
+
+    /// Surface radius (m from the planet centre) along `dir` — the rendered voxel mesh
+    /// if a leaf is resident, else the analytic fallback. The ONE surface both the feet
+    /// and the camera-occlusion march use, so they can never disagree.
+    fn surface_radius_at(&self, dir: DVec3) -> f64 {
+        self.collider
+            .as_ref()
+            .and_then(|c| c.ground_radius(dir))
+            // Fallback (no resident leaf yet): the analytic surface. Feet + camera both
+            // go through surface_radius_at, so they still agree; honours the controller's
+            // own base_radius (so small test planets ground correctly too).
+            .unwrap_or_else(|| self.ground_radius(dir))
+    }
+
+    /// Analytic surface radius — the FALLBACK `surface_radius_at` uses when no rendered
+    /// leaf is resident along `dir` (the primary source is the voxel mesh collider).
     fn ground_radius(&self, dir: DVec3) -> f64 {
         surface_radius(self.hf.as_ref(), self.base_radius, self.height_scale, dir)
     }
@@ -140,13 +159,17 @@ impl ThirdPersonController {
     /// under `dir`, lifted by [`FOOT_CLEARANCE`]. Riding the grid (not the analytic
     /// curve) is what keeps the body on the drawn ground instead of diving.
     fn grounded(&self, dir: DVec3) -> DVec3 {
-        let r = grid_surface_radius(
-            self.hf.as_ref(), self.base_radius, self.height_scale, self.grid_res, dir,
-        );
-        dir * (r + FOOT_CLEARANCE)
+        // Rides `surface_radius_at` — the rendered voxel mesh (single source of truth),
+        // the SAME surface the camera-occlusion march uses, so feet + camera agree.
+        dir * (self.surface_radius_at(dir) + FOOT_CLEARANCE)
     }
 
     fn local_up(&self) -> DVec3 {
+        self.feet.normalize()
+    }
+
+    /// Unit direction from the planet centre to the feet — the grounding query dir.
+    pub fn feet_dir(&self) -> DVec3 {
         self.feet.normalize()
     }
 
@@ -236,6 +259,9 @@ impl ThirdPersonController {
     /// Per-frame tick: advance the smoothed collision boom. Call once per frame
     /// (with the active surface controller) so `camera()` reflects collision.
     pub fn update(&mut self, dt: f32) {
+        // Re-ground the feet on the live collision surface each frame so the body tracks
+        // the mesh as it streams in (and stays grounded while idle), then advance the boom.
+        self.feet = self.grounded(self.feet_dir());
         let target = self.collide_boom(self.anchor(), self.look_dir());
         // Snap in fast when newly blocked; ease out slowly when the view clears.
         let rate = if target < self.eff_dist { BOOM_PULL_IN_RATE } else { BOOM_PUSH_OUT_RATE };
@@ -281,10 +307,11 @@ impl ThirdPersonController {
         for i in 1..=COLLISION_STEPS {
             let d = self.cam_dist * (i as f32 / COLLISION_STEPS as f32);
             let pos = anchor + out * d as f64;
-            let ground = grid_surface_radius(
-                self.hf.as_ref(), self.base_radius, self.height_scale, self.grid_res,
-                pos.normalize(),
-            ) + CAM_MARGIN;
+            // Same surface as the feet (surface_radius_at → the rendered voxel mesh).
+            // The anchor sits ANCHOR_HEIGHT above the feet on that same surface, so
+            // nearby samples are always clear — the boom only pulls in behind REAL hills,
+            // never to the neck from a feet-vs-occlusion surface mismatch.
+            let ground = self.surface_radius_at(pos.normalize()) + CAM_MARGIN;
             if pos.length() < ground {
                 break; // blocked here → keep the last clear distance
             }
@@ -340,7 +367,6 @@ mod tests {
             Arc::new(FlatHf),
             R,
             1.0,
-            256, // grid_res
             Vec3::new(0.0, 0.0, -1.0),
         )
     }
@@ -444,7 +470,7 @@ mod tests {
             }
         }
         let mut c = ThirdPersonController::new(
-            DVec3::new(0.0, 100.0, 0.0), Arc::new(RampHf), 100.0, 2000.0, 256,
+            DVec3::new(0.0, 100.0, 0.0), Arc::new(RampHf), 100.0, 2000.0,
             Vec3::new(0.0, 0.0, -1.0),
         );
         for _ in 0..30 { c.update(0.1); }

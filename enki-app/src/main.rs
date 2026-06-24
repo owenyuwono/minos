@@ -48,6 +48,8 @@ mod markers;
 mod rivers;
 mod solar;
 mod planet_view;
+#[cfg(feature = "voxel")]
+mod voxel_view;
 #[cfg(feature = "flora")]
 mod flora_scatter;
 
@@ -96,10 +98,10 @@ use solar::BodyRenderer;
 use controls::space::FreeCam;
 use planet_view::{PlanetConfig, PlanetView, PlanetViewStats, planet_view_from_hf};
 
-/// Quads per cube-face side of the Nanite terrain bake. Single-sourced so the
-/// third-person character grounds against the *same* grid the renderer draws
-/// (see `controls::terrain_grid`). Must match the bake's `nanite_resolution`.
-const NANITE_BAKE_RES: u32 = 1024;
+/// Sun shadow cascades — MUST match `character.rs` SHADOW_CASCADES, the flora
+/// `ShadowUniforms` cascade count, and the receiver shaders.
+#[cfg_attr(not(feature = "voxel"), allow(dead_code))]
+const SHADOW_CASCADES: u32 = 3;
 
 
 // ── App state ─────────────────────────────────────────────────────────────────
@@ -142,8 +144,6 @@ struct App {
     /// CPU-skinned humanoid drawn in third-person surface mode (built at startup
     /// in Planet mode; only drawn while walking the surface in third-person view).
     character:    Option<Character>,
-    #[cfg(feature = "nanite")]
-    nanite:       Option<enki_nanite::render::NaniteRenderer>,
     // Procedural trees (flora), behind `--features flora`. Phase A: the
     // flora-owned sub-renderer (drawing into the main 3D pass) + one walk-up tree
     // spawned near the player in Surface mode. Scatter/LOD is a later slice.
@@ -171,19 +171,20 @@ struct App {
     flora_enabled: bool,
     /// Fraction of candidate cells that get a tree (GUI slider, 0..1).
     flora_density: f32,
-    /// Stage-2 cluster streaming: the deep per-face DAGs (held in RAM) + the
-    /// residency selector that streams only the near-cut subset to the GPU pool.
-    #[cfg(feature = "nanite")]
-    nanite_assets: Vec<enki_nanite::cluster::ClusterAsset>,
-    #[cfg(feature = "nanite")]
-    nanite_streamer: Option<enki_nanite::residency::ClusterStreamer>,
-    /// Planet radius (for the streamer's altitude-relative reselection threshold).
-    #[cfg(feature = "nanite")]
-    nanite_radius: f64,
-    /// Frame index of the last streaming reselection (rate-limits the re-pack so
-    /// fast zoom can't trigger a full re-pack every frame → no sustained fps drop).
-    #[cfg(feature = "nanite")]
-    nanite_last_resel: u64,
+    /// Tree draw radius around the player (m, GUI slider). Far trees in this
+    /// window collapse to a cheap impostor billboard (Tier-2 LOD). Feature-agnostic
+    /// so the panel compiles without `flora`.
+    flora_radius_m: f64,
+    /// Radius used at the last scatter rebuild (rebuild on change).
+    #[cfg(feature = "flora")]
+    flora_last_radius_m: f64,
+    /// Draw flora when the player is within this altitude of the surface (m, GUI
+    /// slider) — so trees fade in during descent, not only in Surface mode.
+    flora_alt_threshold_m: f64,
+    /// Phase 2 voxel terrain: the on-demand transvoxel quadtree. When the `voxel`
+    /// feature is on this REPLACES the classic quadtree (PlanetView) as the terrain.
+    #[cfg(feature = "voxel")]
+    voxel_view: Option<voxel_view::VoxelView>,
     /// In-progress async startup load (heightfield + Nanite bake); `None` once done.
     loader:       Option<loading::Loader>,
     /// Planet config held until the async load completes (then `PlanetView` is built).
@@ -193,6 +194,8 @@ struct App {
     /// Show the one-time load-stats popup until the user dismisses it.
     show_load_stats: bool,
     fps:          FpsMeter,
+    /// CPU time recording the previous frame's 3D pass (ms) — shown in the Stats panel.
+    cpu_ms:       f32,
     last_tick:    Instant,
     minimized:    bool,
     /// Monotonic frame counter for LOD age tracking.
@@ -241,6 +244,10 @@ struct App {
     nanite_enabled:    bool,
     /// LOD pixel-error threshold (lower = finer/smoother, heavier).
     nanite_tau:        f32,
+    /// Voxel caves on/off + carve strength (GUI; feature-agnostic so the panel
+    /// compiles without the `voxel` feature — the effect is what's gated).
+    voxel_caves:       bool,
+    voxel_cave_strength: f32,
     /// Draw the translucent ocean shell over the planet.
     ocean_enabled:     bool,
     /// Draw the wind streakline overlay.
@@ -327,21 +334,24 @@ impl App {
             flora_clock:   0.0,
             flora_enabled: true,
             flora_density: 0.65,
-            #[cfg(feature = "nanite")]
-            nanite:        None,
-            #[cfg(feature = "nanite")]
-            nanite_assets: Vec::new(),
-            #[cfg(feature = "nanite")]
-            nanite_streamer: None,
-            #[cfg(feature = "nanite")]
-            nanite_radius: 0.0,
-            #[cfg(feature = "nanite")]
-            nanite_last_resel: 0,
+            // Default tree draw radius. flora_scatter (the source of RADIUS_M) is
+            // only compiled under `flora`; the field itself is feature-agnostic so
+            // the GUI compiles without it, hence the cfg split on the default.
+            #[cfg(feature = "flora")]
+            flora_radius_m: flora_scatter::RADIUS_M,
+            #[cfg(not(feature = "flora"))]
+            flora_radius_m: 250.0,
+            #[cfg(feature = "flora")]
+            flora_last_radius_m: -1.0,
+            flora_alt_threshold_m: 4000.0,
+            #[cfg(feature = "voxel")]
+            voxel_view:    None,
             loader:        None,
             pending_planet_cfg: None,
             load_timings:  None,
             show_load_stats: false,
             fps:           FpsMeter::new(),
+            cpu_ms:        0.0,
             last_tick:     Instant::now(),
             minimized:     false,
             frame_counter: 0,
@@ -361,10 +371,14 @@ impl App {
             terrain_height_scale: 0.0,
             view_mode:     0,
             wireframe:     false,
-            taa_enabled:   true,
+            taa_enabled:   true, // ON: the FFT ocean + aerial + clouds render in the TAA
+                                 // water-split (begin_water_pass); it also AAs the voxel
+                                 // terrain. Toggle in GUI View — OFF drops those effects.
             taa_jitter:    enki_render::taa::TaaJitter::new(),
             nanite_enabled:    true,
             nanite_tau:        1.0,
+            voxel_caves:       true,
+            voxel_cave_strength: 90.0,
             ocean_enabled:     true,
             wind_enabled:      false,
             atmo_enabled:      true,
@@ -529,7 +543,6 @@ impl App {
                 hf,
                 PLANET_RADIUS,
                 self.terrain_height_scale,
-                NANITE_BAKE_RES,
                 heading,
             ));
             self.surface_speed = 0.0;
@@ -571,6 +584,15 @@ impl App {
                         tpc.on_zoom(self.scroll);
                     }
                     // Camera-relative WASD; remember the speed for the gait.
+                    // Hand the controller the live voxel collision surface FIRST, so the
+                    // feet AND the camera-occlusion march ride the SAME rendered triangles
+                    // this frame — no feet-vs-occlusion mismatch, so the boom never snaps
+                    // to the neck. Falls back to analytic until the player's leaf streams in.
+                    #[cfg(feature = "voxel")]
+                    {
+                        let collider = self.voxel_view.as_ref().map(|vv| vv.collider_dyn());
+                        tpc.set_collider(collider);
+                    }
                     self.surface_speed = tpc.on_move(self.move_keys, dt);
                     // Advance the smoothed camera collision for this frame.
                     tpc.update(dt);
@@ -819,7 +841,6 @@ impl ApplicationHandler for App {
                     height_scale: cfg.lod.height_scale,
                     // Stage 2: bake DEEP (DAG exceeds the GPU pool); only the
                     // near-cut subset is streamed resident per frame.
-                    nanite_resolution: NANITE_BAKE_RES,
                 };
                 self.loader = Some(loading::Loader::spawn(params));
                 self.pending_planet_cfg = Some(cfg);
@@ -1041,19 +1062,33 @@ impl App {
 
                     // ── View mode cycle ───────────────────────────────────────
                     KeyCode::KeyM if pressed => {
-                        #[cfg(feature = "nanite")]
-                        let nanite_on = self.nanite_enabled && self.nanite.is_some();
-                        #[cfg(not(feature = "nanite"))]
-                        let nanite_on = false;
+                        // Geometry views (3–5) work on the Nanite path AND the voxel
+                        // terrain; only the bare classic quadtree lacks them.
+                        let geom_views = cfg!(feature = "nanite") || cfg!(feature = "voxel");
                         loop {
                             // 0–10 View/Planet, 11–12 Ocean (Surface/Intensity).
                             self.view_mode = (self.view_mode + 1) % 13;
-                            // Skip the Nanite-only geometry views (3–5) on the classic path.
-                            if nanite_on || !(3..=5).contains(&self.view_mode) {
+                            if geom_views || !(3..=5).contains(&self.view_mode) {
                                 break;
                             }
                         }
                         log::info!("View mode → {}", self.view_mode);
+                    }
+
+                    // ── Voxel terrain edit: G dig / H fill at the player's feet ──
+                    #[cfg(feature = "voxel")]
+                    KeyCode::KeyG if pressed && self.nav.mode() == NavMode::Surface => {
+                        if let (Some(vv), Some(tpc)) = (self.voxel_view.as_mut(), self.surface.as_ref()) {
+                            vv.queue_edit(tpc.feet_position(), 6.0, true);
+                            log::info!("voxel dig at feet");
+                        }
+                    }
+                    #[cfg(feature = "voxel")]
+                    KeyCode::KeyH if pressed && self.nav.mode() == NavMode::Surface => {
+                        if let (Some(vv), Some(tpc)) = (self.voxel_view.as_mut(), self.surface.as_ref()) {
+                            vv.queue_edit(tpc.feet_position(), 6.0, false);
+                            log::info!("voxel fill at feet");
+                        }
                     }
 
                     // ── Wireframe toggle ──────────────────────────────────────
@@ -1144,10 +1179,6 @@ impl App {
                     self.load_timings = Some(out.timings);
                     self.show_load_stats = true;
                     if let Some(cfg) = self.pending_planet_cfg.take() {
-                        #[cfg(feature = "nanite")]
-                        {
-                            self.nanite_radius = cfg.lod.radius;
-                        }
                         // Keep a handle to the terrain so the FPS controller can ride it.
                         self.height_field = Some(Arc::clone(&out.hf));
                         // Feed the planet's wind field to the ocean (wave height/intensity).
@@ -1166,44 +1197,43 @@ impl App {
                             r.set_source(Arc::clone(&out.hf), cfg.lod.height_scale);
                         }
                         self.terrain_height_scale = cfg.lod.height_scale;
+                        // Phase 2: stand up the on-demand voxel terrain (transvoxel
+                        // quadtree). It drives the same LOD selection as PlanetView but
+                        // meshes each leaf as a transvoxel block. ponytail: subdiv 24 +
+                        // synchronous meshing for now (Phase 3 moves it to the jobs pool).
+                        #[cfg(feature = "voxel")]
+                        {
+                            let vlod = LodConfig {
+                                radius:        cfg.lod.radius,
+                                height_scale:  cfg.lod.height_scale,
+                                resolution:    cfg.lod.resolution,
+                                max_depth:     cfg.lod.max_depth,
+                                target_tri_px: cfg.lod.target_tri_px,
+                                hysteresis:    cfg.lod.hysteresis,
+                                lru_capacity:  cfg.lod.lru_capacity,
+                            };
+                            let shadow_size = self.shadow_size;
+                            if let Some(rhi) = self.rhi.as_mut() {
+                                // Re-home the sun shadow map onto the voxel terrain
+                                // (it was created in the now-deleted Nanite loader).
+                                if let Err(e) = rhi.create_shadow_map(shadow_size, SHADOW_CASCADES) {
+                                    log::error!("create_shadow_map failed: {e}");
+                                }
+                                let vv = voxel_view::VoxelView::new(
+                                    rhi,
+                                    Arc::clone(&out.hf),
+                                    vlod,
+                                    16,
+                                    cfg.terrain_pipeline,
+                                );
+                                self.voxel_view = Some(vv);
+                            }
+                            log::info!("voxel terrain (VoxelView) initialised");
+                        }
                         self.planet_view = Some(planet_view_from_hf(cfg, out.hf));
                     }
 
 
-                    // Nanite (Stage 2): the deep per-face DAGs live in RAM; the GPU
-                    // pool starts empty and the streamer uploads only the near-cut
-                    // cluster subset each frame, so the DAG can exceed GPU memory.
-                    #[cfg(feature = "nanite")]
-                    if let Some(nodes) = out.nanite_asset {
-                        if let Some(rhi) = self.rhi.as_mut() {
-                            match enki_nanite::render::NaniteRenderer::new(rhi, &[]) {
-                                Ok(r) => {
-                                    let clusters: usize =
-                                        nodes.iter().map(|a| a.cluster_count()).sum();
-                                    log::info!(
-                                        "Nanite Stage-2 ready ({} faces, {} clusters in DAG; streaming near-cut subset)",
-                                        nodes.len(),
-                                        clusters,
-                                    );
-                                    // Sun shadow map: allocate N cascades + point the
-                                    // Nanite draw set at them before the first frame.
-                                    match rhi.create_shadow_map(
-                                        self.shadow_size,
-                                        enki_nanite::render::SHADOW_CASCADES,
-                                    ) {
-                                        Ok(()) => r.bind_shadow_map(rhi),
-                                        Err(e) => log::error!("create_shadow_map failed: {e}"),
-                                    }
-                                    self.nanite_streamer = Some(
-                                        enki_nanite::residency::ClusterStreamer::new(&nodes),
-                                    );
-                                    self.nanite_assets = nodes;
-                                    self.nanite = Some(r);
-                                }
-                                Err(e) => log::error!("Nanite renderer init failed: {e}"),
-                            }
-                        }
-                    }
                     self.loader = None;
                     log::info!("Async load complete.");
                 }
@@ -1244,6 +1274,8 @@ impl App {
         let ui_out = if self.egui.is_some() && self.window.is_some() && self.rhi.is_some() {
             let nanite_enabled    = self.nanite_enabled;
             let nanite_tau        = self.nanite_tau;
+            let voxel_caves          = self.voxel_caves;
+            let voxel_cave_strength  = self.voxel_cave_strength;
             let shadow_map_enabled = self.shadow_map_enabled;
             let shadow_half_extent = self.shadow_half_extent;
             let shadow_depth       = self.shadow_depth;
@@ -1267,9 +1299,28 @@ impl App {
             let wave_foam         = self.wave_foam;
             let flora_enabled     = self.flora_enabled;
             let flora_density      = self.flora_density;
+            let flora_radius_m     = self.flora_radius_m;
+            let flora_alt_threshold_m = self.flora_alt_threshold_m;
             // LoadTimings is Copy — snapshot it out so the popup can borrow it while
             // egui mutably borrows self. Only passed while the popup is showing.
             let load_stats        = if self.show_load_stats { self.load_timings } else { None };
+
+            // Profiler counters for the top-right Stats panel (all ~1–2 frames stale).
+            let gpu_ms = self.rhi.as_ref().map(|r| r.gpu_time_ms()).unwrap_or(0.0);
+            #[allow(unused_mut)]
+            let (mut triangles, mut visible_clusters, mut resident_clusters) = (0u64, 0u32, 0u32);
+            // Real terrain geometry (voxel leaves + any classic quadtree chunks).
+            if let Some(pv) = self.planet_view.as_ref() {
+                triangles += pv.triangle_count() as u64;
+            }
+            #[cfg(feature = "voxel")]
+            if let Some(vv) = self.voxel_view.as_ref() {
+                triangles += vv.triangle_count() as u64;
+            }
+            let profiler = crate::gui::Profiler {
+                cpu_ms: self.cpu_ms, gpu_ms, triangles, visible_clusters, resident_clusters,
+            };
+
             // egui, window, and rhi are independent fields — split-borrow.
             let egui   = self.egui.as_mut().unwrap();
             let window = self.window.as_ref().unwrap();
@@ -1279,8 +1330,10 @@ impl App {
                 window, rhi, nav_mode, altitude, frame_time, view_mode, wireframe, taa_on,
                 shadow_map_enabled, shadow_half_extent, shadow_depth, shadow_depth_bias, shadow_normal_bias,
                 nanite_enabled, nanite_tau, cfg!(feature = "nanite"),
+                cfg!(feature = "voxel"), voxel_caves, voxel_cave_strength,
                 ocean_enabled, sea_level_m, wave_enabled, wave_choppiness, wave_foam,
                 cfg!(feature = "flora"), flora_enabled, flora_density,
+                flora_radius_m, flora_alt_threshold_m,
                 self.sky.time_scale, self.sky.paused,
                 wind_enabled, wind_params,
                 atmo_enabled, atmo_params,
@@ -1288,6 +1341,7 @@ impl App {
                 clouds_enabled, cloud_params,
                 markers_poles, markers_equator, rivers_enabled,
                 planet_stats.as_ref(), load_stats.as_ref(),
+                profiler,
             ))
         } else {
             None
@@ -1307,12 +1361,17 @@ impl App {
             self.shadow_normal_bias  = out.shadow_normal_bias;
             self.nanite_enabled    = out.nanite_enabled;
             self.nanite_tau        = out.nanite_tau;
-            // Nanite-only geometry views (3–5) collapse to Lit when the classic path is active.
-            #[cfg(feature = "nanite")]
-            let nanite_on = self.nanite_enabled && self.nanite.is_some();
-            #[cfg(not(feature = "nanite"))]
-            let nanite_on = false;
-            if !nanite_on && (3..=5).contains(&self.view_mode) {
+            self.voxel_caves          = out.voxel_caves;
+            self.voxel_cave_strength  = out.voxel_cave_strength;
+            #[cfg(feature = "voxel")]
+            if let Some(vv) = self.voxel_view.as_mut() {
+                vv.set_caves_enabled(out.voxel_caves);
+                vv.set_cave_strength(out.voxel_cave_strength as f64);
+            }
+            // Geometry views (3–5) work on the Nanite path AND the voxel terrain; only
+            // the bare classic quadtree lacks them → collapse to Lit there.
+            let geom_views = cfg!(feature = "nanite") || cfg!(feature = "voxel");
+            if !geom_views && (3..=5).contains(&self.view_mode) {
                 self.view_mode = 0;
             }
             self.ocean_enabled     = out.ocean_enabled;
@@ -1322,6 +1381,8 @@ impl App {
             self.wave_foam         = out.wave_foam;
             self.flora_enabled     = out.flora_enabled;
             self.flora_density     = out.flora_density;
+            self.flora_radius_m    = out.flora_radius_m;
+            self.flora_alt_threshold_m = out.flora_alt_threshold_m;
             self.wind_enabled      = out.wind_enabled;
             if let Some(w) = self.wind.as_mut() {
                 w.params = out.wind;
@@ -1384,6 +1445,10 @@ impl App {
             return;
         }
 
+        // CPU recording time: from here (past begin_frame's fence wait) to just
+        // before end_frame — so it reflects real CPU cost, not vsync idle.
+        let cpu_t0 = Instant::now();
+
         // ── 3D rendering ──────────────────────────────────────────────────
         {
             {
@@ -1432,100 +1497,45 @@ impl App {
                 // the small near cascade reaches the wedge ahead; camera otherwise.
                 // `shadow_params = [depth_bias, normal_bias, strength, enabled]`.
                 // Hoisted here so cull/update AND the caster pass below share them.
-                #[cfg(feature = "nanite")]
                 let shadow_focus = if nav_mode == NavMode::Surface {
                     self.surface.as_ref().map(|tpc| tpc.feet_position()).unwrap_or(camera_world_pos)
                 } else {
                     camera_world_pos
                 };
-                #[cfg(feature = "nanite")]
-                let (cascade_mvps, shadow_params) = if self.shadow_map_enabled && rhi.has_shadow_map() {
-                    (
-                        sun_cascade_matrices(
-                            self.sun_dir_body, camera_world_pos, shadow_focus,
-                            self.shadow_half_extent, self.shadow_depth, self.shadow_size,
-                        ),
-                        [self.shadow_depth_bias, self.shadow_normal_bias, 1.0, 1.0],
-                    )
-                } else {
-                    ([glam::Mat4::IDENTITY; 3], [0.0; 4])
-                };
+                // Cascade light matrices, built whenever the shadow map exists (the
+                // voxel terrain re-homed it — see the loader). Receivers fall back to
+                // the screen-space shadow when it's off, so dummies are harmless.
+                let (cascade_mvps, shadow_params): ([glam::Mat4; 3], [f32; 4]) =
+                    if self.shadow_map_enabled && rhi.has_shadow_map() {
+                        (
+                            sun_cascade_matrices(
+                                self.sun_dir_body, camera_world_pos, shadow_focus,
+                                self.shadow_half_extent, self.shadow_depth, self.shadow_size,
+                            ),
+                            [self.shadow_depth_bias, self.shadow_normal_bias, 1.0, 1.0],
+                        )
+                    } else {
+                        ([glam::Mat4::IDENTITY; 3], [0.0; 4])
+                    };
 
-                // Mutual exclusivity: Nanite is an LOD system that REPLACES the
-                // quadtree terrain. When it's active, the quadtree is not rendered.
-                #[cfg(feature = "nanite")]
-                let nanite_active = self.nanite_enabled && self.nanite.is_some();
-                #[cfg(not(feature = "nanite"))]
-                let nanite_active = false;
+                // Voxel terrain (Phase 2) REPLACES the quadtree as the terrain when present.
+                #[cfg(feature = "voxel")]
+                let voxel_on = self.voxel_view.is_some();
+                #[cfg(not(feature = "voxel"))]
+                let voxel_on = false;
 
                 // PlanetView::update — streaming uploads (outside rendering instance).
-                if !nanite_active {
+                if !voxel_on {
                     if let Some(pv) = self.planet_view.as_mut() {
                         pv.update(rhi, fi, self.frame_counter, &lod_cam, camera_world_pos);
                     }
                 }
-
-                // Nanite (Stage 2): stream the near-cut cluster subset, then per-
-                // frame uniforms + cull dispatch (MUST be outside the rendering
-                // instance — compute dispatch is illegal inside it).
-                #[cfg(feature = "nanite")]
-                if nanite_active {
-                    // 1. Reselect the resident set (throttled), then INCREMENTALLY
-                    //    reconcile the GPU page pool: update_residency uploads only the
-                    //    newly-added clusters and frees the removed ones (stable slots,
-                    //    no whole-set re-pack) → no fast-zoom hitch.
-                    {
-                        let cot = 1.0 / (camera.fov_y_radians * 0.5).tan();
-                        let altitude =
-                            (camera_world_pos.length() - self.nanite_radius).max(1.0);
-                        // Wide margin keeps the resident set valid between reselections.
-                        let move_thresh = (altitude * 0.25).max(25.0);
-                        // Rate-limit how often we recompute the (whole-DAG) selection.
-                        const MIN_RESEL_FRAMES: u64 = 4;
-                        let eligible = self.frame_counter.wrapping_sub(self.nanite_last_resel)
-                            >= MIN_RESEL_FRAMES;
-                        let changed = if eligible {
-                            if let Some(s) = self.nanite_streamer.as_mut() {
-                                s.update(
-                                    camera_world_pos, self.nanite_tau, screen_h_px, cot, 2.5,
-                                    move_thresh,
-                                )
-                                .is_some()
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        };
-                        if changed {
-                            self.nanite_last_resel = self.frame_counter;
-                            let fif = rhi.frames_in_flight() as u64;
-                            let completed = self.frame_counter;
-                            let retire_at = self.frame_counter + fif;
-                            if let (Some(n), Some(s)) =
-                                (self.nanite.as_mut(), self.nanite_streamer.as_ref())
-                            {
-                                let _ = n.update_residency(
-                                    rhi, completed, retire_at, &self.nanite_assets,
-                                    s.entries(), s.selection(),
-                                );
-                            }
-                        }
-                    }
-                    // 2. Per-frame uniforms (incl. this frame's active-slot list) + cull.
-                    //    FrameUniforms gives the rotation-only camera-relative view-proj
-                    //    AND the terrain's lights.
-                    if let Some(n) = self.nanite.as_mut() {
-                        // Dithered LOD cross-fade is only useful with TAA on (it
-                        // resolves the per-frame stipple into a smooth blend).
-                        let _ = n.update(
-                            rhi, fi, camera_world_pos, &fu, screen_h_px,
-                            camera.fov_y_radians, self.nanite_tau, terrain_view,
-                            self.taa_enabled, self.frame_counter as u32, cascade_mvps, shadow_params,
-                        );
-                        let _ = n.record_cull(rhi, fi);
-                    }
+                #[cfg(feature = "voxel")]
+                if let Some(vv) = self.voxel_view.as_mut() {
+                    vv.set_view_mode(terrain_view); // bake the selected data field; remeshes on change
+                    vv.update(rhi, fi, &lod_cam);
                 }
+
 
                 // Third-person character: advance the gait + skin + upload this
                 // frame's verts (host-visible memcpy, fine outside the instance).
@@ -1545,20 +1555,51 @@ impl App {
                 // uniforms + keep the shadow map valid. All OUTSIDE begin_rendering
                 // (host-visible uploads + a depth-only pass), mirroring
                 // Character::update + the Nanite cull dispatch.
+                // Tier-2: flora draws in ANY nav mode the opaque bracket supports
+                // (it's mode-invariant), gated on a fade-in altitude so trees resolve
+                // during descent — not only once on the surface. The scatter window
+                // (RADIUS_M) only matters within a few hundred m of the ground; the
+                // threshold sits well above it so impostors appear before landing.
                 #[cfg(feature = "flora")]
-                let draw_trees =
-                    nav_mode == NavMode::Surface && self.flora_enabled && self.flora_renderer.is_some();
+                let draw_trees = self.flora_enabled
+                    && self.flora_renderer.is_some()
+                    && altitude < self.flora_alt_threshold_m;
+                // Scatter/build center: the player's feet in Surface mode; otherwise
+                // (Globe / Placement / Space) `self.surface` is None, so use the
+                // SUB-CAMERA ground point — project the camera radially to the planet
+                // and ground it on the rendered mesh. f64 throughout (camera-relative
+                // precision); None until the heightfield has loaded.
                 #[cfg(feature = "flora")]
-                if draw_trees {
+                let flora_center: Option<DVec3> = if draw_trees {
+                    if let Some(tpc) = self.surface.as_ref() {
+                        Some(tpc.feet_position())
+                    } else if let Some(hf) = self.height_field.as_ref() {
+                        let dir = camera_world_pos.normalize_or_zero();
+                        if dir.length_squared() > 0.0 {
+                            let r = controls::terrain_grid::ground_radius(
+                                hf.as_ref(), self.terrain_height_scale, dir,
+                            );
+                            Some(dir * r)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                #[cfg(feature = "flora")]
+                if let (true, Some(center)) = (draw_trees, flora_center) {
                     // 1. Build the species mesh once from the canonical TreeSpec,
                     //    overridden to SINGLE-leaf cards (the shared `default_specimen`
                     //    is Cluster; the planet wants individual leaves). Drawn at
                     //    many models — its stored origin is unused.
                     if self.flora_tree.is_none() {
-                        if let (Some(tpc), Some(hf)) =
-                            (self.surface.as_ref(), self.height_field.as_ref())
-                        {
-                            let dir = tpc.feet_position().normalize();
+                        if let Some(hf) = self.height_field.as_ref() {
+                            // The species mesh is placement-agnostic (drawn at many
+                            // per-instance models); seed it at the current center.
+                            let dir = center.normalize_or_zero();
                             let r = controls::terrain_grid::ground_radius(
                                 hf.as_ref(), self.terrain_height_scale, dir,
                             );
@@ -1573,6 +1614,13 @@ impl App {
                                         let _ = rend.update_leaf_texture(
                                             rhi, &tree.leaf_genes(), single,
                                         );
+                                        // Bake the TOP/SIDE impostor atlas from the
+                                        // species mesh (one-shot fenced, like the leaf
+                                        // texture upload above) so far trees show a
+                                        // textured billboard, not a flat green disc.
+                                        if let Err(e) = rend.bake_impostor(rhi, &tree) {
+                                            log::error!("FloraRenderer::bake_impostor failed: {e}");
+                                        }
                                     }
                                     self.flora_tree = Some(tree);
                                 }
@@ -1580,34 +1628,67 @@ impl App {
                             }
                         }
                     }
-                    // 2. (Re)scatter when the player moved past half a cell or the
-                    //    density changed (deterministic, so this never reshuffles).
-                    if let (Some(tpc), Some(hf)) =
-                        (self.surface.as_ref(), self.height_field.as_ref())
-                    {
-                        let center = tpc.feet_position();
+                    // 2. (Re)scatter when the player moved a fraction of the WINDOW,
+                    //    the density changed, OR the radius changed (deterministic, so
+                    //    this never reshuffles). NOT per frame — throttled here. A small
+                    //    move only changes a thin far edge ring, so rebuilding the whole
+                    //    250 m disc every ~1 s of walking (the old fixed 2.5 m gate) was
+                    //    the walk-time spike; the floor keeps sub-cell moves from
+                    //    rebuilding the cell-quantized scatter.
+                    if let Some(hf) = self.height_field.as_ref() {
+                        let rescatter_move = (self.flora_radius_m
+                            * flora_scatter::RESCATTER_MOVE_FRAC)
+                            .max(flora_scatter::SPACING_M);
                         let moved = self
                             .flora_scatter_center
-                            .map_or(true, |p| {
-                                (p - center).length() > flora_scatter::SPACING_M * 0.5
-                            });
+                            .map_or(true, |p| (p - center).length() > rescatter_move);
                         let density_changed =
                             (self.flora_density - self.flora_last_density).abs() > 1e-3;
-                        if moved || density_changed {
+                        let radius_changed =
+                            (self.flora_radius_m - self.flora_last_radius_m).abs() > 1e-3;
+                        if moved || density_changed || radius_changed {
                             self.flora_instances = flora_scatter::scatter(
-                                hf.as_ref(), self.terrain_height_scale, center, self.flora_density,
+                                hf.as_ref(), self.terrain_height_scale, center,
+                                self.flora_density, self.flora_radius_m,
                             );
+                            // Re-ground every tree on the EXACT voxel mesh (the renderer's
+                            // own triangles), the same single source the character uses —
+                            // so trees sit on the drawn surface, not scatter()'s analytic
+                            // curve. Far trees on coarser leaves still ride their real mesh.
+                            #[cfg(feature = "voxel")]
+                            if let Some(vv) = self.voxel_view.as_ref() {
+                                for inst in self.flora_instances.iter_mut() {
+                                    let dir = inst.origin.normalize_or_zero();
+                                    if dir.length_squared() > 0.5 {
+                                        if let Some(r) = vv.ground_radius(dir) {
+                                            inst.origin = dir * r;
+                                        }
+                                    }
+                                }
+                            }
                             self.flora_scatter_center = Some(center);
                             self.flora_last_density = self.flora_density;
+                            self.flora_last_radius_m = self.flora_radius_m;
                         }
                     }
                     // 3. Frame uniforms + ONE wind solve (shared by every instance —
-                    //    same genome → same bones) + shadow-map validity (shadows off
-                    //    in-scene: enabled (params.z) = 0 → fs skips the sample; the
-                    //    empty depth pass just keeps set1's shadow map in SHADER_READ).
-                    //    ponytail: the 2048² clear each frame is cheap; init once if
-                    //    it ever shows on a profile.
+                    //    same genome → same bones) + make the trees RECEIVE the
+                    //    planet's 3-cascade sun CSM (the same maps the terrain samples):
+                    //    point the flora shadow set at the cascade depth views and
+                    //    upload the cascade matrices (camera-relative → use_view_pos=1).
+                    //    The empty self-shadow pass below keeps flora's own map in
+                    //    SHADER_READ as the no-CSM fallback (enabled=0 then).
                     self.flora_clock += dt;
+                    let recv_shadows = self.shadow_map_enabled && rhi.has_shadow_map();
+                    let cascade_views = if recv_shadows {
+                        Some([
+                            rhi.shadow_map_view(fi, 0),
+                            rhi.shadow_map_view(fi, 1),
+                            rhi.shadow_map_view(fi, 2),
+                        ])
+                    } else {
+                        None
+                    };
                     if let (Some(rend), Some(tree)) =
                         (self.flora_renderer.as_mut(), self.flora_tree.as_mut())
                     {
@@ -1615,10 +1696,26 @@ impl App {
                         let _ = rend.set_frame_uniforms(rhi, fi, &fu);
                         let _ = rend.set_bone_matrices(rhi, fi, tree.solve_wind(wind));
                         let su = ShadowUniforms {
-                            light_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
-                            params: [1.0 / rend.shadow_map_size() as f32, 0.0, 0.0, 0.0],
+                            light_view_proj: cascade_mvps[0].to_cols_array_2d(),
+                            // (1/size [unused — shader uses textureDimensions], normal_bias,
+                            //  enabled, dappled off on the planet)
+                            params: [
+                                1.0 / rend.shadow_map_size() as f32,
+                                shadow_params[1],
+                                if recv_shadows { 1.0 } else { 0.0 },
+                                0.0,
+                            ],
+                            light_view_proj1: cascade_mvps[1].to_cols_array_2d(),
+                            light_view_proj2: cascade_mvps[2].to_cols_array_2d(),
+                            // (cascade_count=3, use_view_pos=1, depth_bias, _)
+                            params2: [3.0, 1.0, shadow_params[0], 0.0],
                         };
                         let _ = rend.set_shadow_uniforms(rhi, fi, &su);
+                        if let Some(views) = cascade_views {
+                            rend.set_shadow_cascade_views(fi, views);
+                        }
+                        // Keep flora's own self-shadow map in SHADER_READ (the fallback
+                        // bound when recv_shadows is false). Empty when the CSM is used.
                         rend.begin_shadow_pass(rhi, fi);
                         rend.end_shadow_pass(rhi, fi);
                     }
@@ -1628,17 +1725,19 @@ impl App {
                 // pass PER CASCADE — render the casters (terrain Nanite cut, character,
                 // nearby trees) into each cascade map from the light. The terrain then
                 // PCF-samples the tightest covering cascade in fs_color.
-                #[cfg(feature = "nanite")]
-                if nanite_active && self.shadow_map_enabled && rhi.has_shadow_map() {
+                if self.shadow_map_enabled && rhi.has_shadow_map() {
                     for c in 0..rhi.shadow_cascade_count() {
                         let lvp = cascade_mvps[c as usize];
                         // Cascade c covers ±(base·2^c) around the focus; cast within that
                         // + a margin for shadows reaching inward from just outside.
+                        #[cfg(feature = "flora")]
                         let cast_radius =
                             (self.shadow_half_extent * (1u32 << c) as f32 * 1.5) as f64;
                         rhi.begin_shadow_pass(fi, c);
-                        if let Some(n) = self.nanite.as_ref() {
-                            let _ = n.record_shadow_draw(rhi, fi, c);
+                        // Voxel terrain caster (resident leaves → this cascade's depth).
+                        #[cfg(feature = "voxel")]
+                        if let Some(vv) = self.voxel_view.as_ref() {
+                            let _ = vv.record_shadow(rhi, fi, lvp, camera_world_pos);
                         }
                         // Character caster (real mesh silhouette) — always near the focus.
                         if draw_character {
@@ -1658,8 +1757,20 @@ impl App {
                                 (self.flora_renderer.as_ref(), self.flora_tree.as_ref())
                             {
                                 let wind = [self.flora_clock, 0.6, 1.0, 0.0];
+                                let light_planes = frustum_side_planes(lvp);
+                                let base_r = tree.cull_radius();
                                 for inst in &self.flora_instances {
                                     if (inst.origin - shadow_focus).length() > cast_radius {
+                                        continue;
+                                    }
+                                    // Sun-frustum (cascade footprint) cull: a tree
+                                    // outside this cascade's light box can't shadow into
+                                    // it. Tighter than the distance gate at the box
+                                    // corners; the sun-depth axis is NOT tested (a tree
+                                    // up-sun still casts into the footprint).
+                                    let center = (inst.origin - camera_world_pos).as_vec3();
+                                    if !sphere_in_side_planes(&light_planes, center, base_r * inst.scale)
+                                    {
                                         continue;
                                     }
                                     let model = flora_scatter::instance_model(
@@ -1678,7 +1789,7 @@ impl App {
                 // 3D opaque pass.
                 rhi.begin_rendering(fi);
                 rhi.set_viewport_scissor_full(fi);
-                if !nanite_active {
+                if !voxel_on {
                     if let Some(pv) = self.planet_view.as_mut() {
                         if let Err(e) = pv.record(rhi, fi, &fu, camera_world_pos, terrain_view, wireframe) {
                             log::error!("PlanetView::record error: {e}");
@@ -1686,13 +1797,16 @@ impl App {
                     }
                 }
 
-                // Nanite: indirect, vertex-pulling draw (inside the rendering instance).
-                #[cfg(feature = "nanite")]
-                if nanite_active {
-                    if let Some(n) = self.nanite.as_ref() {
-                        let _ = n.record_draw(rhi, fi);
+                // Voxel terrain (Phase 2): draw all resident transvoxel leaves.
+                #[cfg(feature = "voxel")]
+                if let Some(vv) = self.voxel_view.as_ref() {
+                    if let Err(e) = vv.record(
+                        rhi, fi, &fu, camera_world_pos, terrain_view, cascade_mvps, shadow_params,
+                    ) {
+                        log::error!("VoxelView::record error: {e}");
                     }
                 }
+
 
                 // Solar-system bodies (sun + distant planets) as lit spheres on the sky
                 // shell; drawn after opaque terrain so reversed-Z lets the focused planet
@@ -1703,9 +1817,11 @@ impl App {
                     }
                 }
 
-                // Atmosphere shell — after bodies, behind the foreground (the limb
-                // halo against space + a soft silhouette).
-                if self.atmo_enabled {
+                // Atmosphere shell — TAA-OFF fallback only. With TAA on, the
+                // depth-aware `Aerial` pass (water split) IS the scattering, the sky
+                // dome AND the limb halo; drawing the shell too just double-tints the
+                // planet blue from orbit. Mutually exclusive (matches aerial.rs).
+                if self.atmo_enabled && !(self.taa_enabled && self.aerial_enabled) {
                     if let Some(a) = self.atmosphere.as_ref() {
                         if let Err(e) = a.record(rhi, fi, &fu, camera_world_pos, self.atmo_params) {
                             log::error!("Atmosphere::record error: {e}");
@@ -1742,31 +1858,88 @@ impl App {
                     {
                         let feet = tpc.feet_position();
                         let facing = tpc.facing();
-                        if let Err(e) = ch.draw(rhi, fi, &fu, &camera, feet, facing) {
+                        if let Err(e) =
+                            ch.draw(rhi, fi, &fu, &camera, feet, facing, cascade_mvps, shadow_params)
+                        {
                             log::error!("Character::draw error: {e}");
                         }
                     }
                 }
 
-                // Procedural trees: drawn inside the opaque pass, after the
-                // character, before the translucent ocean (shares reversed-Z depth).
-                // Every scattered tree renders at FULL detail — no leaf LOD, no
-                // impostor fade — so far trees stay fully visible. ponytail: these
-                // are plain per-instance draws (NOT Nanite-virtualized), so cost
-                // scales with the count; flora_scatter::MAX_TREES caps it.
+                // Procedural trees: drawn inside the opaque pass, after the character,
+                // before the translucent ocean (shares reversed-Z depth).
+                // GEOMETRY NEAR, FLAT GREEN DISC MID, TINTED GROUND FAR: within
+                // TREE_GEOM_M the real tree draws; past it each tree collapses to ONE
+                // flat green disc (the impostor billboard) — top-down / mid-range bare
+                // branches read as red sticks, so a flat canopy dot looks far better and
+                // is cheap. Past the scatter ring there are no instances at all — the
+                // baked forest canopy tint (vegetation_density in tessellate.rs) IS the
+                // forest from a distance / orbit, at zero per-frame cost.
+                // ponytail: per-instance draws (NOT Nanite-virtualized); instance the
+                // discs if the count ever costs. Disc colour + crossover are consts —
+                // promote to GUI sliders if tuned often.
                 #[cfg(feature = "flora")]
                 if draw_trees {
                     if let (Some(rend), Some(tree)) =
                         (self.flora_renderer.as_ref(), self.flora_tree.as_ref())
                     {
+                        // Geometry within TREE_GEOM_M; flat green disc beyond, opaque by
+                        // the end of the TREE_FADE_M crossfade band.
+                        const TREE_GEOM_M: f32 = 40.0;
+                        const TREE_FADE_M: f32 = 25.0;
+                        const DISC_GREEN: [f32; 3] = [0.10, 0.22, 0.08];
+                        let disc_green = glam::Vec3::from(DISC_GREEN);
                         let wind = [self.flora_clock, 0.6, 1.0, 0.0];
+                        // Frustum + behind-camera cull. Trees are plain per-instance
+                        // draws and the scatter ring wraps the whole sphere around the
+                        // player, so ~half sit behind the camera — skipping the
+                        // off-screen ones is a direct draw-call saving.
+                        let cam_planes =
+                            frustum_side_planes(glam::Mat4::from_cols_array_2d(&fu.view_proj));
+                        let cam_fwd = camera.orientation * glam::Vec3::NEG_Z;
+                        let cam_right = camera.orientation * glam::Vec3::X;
+                        let cam_up = camera.orientation * glam::Vec3::Y;
+                        let base_r = tree.cull_radius();
                         for inst in &self.flora_instances {
+                            let center = (inst.origin - camera_world_pos).as_vec3();
+                            let radius = base_r * inst.scale;
+                            if center.dot(cam_fwd) < -radius
+                                || !sphere_in_side_planes(&cam_planes, center, radius)
+                            {
+                                continue;
+                            }
+                            let disc =
+                                ((center.length() - TREE_GEOM_M) / TREE_FADE_M).clamp(0.0, 1.0);
                             let model = flora_scatter::instance_model(
                                 inst.origin, inst.yaw, inst.scale, camera_world_pos,
                             );
-                            if let Err(e) = tree.record_at(rhi, rend, fi, model, wind) {
-                                log::error!("FloraView::record_at error: {e}");
-                                break;
+                            // Geometry (leaves thin as the disc fades in); skipped once
+                            // fully a disc.
+                            if disc < 1.0 {
+                                let lod = LeafLod {
+                                    density_frac: 1.0 - disc,
+                                    cast_leaf_shadows: true,
+                                    impostor_blend: 0.0,
+                                };
+                                if let Err(e) = tree.record_at_lod(rhi, rend, fi, model, wind, lod)
+                                {
+                                    log::error!("FloraView::record_at_lod error: {e}");
+                                    break;
+                                }
+                            }
+                            // Flat green disc (alpha-blended) ON TOP, once the fade has
+                            // started; camera-facing billboard.
+                            if disc > 0.0 {
+                                // Tree radial up = the surface normal at the
+                                // instance (the FS blends TOP vs SIDE atlas tiles).
+                                let tree_up = inst.origin.normalize().as_vec3();
+                                if let Err(e) = tree.record_impostor_at(
+                                    rhi, rend, fi, model, cam_right, cam_up, disc_green,
+                                    disc, tree_up,
+                                ) {
+                                    log::error!("FloraView::record_impostor_at error: {e}");
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1883,15 +2056,6 @@ impl App {
                     s.min_lod_level, s.max_lod_level,
                 );
             }
-            #[cfg(feature = "nanite")]
-            if self.nanite_enabled {
-                if let Some(n) = self.nanite.as_ref() {
-                    log::info!(
-                        "[nanite] enabled — visible clusters (prev frame): {}",
-                        n.last_visible_clusters()
-                    );
-                }
-            }
         }
 
         // ── TAA resolve ──────────────────────────────────────────────────
@@ -1905,14 +2069,11 @@ impl App {
             );
             let unjittered_vp = proj * camera.view_matrix_rotation_only();
             self.taa_jitter.advance(unjittered_vp, camera.position);
-            // The shadow MAP supersedes the screen-space sun shadow when it's active
-            // (it casts objects + terrain too) — disable the SS shadow to avoid
-            // double-darkening. Keep SS only as the fallback when the map is off.
-            #[cfg(feature = "nanite")]
-            let map_active = self.shadow_map_enabled && self.nanite_enabled && rhi.has_shadow_map();
-            #[cfg(not(feature = "nanite"))]
-            let map_active = false;
-            let ss_shadow = if map_active { 0.0 } else { 1.0 };
+            // The voxel terrain now RECEIVES the crisp CSM (terrain_csm.wgsl), so the
+            // screen-space sun shadow — a dithered, blocky stopgap — would just double
+            // up and stipple the ground. Turn it OFF when the CSM map is active; keep it
+            // as the fallback only when there's no shadow map.
+            let ss_shadow = if rhi.has_shadow_map() { 0.0_f32 } else { 1.0_f32 };
             let params = self.taa_jitter.resolve_params(
                 aspect * screen_h_px,
                 screen_h_px,
@@ -1942,12 +2103,17 @@ impl App {
             egui.render(rhi, fi);
         }
 
+        // Measure CPU recording cost now (before submit/present); stored after the
+        // `rhi` borrow ends below, for next frame's Stats panel.
+        let cpu_ms = cpu_t0.elapsed().as_secs_f32() * 1000.0;
+
         // ── End frame ─────────────────────────────────────────────────────
         // end_frame closes the UI rendering instance opened by begin_ui_pass,
         // then submits and presents.
         if let Err(e) = rhi.end_frame(fi) {
             log::error!("end_frame error: {e}");
         }
+        self.cpu_ms = cpu_ms;
     }
 }
 
@@ -1964,6 +2130,28 @@ impl App {
 /// invariant, so centring is purely a *reach* choice (a small box must sit on the
 /// player to cover the wedge ahead); shrinking `half_extent` is the density lever.
 #[cfg_attr(not(feature = "nanite"), allow(dead_code))]
+/// The four SIDE frustum planes (left, right, bottom, top) of a view-projection
+/// matrix, normalized (Gribb–Hartmann). A point `p` is inside a plane iff
+/// `dot(plane.xyz, p) + plane.w >= 0`. Near/far are omitted on purpose: for the
+/// camera we reject behind-the-eye points with an explicit forward dot (sidesteps
+/// the reversed-Z near/far sign subtlety); for a sun cascade the depth axis must
+/// NOT cull a caster (a tree up-sun still shadows the footprint).
+#[cfg(feature = "flora")]
+fn frustum_side_planes(vp: glam::Mat4) -> [glam::Vec4; 4] {
+    let (r0, r1, r3) = (vp.row(0), vp.row(1), vp.row(3));
+    [r3 + r0, r3 - r0, r3 + r1, r3 - r1].map(|p| {
+        let n = p.truncate().length();
+        if n > 1e-8 { p / n } else { p }
+    })
+}
+
+/// Conservative sphere-vs-side-planes test (`center` in the matrix's space).
+#[cfg(feature = "flora")]
+fn sphere_in_side_planes(planes: &[glam::Vec4; 4], center: glam::Vec3, radius: f32) -> bool {
+    planes.iter().all(|pl| pl.truncate().dot(center) + pl.w >= -radius)
+}
+
+#[allow(dead_code)] // used by the voxel shadow caster (and dead under --no-default-features)
 fn sun_light_view_proj(
     sun_dir: glam::Vec3,
     cam_world: glam::DVec3,
@@ -2036,4 +2224,25 @@ fn main() {
     }
 
     log::info!("enki shut down");
+}
+
+#[cfg(all(test, feature = "flora"))]
+mod cull_tests {
+    use super::{frustum_side_planes, sphere_in_side_planes};
+    use enki_render::projection::reversed_z_orthographic;
+    use glam::Vec3;
+
+    #[test]
+    fn side_planes_accept_inside_reject_outside() {
+        // Ortho box ±2 in x/y; the matrix's own space is the test space. The side
+        // planes ignore depth, so any z works.
+        let vp = reversed_z_orthographic(-2.0, 2.0, -2.0, 2.0, 1.0, 100.0);
+        let planes = frustum_side_planes(vp);
+        assert!(sphere_in_side_planes(&planes, Vec3::ZERO, 0.1), "centre is inside");
+        assert!(!sphere_in_side_planes(&planes, Vec3::new(10.0, 0.0, 0.0), 0.1), "far +x is outside");
+        assert!(!sphere_in_side_planes(&planes, Vec3::new(0.0, 10.0, 0.0), 0.1), "far +y is outside");
+        // A big enough bounding sphere widens acceptance (conservative — never drops
+        // geometry that pokes into the frustum).
+        assert!(sphere_in_side_planes(&planes, Vec3::new(2.5, 0.0, 0.0), 1.0), "straddler kept");
+    }
 }

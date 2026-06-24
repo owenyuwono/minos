@@ -137,6 +137,18 @@ fn hg(cos_t: f32, g: f32) -> f32 {
     return (1.0 - g2) / (4.0 * PI * pow(max(1.0 + g2 - 2.0 * g * cos_t, 1e-4), 1.5));
 }
 
+// ACES filmic tonemap (same curve as terrain/ocean). The cloud body is HDR (sun + amb
+// luminance > 1); without this it clamps to flat white on the 8-bit sRGB target while
+// the tonemapped scene under it does not, so the cloud reads as a blown-out sheet.
+fn aces_filmic(x: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 // Interleaved gradient noise, animated per frame → breaks march banding.
 fn ign(px: vec2<f32>, frame_n: f32) -> f32 {
     let p = px + 5.588238 * fract(frame_n * 0.6180339887);
@@ -193,18 +205,35 @@ fn height_gradient(h: f32, cloud_type: f32) -> f32 {
 // skips the fine static detail (empty-space scout + sun light-march).
 fn density_at(pos: vec3<f32>, hfrac: f32, cheap: bool) -> f32 {
     let dir = normalize(pos);
-    // Sharpen the advected field into defined clouds; scale by the coverage slider.
-    // The advected field's mean sits ~0.3, so the gate is low + tight: most of a moist
-    // clump reads as cloud, dry gaps stay clear.
-    let field = sample_coverage(dir);
-    let cov = clamp(smoothstep(0.04, 0.26, field) * cloud.shell.z * 2.2, 0.0, 1.0);
+    // Climate-shaped coverage from the advected field — NO saturating gain, so the field's
+    // spatial variation survives as the cloud pattern. The coverage slider slides the
+    // threshold `lo` (higher coverage → lower threshold → more sky filled).
+    let raw = sample_coverage(dir);
+    let lo = mix(0.5, 0.05, cloud.shell.z);
+    let shaped = smoothstep(lo, lo + 0.30, raw);
+    // moisture_influence (extra.w): 1 = pure climate field, 0 = uniform overcast deck.
+    // Applied to cov (NOT the field) — a low setting raises a uniform deck instead of a
+    // field floor that would flood the whole planet (every cell pushed over `lo`).
+    let cov = mix(cloud.shell.z, shaped, cloud.extra.w);
     if (cov <= 0.01) { return 0.0; }
     var d = cov * height_gradient(hfrac, cloud.extra.x);
     if (d <= 0.0 || cheap) { return d; }
-    // Fine sub-grid static detail (crispness on top of the bilinear-smooth field).
+    // Multi-octave BILLOW detail — this is the cloud's "texture". Inverted Worley FBM (high
+    // at cell cores = billows, low in the gaps) at two frequencies carves cauliflower relief
+    // into the smooth coverage shape; the dense, self-shadowed surface (high `density`) then
+    // reads it as light/dark detail. Curl churns the sample for wispy motion.
+    // ponytail: 2 octaves @ ≥190 m features — finer aliases (clouds aren't TAA-resolved);
+    // for crisper texture raise `steps` (smaller march step) AND add a higher octave.
     let inv = 1.0 / cloud.march.z;
-    let er = worley(pos * (inv * 6.0));
-    d = d * (0.6 + 0.4 * er);
+    let curl_amt = cloud.extra.z;
+    let curl_off = noise3(pos * (inv * 2.0)) * (curl_amt * cloud.march.z * 0.6);
+    let q = pos + curl_off;
+    let billow = clamp(
+        (1.0 - worley(q * (inv * 6.0))) * 0.65 + (1.0 - worley(q * (inv * 13.0))) * 0.35,
+        0.0, 1.0);
+    // Erode the gaps (low billow), harder at the wispy edges (low cov) than the solid cores.
+    let erode = clamp(0.45 + 0.55 * curl_amt, 0.0, 1.0) * (0.3 + 0.7 * (1.0 - cov));
+    d = d * (1.0 - erode * (1.0 - billow));
     return clamp(d, 0.0, 1.0);
 }
 
@@ -323,7 +352,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // WHITE clouds: neutral ambient (not sky-blue tinted), scaled by sky brightness so
     // it still dims at night. The sky's colour only nudges it slightly.
     let sky_lum = max(frame.hemi_sky.x, max(frame.hemi_sky.y, frame.hemi_sky.z));
-    let amb = vec3<f32>(0.45 + 0.55 * sky_lum) + frame.hemi_sky.xyz * 0.08;
+    // Modest neutral sky-fill, scaled by daylight (dark at night). Kept LOW so the sun
+    // term + self-shadow (tau) carve the cloud's form — a high floor (was 0.45) flattens
+    // all contrast and, with the now-tonemapped body, washes the clouds back to grey.
+    let amb = vec3<f32>(0.06 + 0.30 * sky_lum) + frame.hemi_sky.xyz * 0.06;
 
     var transmit = 1.0;
     var scattered = vec3<f32>(0.0);
@@ -367,11 +399,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let alpha = clamp(1.0 - transmit, 0.0, 1.0);
 
     if (cloud.misc.x > 0.5) {
-        // Debug "Density" view: opaque coverage heatmap.
-        return vec4<f32>(alpha, alpha * 0.6, 1.0 - alpha, 1.0);
+        // Debug "Density" view: the RAW advected coverage field (grayscale) sampled at the
+        // shell midpoint — shows the worker's field DIRECTLY (white = saturated/covers, black
+        // = clear), independent of the density/lighting, so coverage vs shading bugs split.
+        let mid = dir * mix(t_enter, t_exit, 0.5) - c;
+        let rawc = sample_coverage(normalize(mid));
+        return vec4<f32>(rawc, rawc, rawc, 1.0);
     }
 
     if (alpha <= 0.001) { return vec4<f32>(0.0); }
-    // Un-premultiply for SRC_ALPHA blend (hardware re-multiplies by alpha).
-    return vec4<f32>(scattered / alpha, alpha);
+    // Tonemap the HDR cloud body into displayable range (the terrain/ocean it composites
+    // over are ACES-tonemapped too). Un-premultiply for SRC_ALPHA blend (hardware
+    // re-multiplies by alpha).
+    return vec4<f32>(aces_filmic(scattered / alpha), alpha);
 }

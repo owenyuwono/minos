@@ -49,18 +49,12 @@ pub struct LoadParams {
     pub climate: ClimateParams,
     pub radius: f64,
     pub height_scale: f64,
-    /// Per-face DAG bake resolution (Stage-1 true-Nanite: deep, fully resident).
-    pub nanite_resolution: u32,
 }
 
 /// Result produced by the loader thread.
 pub struct LoadOutput {
-    /// The shared height field (used by `PlanetView` and the Nanite renderer).
+    /// The shared height field (used by the voxel terrain / `PlanetView`).
     pub hf: Arc<dyn HeightField>,
-    /// One deep cluster-DAG per cube face (each its own f64 origin). Resident in
-    /// full; the GPU per-cluster cut is the only LOD mechanism (no quadtree).
-    #[cfg(feature = "nanite")]
-    pub nanite_asset: Option<Vec<enki_nanite::cluster::ClusterAsset>>,
     /// Per-stage load timing for the completion popup.
     pub timings: LoadTimings,
 }
@@ -116,22 +110,7 @@ impl Loader {
             let heightfield_ms = t_load.elapsed().as_secs_f64() * 1e3;
             log::info!("load: heightfield built in {:.0}ms", heightfield_ms);
 
-            #[cfg(feature = "nanite")]
-            let (nanite_asset, bake_wall_ms, tessellate_ms, clusters_ms, dag_ms) = {
-                set(0.4, "Baking Nanite planet (6 deep face DAGs)…");
-                let t_bake = std::time::Instant::now();
-                let (asset, bt) = enki_nanite::bake::bake_planet(
-                    hf.as_ref(),
-                    params.radius,
-                    params.height_scale,
-                    params.nanite_resolution,
-                );
-                let bake_wall_ms = t_bake.elapsed().as_secs_f64() * 1e3;
-                log::info!("load: bake_planet (6 faces) wall-clock {:.0}ms", bake_wall_ms);
-                (Some(asset), bake_wall_ms, bt.tessellate_ms, bt.clusters_ms, bt.dag_ms)
-            };
-
-            #[cfg(not(feature = "nanite"))]
+            // Terrain is meshed on demand by the voxel renderer — no startup bake.
             let (bake_wall_ms, tessellate_ms, clusters_ms, dag_ms) = (0.0_f64, 0.0, 0.0, 0.0);
 
             set(0.95, "Uploading to GPU…");
@@ -145,8 +124,6 @@ impl Loader {
             };
             let _ = tx.send(LoadOutput {
                 hf,
-                #[cfg(feature = "nanite")]
-                nanite_asset,
                 timings,
             });
         });

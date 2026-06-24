@@ -206,6 +206,11 @@ pub struct PlanetViewStats {
 }
 
 impl PlanetView {
+    /// Total triangles across all GPU-resident chunks (top-right HUD stat).
+    pub fn triangle_count(&self) -> u32 {
+        self.resident.values().map(|rc| rc.handle.index_count).sum::<u32>() / 3
+    }
+
     /// Return a lightweight snapshot of LOD statistics for the current frame.
     ///
     /// Cheap: iterates resident keys (typically < 1000) with no allocation.

@@ -10,6 +10,7 @@ struct ClusterMeta {
     parent_bounds: vec4<f32>, // encloses bounds
     err: vec4<f32>,           // self_error, parent_error, lod, _
     range: vec4<u32>,         // tri_offset, tri_count, _, _
+    cone: vec4<f32>,          // backface normal cone: axis.xyz, sin(half_angle)
 };
 
 struct FrameData {
@@ -89,6 +90,18 @@ fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (dot(pl.xyz, center) + pl.w < -r) {
             return;
         }
+    }
+
+    // Backface normal-cone cull: skip a cluster whose every triangle faces away.
+    // `view` is the camera→cluster direction (camera at the origin), `cone.xyz` the
+    // outward axis, `cone.w` = sin(half-angle). When all faces point away,
+    // `dot(axis, view) > sin(half-angle)` holds (derivation: the worst-case face,
+    // tilted toward the view, still faces away iff `dot(axis,view) > sin α`). The
+    // sentinel `cone.w >= 2` (degenerate / >hemisphere cone) never fires. Skip when
+    // the camera is inside the bounds (view direction ill-defined, apex matters).
+    let dlen = length(center);
+    if (dlen > r && dot(m.cone.xyz, center / dlen) > m.cone.w) {
+        return;
     }
 
     let tau = frame.lod.x;

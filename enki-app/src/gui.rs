@@ -61,6 +61,10 @@ pub struct UiOutput {
     pub nanite_enabled: bool,
     /// LOD pixel-error threshold (lower = finer / smoother LOD, heavier).
     pub nanite_tau: f32,
+    /// Carve dig-able caves into the voxel terrain.
+    pub voxel_caves: bool,
+    /// Cave carve strength (m).
+    pub voxel_cave_strength: f32,
     /// Draw the translucent ocean shell over the planet.
     pub ocean_enabled: bool,
     /// Sea level as a metre offset from the terrain's `e = 0` datum.
@@ -75,6 +79,10 @@ pub struct UiOutput {
     pub flora_enabled: bool,
     /// Fraction of candidate cells that get a tree (0..1).
     pub flora_density: f32,
+    /// Tree draw radius around the player (m) — far trees collapse to impostors.
+    pub flora_radius_m: f64,
+    /// Draw flora within this altitude of the surface (m) — fade in on descent.
+    pub flora_alt_threshold_m: f64,
     /// Cycle nav mode (same as Tab).
     pub cycle_nav: bool,
     /// Exit the surface walker back to orbit (same as Esc).
@@ -106,6 +114,36 @@ pub struct UiOutput {
     pub markers_equator: bool,
     /// Draw the traced river network.
     pub rivers_enabled: bool,
+}
+
+// ── Profiler ──────────────────────────────────────────────────────────────
+
+/// Per-frame perf counters for the top-right Stats panel. All ~1–2 frames stale
+/// (read back from the GPU / measured on the prior frame) — fine for a HUD.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Profiler {
+    /// CPU time spent recording the 3D frame (ms) — excludes the begin_frame
+    /// fence wait + vsync, so it reflects real CPU cost even when GPU/vsync-bound.
+    pub cpu_ms: f32,
+    /// Whole-frame GPU time from timestamp queries (ms); 0.0 if unsupported.
+    pub gpu_ms: f32,
+    /// Triangles submitted by the Nanite indirect draw last frame.
+    pub triangles: u64,
+    /// Nanite clusters passing the GPU cull last frame.
+    pub visible_clusters: u32,
+    /// Nanite clusters resident in the GPU page pool.
+    pub resident_clusters: u32,
+}
+
+/// Compact count: `2.41M` / `18.3K` / `742`.
+fn fmt_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.2}M", n as f64 / 1.0e6)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1.0e3)
+    } else {
+        n.to_string()
+    }
 }
 
 // ── EguiState ─────────────────────────────────────────────────────────────
@@ -213,6 +251,9 @@ impl EguiState {
         nanite_enabled:    bool,
         nanite_tau:        f32,
         nanite_available:  bool,
+        voxel_available:   bool,
+        voxel_caves:       bool,
+        voxel_cave_strength: f32,
         ocean_enabled:     bool,
         sea_level_m:       f64,
         wave_enabled:      bool,
@@ -221,6 +262,8 @@ impl EguiState {
         flora_available:   bool,
         flora_enabled:     bool,
         flora_density:     f32,
+        flora_radius_m:    f64,
+        flora_alt_threshold_m: f64,
         time_scale:        f64,
         paused:            bool,
         wind_enabled:      bool,
@@ -236,6 +279,7 @@ impl EguiState {
         rivers_enabled:    bool,
         planet_stats:      Option<&PlanetViewStats>,
         load_stats:        Option<&LoadTimings>,
+        profiler:          Profiler,
     ) -> UiOutput {
         let raw_input = self.winit.take_egui_input(window);
 
@@ -250,6 +294,8 @@ impl EguiState {
             shadow_normal_bias,
             nanite_enabled,
             nanite_tau,
+            voxel_caves,
+            voxel_cave_strength,
             ocean_enabled,
             sea_level_m,
             wave_enabled,
@@ -257,6 +303,8 @@ impl EguiState {
             wave_foam,
             flora_enabled,
             flora_density,
+            flora_radius_m,
+            flora_alt_threshold_m,
             time_scale,
             paused,
             wind_enabled,
@@ -299,11 +347,7 @@ impl EguiState {
                         });
                     });
 
-                    // ── Performance ──────────────────────────────────────────
-                    CollapsingHeader::new("Performance").default_open(true).show(ui, |ui| {
-                        let fps = if frame_time_s > 0.0 { 1.0 / frame_time_s } else { 0.0 };
-                        ui.label(format!("FPS: {fps:.0}   ({:.2} ms)", frame_time_s * 1000.0));
-                    });
+                    // (Performance / FPS moved to the top-right "Stats" panel.)
 
                     // ── Time (orbits + day/night speed) ──────────────────────
                     CollapsingHeader::new("Time").default_open(false).show(ui, |ui| {
@@ -317,27 +361,44 @@ impl EguiState {
 
                     // ── View ─────────────────────────────────────────────────
                     CollapsingHeader::new("View").default_open(true).show(ui, |ui| {
-                        // Geometry-debug views (Triangle/Cluster/LOD) need the Nanite path.
                         let nanite_active = nanite_available && out.nanite_enabled;
+                        // Triangle/Cluster/LOD now work on the voxel terrain too
+                        // (terrain.wgsl / terrain_csm.wgsl modes 3/4/5), so show them
+                        // whenever the active path supports them. Shadow⊙ stays
+                        // Nanite-only (its cascade debug lives in nanite_draw.wgsl).
+                        let geom_available = nanite_available || voxel_available;
+                        let geom_active = nanite_active || voxel_available;
                         ui.horizontal(|ui| {
                             ui.label("View:");
                             ui.selectable_value(&mut out.view_mode, 0, "Lit");
                             ui.selectable_value(&mut out.view_mode, 1, "Unlit");
                             ui.selectable_value(&mut out.view_mode, 2, "Normal");
-                            ui.add_enabled_ui(nanite_active, |ui| {
-                                ui.selectable_value(&mut out.view_mode, 3, "Triangle");
-                                ui.selectable_value(&mut out.view_mode, 4, "Cluster");
-                                ui.selectable_value(&mut out.view_mode, 5, "LOD");
-                                ui.selectable_value(&mut out.view_mode, 14, "Shadow⊙");
-                            });
+                            if geom_available {
+                                ui.add_enabled_ui(geom_active, |ui| {
+                                    ui.selectable_value(&mut out.view_mode, 3, "Triangle");
+                                    ui.selectable_value(&mut out.view_mode, 4, "Cluster");
+                                    ui.selectable_value(&mut out.view_mode, 5, "LOD");
+                                });
+                            }
+                            if nanite_available {
+                                ui.add_enabled_ui(nanite_active, |ui| {
+                                    ui.selectable_value(&mut out.view_mode, 14, "Shadow⊙");
+                                });
+                            }
                         });
                         ui.horizontal(|ui| {
                             ui.label("Planet:");
                             ui.selectable_value(&mut out.view_mode, 6, "Plate");
-                            ui.selectable_value(&mut out.view_mode, 7, "Height");
-                            ui.selectable_value(&mut out.view_mode, 8, "Material");
-                            ui.selectable_value(&mut out.view_mode, 9, "Wetness");
-                            ui.selectable_value(&mut out.view_mode, 10, "Volcano");
+                            // Height/Material/Wetness/Volcano need per-vertex data the
+                            // 4×vec3 format lacks. The voxel path bakes the selected field
+                            // into vertex color on demand (remesh on switch); Nanite carries
+                            // all four per-vertex. Greyed only on the classic quadtree path.
+                            ui.add_enabled_ui(nanite_active || voxel_available, |ui| {
+                                ui.selectable_value(&mut out.view_mode, 7, "Height");
+                                ui.selectable_value(&mut out.view_mode, 8, "Material");
+                                ui.selectable_value(&mut out.view_mode, 9, "Wetness");
+                                ui.selectable_value(&mut out.view_mode, 10, "Volcano");
+                            });
                         });
                         ui.horizontal(|ui| {
                             ui.label("Ocean:");
@@ -349,23 +410,29 @@ impl EguiState {
                             ui.selectable_value(&mut out.view_mode, 13, "Density");
                         });
                         ui.checkbox(&mut out.wireframe, "Wireframe");
-                        ui.checkbox(&mut out.taa, "TAA (temporal AA)");
-                        // Sun shadow map (Nanite path) — casters: terrain + character
-                        // + nearby trees. Greyed when Nanite is off.
-                        ui.add_enabled_ui(nanite_active, |ui| {
-                            ui.checkbox(&mut out.shadow_map_enabled, "Sun shadows (map)");
-                            if out.shadow_map_enabled {
-                                ui.add(egui::Slider::new(&mut out.shadow_half_extent, 8.0..=64.0)
-                                    .text("Shadow base radius (m) — cascade 0; ×2 per cascade"));
-                                ui.add(egui::Slider::new(&mut out.shadow_depth, 60.0..=600.0)
-                                    .text("Shadow depth span (m)"));
-                                ui.add(egui::Slider::new(&mut out.shadow_depth_bias, 0.0..=0.005)
-                                    .text("Shadow depth bias"));
-                                ui.add(egui::Slider::new(&mut out.shadow_normal_bias, 0.0..=0.3)
-                                    .text("Shadow normal bias (m)"));
-                            }
-                        });
+                        // Sun shadow map: re-homed onto the voxel terrain (Phase 3), so
+                        // the controls show for a `voxel` build (or `nanite`). Tunes the
+                        // CSM that the character + trees receive on top of the SS shadow.
+                        if nanite_available || voxel_available {
+                            ui.add_enabled_ui(nanite_active || voxel_available, |ui| {
+                                ui.checkbox(&mut out.shadow_map_enabled, "Sun shadows (map)");
+                                if out.shadow_map_enabled {
+                                    ui.add(egui::Slider::new(&mut out.shadow_half_extent, 8.0..=64.0)
+                                        .text("Shadow base radius (m) — cascade 0; ×2 per cascade"));
+                                    ui.add(egui::Slider::new(&mut out.shadow_depth, 60.0..=600.0)
+                                        .text("Shadow depth span (m)"));
+                                    ui.add(egui::Slider::new(&mut out.shadow_depth_bias, 0.0..=0.005)
+                                        .text("Shadow depth bias"));
+                                    ui.add(egui::Slider::new(&mut out.shadow_normal_bias, 0.0..=0.3)
+                                        .text("Shadow normal bias (m)"));
+                                }
+                            });
+                        }
                     });
+
+                    // ── TAA — gates the refraction split that the FFT ocean,
+                    //    aerial scattering, and clouds all render inside. ─────────
+                    ui.checkbox(&mut out.taa, "TAA (FFT ocean / aerial / clouds need it)");
 
                     // ── Ocean ────────────────────────────────────────────────
                     CollapsingHeader::new("Ocean").default_open(true).show(ui, |ui| {
@@ -426,7 +493,7 @@ impl EguiState {
                         ui.add_enabled(on,
                             egui::Slider::new(&mut out.aerial.intensity, 0.0..=2.0).text("Intensity"));
                         ui.add_enabled(on,
-                            egui::Slider::new(&mut out.aerial.sky_strength, 0.0..=2.0).text("Sky brightness"));
+                            egui::Slider::new(&mut out.aerial.sky_strength, 0.0..=6.0).text("Sky brightness"));
                     });
 
                     // ── Clouds (needs TAA on) ────────────────────────────────
@@ -436,7 +503,7 @@ impl EguiState {
                         ui.add_enabled(on,
                             egui::Slider::new(&mut out.clouds.coverage, 0.0..=1.0).text("Coverage"));
                         ui.add_enabled(on,
-                            egui::Slider::new(&mut out.clouds.density, 0.0..=0.25).text("Density"));
+                            egui::Slider::new(&mut out.clouds.density, 0.0..=0.08).text("Density"));
                         ui.add_enabled(on,
                             egui::Slider::new(&mut out.clouds.base_alt_m, 200.0..=8000.0).text("Base alt (m)"));
                         ui.add_enabled(on,
@@ -473,11 +540,26 @@ impl EguiState {
                     // ── Trees (flora) ────────────────────────────────────────
                     CollapsingHeader::new("Trees").default_open(true).show(ui, |ui| {
                         ui.add_enabled_ui(flora_available, |ui| {
-                            ui.checkbox(&mut out.flora_enabled, "Show trees (surface)");
+                            ui.checkbox(&mut out.flora_enabled, "Show trees");
                             ui.add_enabled(
                                 out.flora_enabled,
                                 egui::Slider::new(&mut out.flora_density, 0.0..=1.0)
                                     .text("Density"),
+                            );
+                            // ponytail: max is bounded by the O(radius²) per-rebuild
+                            // scatter SCAN (~60k climate+raycast evals at 2 km / 5 m
+                            // spacing) — Tier-2 impostors make far DRAWS cheap but do
+                            // nothing for the scan; a spatial-hash / cube-cell-id
+                            // windowed rebuild is the path to a wider horizon.
+                            ui.add_enabled(
+                                out.flora_enabled,
+                                egui::Slider::new(&mut out.flora_radius_m, 100.0..=2000.0)
+                                    .text("Radius (m)"),
+                            );
+                            ui.add_enabled(
+                                out.flora_enabled,
+                                egui::Slider::new(&mut out.flora_alt_threshold_m, 0.0..=8000.0)
+                                    .text("Fade-in altitude (m)"),
                             );
                         });
                         if !flora_available {
@@ -485,19 +567,29 @@ impl EguiState {
                         }
                     });
 
-                    // ── Nanite ───────────────────────────────────────────────
-                    CollapsingHeader::new("Nanite").default_open(true).show(ui, |ui| {
-                        ui.add_enabled_ui(nanite_available, |ui| {
+                    // ── Nanite (only in a `--features nanite` build) ─────────
+                    if nanite_available {
+                        CollapsingHeader::new("Nanite").default_open(true).show(ui, |ui| {
                             ui.checkbox(&mut out.nanite_enabled, "Enable Nanite");
                             ui.add(
                                 egui::Slider::new(&mut out.nanite_tau, 0.25..=8.0)
                                     .text("LOD threshold (px)"),
                             );
                         });
-                        if !nanite_available {
-                            ui.small("Built without the `nanite` feature.");
-                        }
-                    });
+                    }
+
+                    // ── Voxel terrain (only in a `--features voxel` build) ────
+                    if voxel_available {
+                        CollapsingHeader::new("Voxel").default_open(true).show(ui, |ui| {
+                            ui.checkbox(&mut out.voxel_caves, "Caves (carve below surface)");
+                            ui.add_enabled_ui(out.voxel_caves, |ui| {
+                                ui.add(
+                                    egui::Slider::new(&mut out.voxel_cave_strength, 0.0..=200.0)
+                                        .text("Cave strength (m)"),
+                                );
+                            });
+                        });
+                    }
 
                     // ── Planet LOD stats ─────────────────────────────────────
                     if let Some(ps) = planet_stats {
@@ -517,6 +609,51 @@ impl EguiState {
                         ui.label("[Tab] cycle nav mode");
                         ui.label("[V] 1st/3rd-person (surface)");
                         ui.label("[Esc] exit to orbit");
+                    });
+                });
+
+            // ── Top-right Stats / profiler panel ─────────────────────────────
+            egui::Window::new("Stats")
+                .anchor(egui::Align2::RIGHT_TOP, [-8.0, 8.0])
+                .resizable(false)
+                .default_width(150.0)
+                .show(ctx, |ui| {
+                    let fps = if frame_time_s > 0.0 { 1.0 / frame_time_s } else { 0.0 };
+                    let fps_color = if fps >= 50.0 {
+                        egui::Color32::from_rgb(120, 230, 120)
+                    } else if fps >= 30.0 {
+                        egui::Color32::from_rgb(230, 220, 120)
+                    } else {
+                        egui::Color32::from_rgb(230, 120, 120)
+                    };
+                    let ext = rhi.extent();
+                    let gpu = if profiler.gpu_ms > 0.0 {
+                        format!("{:.2} ms", profiler.gpu_ms)
+                    } else {
+                        "—".to_string()
+                    };
+                    egui::Grid::new("stats_grid").num_columns(2).striped(true).show(ui, |ui| {
+                        ui.label("FPS");
+                        ui.colored_label(fps_color, format!("{fps:.0}  ({:.2} ms)", frame_time_s * 1000.0));
+                        ui.end_row();
+                        ui.label("CPU");
+                        ui.label(format!("{:.2} ms", profiler.cpu_ms));
+                        ui.end_row();
+                        ui.label("GPU");
+                        ui.label(gpu);
+                        ui.end_row();
+                        ui.label("Triangles");
+                        ui.label(fmt_count(profiler.triangles));
+                        ui.end_row();
+                        // Clusters are Nanite-specific — only in a `--features nanite` build.
+                        if nanite_available {
+                            ui.label("Clusters");
+                            ui.label(format!("{} vis / {} res", profiler.visible_clusters, profiler.resident_clusters));
+                            ui.end_row();
+                        }
+                        ui.label("Resolution");
+                        ui.label(format!("{}×{}", ext.width, ext.height));
+                        ui.end_row();
                     });
                 });
 

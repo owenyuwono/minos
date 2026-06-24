@@ -13,5 +13,7 @@ pub mod river_carve;
 pub mod sampler;
 pub mod simple_height;
 pub mod tectonics;
+pub mod vegetation;
 
 pub use enki_render::geometry::ChunkMeshArrays;
+pub use vegetation::vegetation_density;
