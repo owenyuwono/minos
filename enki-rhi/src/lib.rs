@@ -17,7 +17,7 @@ pub mod streaming;
 pub mod surface;
 pub mod swapchain;
 pub mod sync;
-mod taa_pass;
+mod scene_targets;
 
 pub use ash::vk;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -92,6 +92,23 @@ pub use pipeline::GraphicsPipelineDesc;
 pub use pipeline::PipelineHandle;
 pub use shader::ShaderModule;
 
+/// Post-process anti-aliasing mode for [`Rhi::present_composite`]. Spatial only —
+/// no temporal history (there is no TAA). Chosen at runtime from the Settings panel.
+///
+/// MODULAR PLUG POINT — to add a method: add a variant here, a WGSL + fullscreen
+/// pipeline in `init_scene_targets`, and a match arm in `present_composite`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PostAa {
+    /// Plain blit `current` → swapchain (relies on the always-on 4× MSAA).
+    #[default]
+    None,
+    /// FXAA fullscreen pass over the resolved scene.
+    Fxaa,
+}
+
+/// FXAA fullscreen post-process shader (built into the scene-composite pipeline).
+const FXAA_WGSL: &str = include_str!("shaders/fxaa.wgsl");
+
 // Re-export streaming types at the crate root for caller convenience.
 pub use streaming::{StreamedMesh, DEFAULT_FRAME_BUDGET_BYTES};
 
@@ -163,6 +180,10 @@ pub struct Rhi {
     frame_counter: u64,
     frames_in_flight: usize,
     msaa_sample_count: vk::SampleCountFlags,
+    /// SSAA supersample factor (1.0 = native). The scene offscreen targets + the 3D
+    /// MSAA depth are sized `swapchain.extent × render_scale`; the swapchain + UI stay
+    /// 1×, and `present_composite` downsamples. Changed via `set_render_scale`.
+    render_scale: f32,
     clear_color: [f32; 4],
     needs_recreate: bool,
 
@@ -187,13 +208,12 @@ pub struct Rhi {
     /// Destroyed after device_wait_idle, before the device itself.
     streamer: Option<streaming::StreamingUploader>,
 
-    // ── TAA ─────────────────────────────────────────────────────────────────
-    /// TAA resolve resources (offscreen targets + history + pipeline). `None`
-    /// until [`Self::init_taa`]. Images recreated on resize, all freed in Drop.
-    taa: Option<taa_pass::TaaResources>,
-    /// When true (and `taa` is initialised), the frame bracket renders the 3D
-    /// pass to the TAA targets and runs the resolve. Toggled by the app.
-    taa_enabled: bool,
+    // ── Scene-composite targets ──────────────────────────────────────────────
+    /// Offscreen targets for the 3D pass (MSAA + resolved current/depth + the
+    /// refraction copies). `None` until [`Self::init_scene_targets`]. Images
+    /// recreated on resize, all freed in Drop. The composited `current` is blitted
+    /// to the swapchain by `present_composite`.
+    scene: Option<scene_targets::SceneTargets>,
 
     // ── Sun shadow map ───────────────────────────────────────────────────────
     /// 1× D32 depth targets rendered from the light each frame, sampled (PCF) by
@@ -334,6 +354,7 @@ impl Rhi {
             frame_counter: 0,
             frames_in_flight: frames_in_flight as usize,
             msaa_sample_count,
+            render_scale: 1.0,
             clear_color: [0.02, 0.03, 0.05, 1.0],
             needs_recreate: false,
             buffers,
@@ -342,8 +363,7 @@ impl Rhi {
             pipelines: ManuallyDrop::new(pipelines),
             current_pipeline_layout: None,
             streamer: Some(streamer),
-            taa: None,
-            taa_enabled: false,
+            scene: None,
             shadow_maps: Vec::new(),
             shadow_map_layouts: Vec::new(),
             shadow_sampler: vk::Sampler::null(),
@@ -912,76 +932,55 @@ impl Rhi {
         self.shadow_map_layouts[idx] = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
     }
 
-    // ── TAA (temporal anti-aliasing) ─────────────────────────────────────────
+    // ── Scene-composite targets ──────────────────────────────────────────────
 
-    /// Initialise the TAA resolve resources. Call once after the swapchain is
-    /// sized. `shader` must hold the resolve fullscreen `vs`/`fs`; `ubo_size` is
-    /// `size_of::<ResolveParams>()`. TAA stays OFF until `set_taa_enabled(true)`.
-    pub fn init_taa(
-        &mut self,
-        shader: &ShaderModule,
-        vs_entry: &str,
-        fs_entry: &str,
-        ubo_size: u64,
-    ) -> Result<(), RhiError> {
+    /// Initialise the scene-composite offscreen targets (MSAA color + resolved
+    /// current/depth + the refraction copies). Call once after the swapchain is
+    /// sized; the 3D pass renders into them whenever they exist.
+    pub fn init_scene_targets(&mut self) -> Result<(), RhiError> {
+        let images = self.create_scene_images()?;
+
+        // FXAA post-process pipeline: a fullscreen pass sampling `current` (binding 0)
+        // with a clamp-to-edge linear sampler (binding 1), rendering to the swapchain.
+        // Built once; survives swapchain resize (only binding 0 re-points — see
+        // `recreate_swapchain`). See `present_composite` for the dispatch.
         let frag = vk::ShaderStageFlags::FRAGMENT;
-        let img = vk::DescriptorType::SAMPLED_IMAGE;
-        let bindings = [
-            BindingDesc { binding: 0, ty: img, stages: frag },
-            BindingDesc { binding: 1, ty: img, stages: frag },
-            BindingDesc { binding: 2, ty: img, stages: frag },
-            BindingDesc { binding: 3, ty: vk::DescriptorType::SAMPLER, stages: frag },
-            BindingDesc { binding: 4, ty: vk::DescriptorType::UNIFORM_BUFFER, stages: frag },
-        ];
-        let set_layout = self.create_descriptor_set_layout(&bindings)?;
-        // Fullscreen post-process pipeline (no vertex input, no depth, one color
-        // attachment, custom set layout) for the TAA resolve pass.
-        let pipeline = self.pipelines.create_fullscreen(
-            shader, vs_entry, fs_entry, set_layout, self.swapchain.format,
+        let fxaa_layout = self.create_descriptor_set_layout(&[
+            BindingDesc { binding: 0, ty: vk::DescriptorType::SAMPLED_IMAGE, stages: frag },
+            BindingDesc { binding: 1, ty: vk::DescriptorType::SAMPLER, stages: frag },
+        ])?;
+        let sm = self.create_shader_module(FXAA_WGSL)?;
+        let fxaa_pipeline = self.pipelines.create_fullscreen(
+            &sm, "vs_fullscreen", "fs_fxaa", fxaa_layout, self.swapchain.format,
         )?;
-        let sampler = self.create_sampler()?;
-
-        let fif = self.frames_in_flight;
-        let mut sets = Vec::with_capacity(fif);
-        let mut ubos = Vec::with_capacity(fif);
-        for _ in 0..fif {
-            let set = self.allocate_descriptor_set(set_layout)?;
-            let ubo = self.create_gpu_buffer(
-                ubo_size.max(16),
-                true,
-                vk::BufferUsageFlags::UNIFORM_BUFFER,
-            )?;
-            // Static bindings (sampler + UBO); image bindings written per-resolve.
-            self.write_sampler_binding(set, 3, sampler);
-            self.write_uniform_binding(set, 4, ubo)?;
-            sets.push(set);
-            ubos.push(ubo);
+        self.destroy_shader_module(sm);
+        let fxaa_sampler = self.create_sampler()?;
+        let fxaa_set = self.allocate_descriptor_set(fxaa_layout)?;
+        self.write_sampler_binding(fxaa_set, 1, fxaa_sampler);
+        if let Some(im) = images.as_ref() {
+            self.write_sampled_image_binding(
+                fxaa_set, 0, im.current.view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            );
         }
 
-        let images = self.create_taa_images()?;
-
-        self.taa = Some(taa_pass::TaaResources {
+        self.scene = Some(scene_targets::SceneTargets {
             images,
-            history_layout: [vk::ImageLayout::UNDEFINED; 2],
-            sampler,
-            set_layout,
-            pipeline,
-            sets,
-            ubos,
-            write_index: 0,
+            fxaa_pipeline,
+            fxaa_sampler,
+            fxaa_set,
         });
-        log::info!("TAA initialised (resolve pipeline + targets ready; toggle currently OFF)");
+        log::info!("scene-composite targets ready (FXAA pipeline built)");
         Ok(())
     }
 
-    /// (Re)build the TAA offscreen images at the current extent (`None` if zero).
-    fn create_taa_images(&mut self) -> Result<Option<taa_pass::TaaImages>, RhiError> {
+    /// (Re)build the scene offscreen images at the current extent (`None` if zero).
+    fn create_scene_images(&mut self) -> Result<Option<scene_targets::SceneImages>, RhiError> {
         if self.swapchain.extent.width == 0 || self.swapchain.extent.height == 0 {
             return Ok(None);
         }
         let dev_h: *const ash::Device = &self.device.handle;
         let dev_a: *mut gpu_allocator::vulkan::Allocator = &mut *self.device.allocator;
-        let images = taa_pass::TaaImages::new(
+        let images = scene_targets::SceneImages::new(
             unsafe { &*dev_h },
             unsafe { &mut *dev_a },
             self.swapchain.extent,
@@ -991,201 +990,236 @@ impl Rhi {
         Ok(Some(images))
     }
 
-    /// Enable/disable the TAA resolve path (no-op until `init_taa`).
-    pub fn set_taa_enabled(&mut self, enabled: bool) {
-        self.taa_enabled = enabled;
+    /// Whether the scene-composite targets are allocated. False only at zero extent
+    /// (minimised), where the 3D pass falls back to rendering straight to the
+    /// swapchain.
+    pub fn scene_targets_ready(&self) -> bool {
+        self.scene.as_ref().map(|s| s.images.is_some()).unwrap_or(false)
     }
 
-    /// True once `init_taa` has run.
-    pub fn taa_ready(&self) -> bool {
-        self.taa.is_some()
+    /// The 3D-pass render extent = `swapchain.extent × render_scale` (SSAA), clamped
+    /// ≥1. The scene offscreen targets + the 3D MSAA depth are this size; the swapchain
+    /// + UI stay 1×. Equals the swapchain extent at scale 1.0.
+    pub fn scene_extent(&self) -> vk::Extent2D {
+        let e = self.swapchain.extent;
+        let s = self.render_scale.clamp(1.0, 2.0);
+        vk::Extent2D {
+            width: (((e.width as f32) * s).round() as u32).max(1),
+            height: (((e.height as f32) * s).round() as u32).max(1),
+        }
     }
 
-    /// Whether the TAA path is active this frame (enabled + initialised + images).
-    pub fn taa_active(&self) -> bool {
-        self.taa_enabled
-            && self
-                .taa
-                .as_ref()
-                .map(|t| t.images.is_some())
-                .unwrap_or(false)
+    /// Set the SSAA supersample factor (1.0 = native, 2.0 = render 2× then downscale at
+    /// present). Rebuilds the scene offscreen targets + the 3D MSAA depth at the scaled
+    /// extent and re-points the FXAA source. Cheap no-op when unchanged. Stalls the GPU
+    /// on change (rare — only when the user switches AA mode in Settings).
+    pub fn set_render_scale(&mut self, scale: f32) {
+        let scale = scale.clamp(1.0, 2.0);
+        if (scale - self.render_scale).abs() < 1e-3 {
+            return;
+        }
+        self.render_scale = scale;
+        if self.scene.is_none()
+            || self.swapchain.extent.width == 0
+            || self.swapchain.extent.height == 0
+        {
+            return; // nothing allocated / minimised — picked up on next (re)create
+        }
+        let _ = unsafe { self.device.handle.device_wait_idle() };
+        let ext = self.scene_extent();
+        let dev_h: *const ash::Device = &self.device.handle;
+        let dev_a: *mut gpu_allocator::vulkan::Allocator = &mut *self.device.allocator;
+        // The 3D MSAA depth shares the rendering instance with the scene MSAA color, so
+        // its extent MUST match — rebuild it at the scaled size too.
+        if let Some(img) = self.depth_image.take() {
+            img.destroy(unsafe { &*dev_h }, unsafe { &mut *dev_a });
+        }
+        match image::AllocatedImage::new_depth(
+            unsafe { &*dev_h }, unsafe { &mut *dev_a }, ext, self.msaa_sample_count,
+        ) {
+            Ok(d) => self.depth_image = Some(d),
+            Err(e) => { log::error!("set_render_scale: depth realloc failed: {e}"); return; }
+        }
+        if let Some(scene) = self.scene.as_mut() {
+            if let Some(images) = scene.images.take() {
+                images.destroy(unsafe { &*dev_h }, unsafe { &mut *dev_a });
+            }
+        }
+        match scene_targets::SceneImages::new(
+            unsafe { &*dev_h }, unsafe { &mut *dev_a }, ext, self.swapchain.format, self.msaa_sample_count,
+        ) {
+            Ok(images) => {
+                self.scene.as_mut().unwrap().images = Some(images);
+                // Re-point the FXAA source at the new `current` view.
+                let (set, view) = {
+                    let s = self.scene.as_ref().unwrap();
+                    (s.fxaa_set, s.images.as_ref().unwrap().current.view)
+                };
+                self.write_sampled_image_binding(
+                    set, 0, view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                );
+            }
+            Err(e) => log::error!("set_render_scale: scene image realloc failed: {e}"),
+        }
+        log::info!("render scale → {:.2}× (scene {}x{})", scale, ext.width, ext.height);
     }
 
-    /// Run the TAA resolve for frame `fi`: reproject + 3×3 neighborhood-clamp +
-    /// blend the current frame against history, then blit the result to the
-    /// swapchain. MUST be called after all 3D draws and BEFORE `begin_ui_pass`.
-    /// `params` is the `ResolveParams` byte image. No-op when TAA isn't active.
-    pub fn taa_resolve(&mut self, fi: u32, params: &[u8]) -> Result<(), RhiError> {
-        if fi == u32::MAX || !self.taa_active() {
+    /// Composite the finished scene to the swapchain and apply post-process AA: close
+    /// the open 3D/water rendering instance, then either blit `current` → swapchain
+    /// (`PostAa::None`) or run a fullscreen FXAA pass `current` → swapchain
+    /// (`PostAa::Fxaa`). Either way the swapchain ends in COLOR_ATTACHMENT for the UI
+    /// pass. MUST be called after all 3D draws and BEFORE `begin_ui_pass`. No-op when
+    /// the scene targets aren't ready (zero extent — `begin_rendering` rendered straight
+    /// to the swapchain).
+    pub fn present_composite(&mut self, fi: u32, aa: PostAa) -> Result<(), RhiError> {
+        if fi == u32::MAX || !self.scene_targets_ready() {
             return Ok(());
         }
         let fi_idx = fi as usize;
         let image_index = self.image_indices[fi_idx] as usize;
         let cmd = self.commands.frames[fi_idx].buffer;
-        let extent = self.swapchain.extent;
+        let swap_extent = self.swapchain.extent;
+        let scene_extent = self.scene_extent(); // SSAA: scene ≥ swapchain (equal at 1×)
 
-        // Pull the handles we need (immutable), then upload the resolve UBO.
-        let (write_index, set, pipeline, ubo) = {
-            let taa = self.taa.as_ref().unwrap();
-            (taa.write_index, taa.sets[fi_idx], taa.pipeline, taa.ubos[fi_idx])
-        };
-        let prev_index = 1 - write_index;
-        self.write_storage_bytes(ubo, params)?;
-
-        let (cur_img, cur_view, depth_img, depth_view, prev_img, prev_view, cur_hist_img, cur_hist_view, prev_layout) = {
-            let taa = self.taa.as_ref().unwrap();
-            let im = taa.images.as_ref().unwrap();
-            (
-                im.current.image,
-                im.current.view,
-                im.resolved_depth.image,
-                im.resolved_depth.view,
-                im.history[prev_index].image,
-                im.history[prev_index].view,
-                im.history[write_index].image,
-                im.history[write_index].view,
-                taa.history_layout[prev_index],
-            )
-        };
+        let cur_img = self.scene.as_ref().unwrap().images.as_ref().unwrap().current.image;
         let swap_img = self.swapchain.images[image_index];
-        let read = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-
-        // Point the per-frame set at this frame's images (sampler + UBO are static).
-        self.write_sampled_image_binding(set, 0, cur_view, read);
-        self.write_sampled_image_binding(set, 1, depth_view, read);
-        self.write_sampled_image_binding(set, 2, prev_view, read);
-
-        let layout = self.pipeline_layout(pipeline)?;
-        let device = &self.device.handle;
+        let swap_view = self.swapchain.image_views[image_index];
         let color = color_subresource_range();
-        let depth = depth_subresource_range();
 
-        unsafe {
-            // Close the 3D rendering instance opened by begin_rendering.
-            device.cmd_end_rendering(cmd);
+        // MODULAR PLUG POINT — to add an AA method: add a `PostAa` variant, build its
+        // WGSL + fullscreen pipeline in `init_scene_targets`, then add a match arm here.
+        match aa {
+            PostAa::Fxaa => {
+                // Fullscreen FXAA: sample `current` (→ SHADER_READ) into the swapchain
+                // (→ COLOR_ATTACHMENT). `current`'s precondition layout is
+                // COLOR_ATTACHMENT_OPTIMAL (same as the blit path relies on).
+                let (pipeline, set) = {
+                    let s = self.scene.as_ref().unwrap();
+                    (s.fxaa_pipeline, s.fxaa_set)
+                };
+                let layout = self.pipeline_layout(pipeline)?;
+                {
+                    let device = &self.device.handle;
+                    unsafe {
+                        device.cmd_end_rendering(cmd);
+                        let to_read = img_barrier(
+                            cur_img, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                            vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ, color,
+                        );
+                        let to_color = img_barrier(
+                            swap_img, vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                            vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE,
+                            vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE, color,
+                        );
+                        device.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&[to_read, to_color]));
 
-            // Transition: inputs → SHADER_READ, history[cur] → COLOR_ATTACHMENT.
-            let b_cur = img_barrier(
-                cur_img, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, read,
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ, color,
-            );
-            let b_depth = img_barrier(
-                depth_img, vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL, read,
-                vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS, vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ, depth,
-            );
-            let b_prev = img_barrier(
-                prev_img,
-                prev_layout, read,
-                vk::PipelineStageFlags2::ALL_COMMANDS, vk::AccessFlags2::NONE,
-                vk::PipelineStageFlags2::FRAGMENT_SHADER, vk::AccessFlags2::SHADER_READ, color,
-            );
-            let b_hist = img_barrier(
-                cur_hist_img, vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE,
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE, color,
-            );
-            let barriers = [b_cur, b_depth, b_prev, b_hist];
-            device.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&barriers));
+                        let attach = vk::RenderingAttachmentInfo::default()
+                            .image_view(swap_view)
+                            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                            .load_op(vk::AttachmentLoadOp::DONT_CARE)
+                            .store_op(vk::AttachmentStoreOp::STORE);
+                        let info = vk::RenderingInfo::default()
+                            .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: swap_extent })
+                            .layer_count(1)
+                            .color_attachments(std::slice::from_ref(&attach));
+                        device.cmd_begin_rendering(cmd, &info);
+                    }
+                }
+                // FXAA renders to the swapchain at 1× (it samples the scaled `current`
+                // via the LINEAR sampler → minification downsamples for free).
+                self.set_viewport_scissor(fi, swap_extent);
+                self.cmd_bind_pipeline(fi, vk::PipelineBindPoint::GRAPHICS, pipeline)?;
+                self.cmd_bind_descriptor_set(fi, vk::PipelineBindPoint::GRAPHICS, layout, 0, set);
+                let device = &self.device.handle;
+                unsafe {
+                    device.cmd_draw(cmd, 3, 1, 0, 0); // fullscreen triangle
+                    device.cmd_end_rendering(cmd);
+                }
+                // Swapchain left in COLOR_ATTACHMENT_OPTIMAL → begin_ui_pass LOADs it.
+            }
+            PostAa::None => {
+                let device = &self.device.handle;
+                unsafe {
+                    // Close the 3D instance opened by begin_rendering (and reopened on
+                    // `current` by begin_water_pass when the refractive water drew).
+                    device.cmd_end_rendering(cmd);
 
-            // Resolve pass → history[cur].
-            let attach = vk::RenderingAttachmentInfo::default()
-                .image_view(cur_hist_view)
-                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::DONT_CARE)
-                .store_op(vk::AttachmentStoreOp::STORE);
-            let info = vk::RenderingInfo::default()
-                .render_area(vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent })
-                .layer_count(1)
-                .color_attachments(std::slice::from_ref(&attach));
-            device.cmd_begin_rendering(cmd, &info);
+                    // current → TRANSFER_SRC, swapchain → TRANSFER_DST, then blit.
+                    let to_src = img_barrier(
+                        cur_img, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+                        vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_READ, color,
+                    );
+                    let to_dst = img_barrier(
+                        swap_img, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE,
+                        vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_WRITE, color,
+                    );
+                    let pre_blit = [to_src, to_dst];
+                    device.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&pre_blit));
+
+                    let sub = vk::ImageSubresourceLayers::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .mip_level(0)
+                        .base_array_layer(0)
+                        .layer_count(1);
+                    // src = scaled scene `current`, dst = 1× swapchain → LINEAR so SSAA
+                    // (scene > swapchain) downsamples; LINEAR is identity at 1:1.
+                    let src_offsets = [
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D { x: scene_extent.width as i32, y: scene_extent.height as i32, z: 1 },
+                    ];
+                    let dst_offsets = [
+                        vk::Offset3D { x: 0, y: 0, z: 0 },
+                        vk::Offset3D { x: swap_extent.width as i32, y: swap_extent.height as i32, z: 1 },
+                    ];
+                    let region = vk::ImageBlit::default()
+                        .src_subresource(sub)
+                        .src_offsets(src_offsets)
+                        .dst_subresource(sub)
+                        .dst_offsets(dst_offsets);
+                    device.cmd_blit_image(
+                        cmd,
+                        cur_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        swap_img, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        std::slice::from_ref(&region),
+                        vk::Filter::LINEAR,
+                    );
+
+                    // swapchain → COLOR_ATTACHMENT for the UI pass.
+                    let to_color = img_barrier(
+                        swap_img, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                        vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_WRITE,
+                        vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                        vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ, color,
+                    );
+                    device.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_color)));
+                }
+            }
         }
-
-        // Dynamic viewport/scissor for the fullscreen pipeline.
-        self.set_viewport_scissor_full(fi);
-        self.cmd_bind_pipeline(fi, vk::PipelineBindPoint::GRAPHICS, pipeline)?;
-        self.cmd_bind_descriptor_set(fi, vk::PipelineBindPoint::GRAPHICS, layout, 0, set);
-
-        let device = &self.device.handle;
-        unsafe {
-            device.cmd_draw(cmd, 3, 1, 0, 0); // fullscreen triangle
-            device.cmd_end_rendering(cmd);
-
-            // history[cur] → TRANSFER_SRC, swapchain → TRANSFER_DST, then blit.
-            let to_src = img_barrier(
-                cur_hist_img, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_READ, color,
-            );
-            let to_dst = img_barrier(
-                swap_img, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE,
-                vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_WRITE, color,
-            );
-            let pre_blit = [to_src, to_dst];
-            device.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(&pre_blit));
-
-            let sub = vk::ImageSubresourceLayers::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .mip_level(0)
-                .base_array_layer(0)
-                .layer_count(1);
-            let offsets = [
-                vk::Offset3D { x: 0, y: 0, z: 0 },
-                vk::Offset3D { x: extent.width as i32, y: extent.height as i32, z: 1 },
-            ];
-            let region = vk::ImageBlit::default()
-                .src_subresource(sub)
-                .src_offsets(offsets)
-                .dst_subresource(sub)
-                .dst_offsets(offsets);
-            device.cmd_blit_image(
-                cmd,
-                cur_hist_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                swap_img, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                std::slice::from_ref(&region),
-                vk::Filter::NEAREST,
-            );
-
-            // swapchain → COLOR_ATTACHMENT for the UI pass.
-            let to_color = img_barrier(
-                swap_img, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_WRITE,
-                vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                vk::AccessFlags2::COLOR_ATTACHMENT_WRITE | vk::AccessFlags2::COLOR_ATTACHMENT_READ, color,
-            );
-            device.cmd_pipeline_barrier2(cmd, &vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&to_color)));
-        }
-
-        // Advance ping-pong + record the new layouts.
-        let taa = self.taa.as_mut().unwrap();
-        taa.history_layout[write_index] = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
-        taa.history_layout[prev_index] = read;
-        taa.write_index = prev_index;
         Ok(())
     }
 
-    /// Split the 3D pass for refractive water (TAA path only). After opaque draws,
-    /// this closes the MSAA opaque instance (resolving it to `current`), copies the
-    /// resolved opaque color into a history scratch image (the refraction source),
-    /// and reopens a 1× rendering instance on `current` (+ `resolved_depth`) so the
-    /// water can sample the scene behind it. `taa_resolve` then closes this instance
-    /// and runs the history blend as usual. No-op (returns false) when TAA is off.
+    /// Split the 3D pass for refractive water. After opaque draws, this closes the
+    /// MSAA opaque instance (resolving it to `current`), copies the resolved opaque
+    /// color into the refraction scratch (the refraction source) + the opaque depth
+    /// into `refract_depth`, and reopens a 1× rendering instance on `current` (+
+    /// `resolved_depth`) so the water can sample the scene behind it.
+    /// `present_composite` then closes this instance and blits `current` to the
+    /// swapchain. No-op (returns false) when the scene targets aren't ready.
     pub fn begin_water_pass(&mut self, fi: u32) -> Result<bool, RhiError> {
-        if fi == u32::MAX || !self.taa_active() {
+        if fi == u32::MAX || !self.scene_targets_ready() {
             return Ok(false);
         }
         let fi_idx = fi as usize;
         let cmd = self.commands.frames[fi_idx].buffer;
-        let extent = self.swapchain.extent;
-        let (cur_img, cur_view, depth_view, rdepth_img, refr_depth_img, scr_img, scr_old) = {
-            let taa = self.taa.as_ref().unwrap();
-            let im = taa.images.as_ref().unwrap();
-            let w = taa.write_index;
+        let extent = self.scene_extent(); // all blits/copies/reopen here are scene-side
+        let (cur_img, cur_view, depth_view, rdepth_img, refr_depth_img, scr_img) = {
+            let im = self.scene.as_ref().unwrap().images.as_ref().unwrap();
             (im.current.image, im.current.view, im.resolved_depth.view,
              im.resolved_depth.image, im.refract_depth.image,
-             im.history[w].image, taa.history_layout[w])
+             im.refraction_scratch.image)
         };
         let color = color_subresource_range();
         let dr = depth_subresource_range();
@@ -1200,8 +1234,10 @@ impl Rhi {
                 vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT, vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
                 vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_READ, color,
             );
+            // The scratch is fully overwritten by the blit below, so discard its old
+            // contents (UNDEFINED old layout) — no per-frame layout tracking needed.
             let b_scr = img_barrier(
-                scr_img, scr_old, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                scr_img, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 vk::PipelineStageFlags2::ALL_COMMANDS, vk::AccessFlags2::NONE,
                 vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_WRITE, color,
             );
@@ -1293,24 +1329,21 @@ impl Rhi {
                 .depth_attachment(&depth_att);
             device.cmd_begin_rendering(cmd, &info);
         }
-        // `taa_resolve`'s b_hist transitions the scratch from UNDEFINED, so the
-        // tracked layout doesn't need updating here.
         Ok(true)
     }
 
     /// The image view holding the opaque scene color this frame (refraction source
-    /// for the water pass). Valid only between `begin_water_pass` and `taa_resolve`.
+    /// for the water pass). Valid only between `begin_water_pass` and
+    /// `present_composite`.
     pub fn refraction_src_view(&self) -> vk::ImageView {
-        let taa = self.taa.as_ref().unwrap();
-        let im = taa.images.as_ref().unwrap();
-        im.history[taa.write_index].view
+        let im = self.scene.as_ref().unwrap().images.as_ref().unwrap();
+        im.refraction_scratch.view
     }
 
     /// The opaque-scene depth this frame (for the water pass's depth-based
-    /// darkening). Valid only between `begin_water_pass` and `taa_resolve`.
+    /// darkening). Valid only between `begin_water_pass` and `present_composite`.
     pub fn refraction_depth_view(&self) -> vk::ImageView {
-        let taa = self.taa.as_ref().unwrap();
-        let im = taa.images.as_ref().unwrap();
+        let im = self.scene.as_ref().unwrap().images.as_ref().unwrap();
         im.refract_depth.view
     }
 
@@ -1487,8 +1520,19 @@ impl Rhi {
     ///
     /// Must be called at least once per frame (dynamic state).
     pub fn set_viewport_scissor_full(&mut self, fi: u32) {
+        // The 3D pass renders into the scene targets (scaled by SSAA `render_scale`); the
+        // FXAA/post pass sets the swapchain extent itself (`set_viewport_scissor`).
+        let extent = if self.scene_targets_ready() {
+            self.scene_extent()
+        } else {
+            self.swapchain.extent
+        };
+        self.set_viewport_scissor(fi, extent);
+    }
+
+    /// Set viewport + scissor to a given extent (full-rect). Dynamic state.
+    fn set_viewport_scissor(&mut self, fi: u32, extent: vk::Extent2D) {
         let cmd = self.commands.frames[fi as usize].buffer;
-        let extent = self.swapchain.extent;
 
         let viewport = vk::Viewport {
             x: 0.0,
@@ -1821,13 +1865,13 @@ impl Rhi {
             .image(self.swapchain.images[image_index as usize])
             .subresource_range(color_subresource_range());
 
-        if self.taa_active() {
-            // TAA path: the 3D pass renders into the TAA MSAA target, resolving
+        if self.scene_targets_ready() {
+            // Composite path: the 3D pass renders into the MSAA target, resolving
             // colour → `current` and depth → `resolved_depth`. The swapchain is
-            // NOT touched here — `taa_resolve` transitions it (TRANSFER_DST → blit
-            // → COLOR_ATTACHMENT). Transition the four TAA attachments instead.
-            let im = self.taa.as_ref().unwrap().images.as_ref().unwrap();
-            let taa_barriers = [
+            // NOT touched here — `present_composite` transitions it (TRANSFER_DST →
+            // blit → COLOR_ATTACHMENT). Transition the four scene attachments instead.
+            let im = self.scene.as_ref().unwrap().images.as_ref().unwrap();
+            let scene_barriers = [
                 img_barrier(
                     im.hdr_msaa.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                     vk::PipelineStageFlags2::NONE, vk::AccessFlags2::NONE,
@@ -1853,7 +1897,7 @@ impl Rhi {
                     vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE, depth_subresource_range(),
                 ),
             ];
-            let dep_info = vk::DependencyInfo::default().image_memory_barriers(&taa_barriers);
+            let dep_info = vk::DependencyInfo::default().image_memory_barriers(&scene_barriers);
             unsafe { self.device.handle.cmd_pipeline_barrier2(cmd, &dep_info) };
         } else {
             let barriers = [msaa_barrier, resolve_barrier, depth_barrier];
@@ -1903,11 +1947,12 @@ impl Rhi {
             depth_stencil: vk::ClearDepthStencilValue { depth: 0.0, stencil: 0 },
         };
 
-        // TAA path: render the 3D pass into the TAA MSAA target, resolving colour
-        // → `current` and depth → `resolved_depth` (SAMPLE_ZERO), so the resolve
-        // can sample them. Otherwise the original MSAA→swapchain path.
-        let (color_view, color_resolve_view, depth_view, depth_resolve_view) = if self.taa_active() {
-            let im = self.taa.as_ref().unwrap().images.as_ref().unwrap();
+        // Composite path: render the 3D pass into the MSAA target, resolving colour
+        // → `current` and depth → `resolved_depth` (SAMPLE_ZERO), so the water pass
+        // can sample them and present_composite can blit. Otherwise (zero extent)
+        // the original MSAA→swapchain path.
+        let (color_view, color_resolve_view, depth_view, depth_resolve_view) = if self.scene_targets_ready() {
+            let im = self.scene.as_ref().unwrap().images.as_ref().unwrap();
             (
                 im.hdr_msaa.view,
                 im.current.view,
@@ -1946,10 +1991,17 @@ impl Rhi {
                 .resolve_image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL);
         }
 
+        // The 3D pass renders into the scene targets (scaled by SSAA `render_scale`); the
+        // swapchain (else branch / zero extent) stays 1×.
+        let area_extent = if self.scene_targets_ready() {
+            self.scene_extent()
+        } else {
+            self.swapchain.extent
+        };
         let rendering_info = vk::RenderingInfo::default()
             .render_area(vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
-                extent: self.swapchain.extent,
+                extent: area_extent,
             })
             .layer_count(1)
             .color_attachments(std::slice::from_ref(&color_attachment))
@@ -2001,9 +2053,9 @@ impl Rhi {
         let image_index = self.image_indices[fi_idx] as usize;
         let cmd = self.commands.frames[fi_idx].buffer;
 
-        if self.taa_active() {
-            // TAA path: `taa_resolve` already closed the 3D instance and blitted the
-            // resolved image to the swapchain, leaving it in COLOR_ATTACHMENT_OPTIMAL
+        if self.scene_targets_ready() {
+            // Composite path: `present_composite` already closed the 3D instance and
+            // blitted `current` to the swapchain, leaving it in COLOR_ATTACHMENT_OPTIMAL
             // with a TRANSFER→COLOR barrier. Nothing to close/barrier here.
         } else {
             // 1. Close the MSAA 3D instance.
@@ -2302,9 +2354,9 @@ impl Rhi {
         if let Some(img) = self.msaa_image.take() {
             img.destroy(unsafe { &*dev_handle }, unsafe { &mut *dev_alloc });
         }
-        // Destroy old TAA offscreen images (recreated at the new extent below).
-        if let Some(taa) = self.taa.as_mut() {
-            if let Some(images) = taa.images.take() {
+        // Destroy old scene offscreen images (recreated at the new extent below).
+        if let Some(scene) = self.scene.as_mut() {
+            if let Some(images) = scene.images.take() {
                 images.destroy(unsafe { &*dev_handle }, unsafe { &mut *dev_alloc });
             }
         }
@@ -2339,10 +2391,14 @@ impl Rhi {
         }
 
         if self.swapchain.extent.width > 0 && self.swapchain.extent.height > 0 {
+            // SSAA: the scene targets + the 3D MSAA depth render at the scaled extent
+            // (render_scale persists across resize); `msaa_image` stays swapchain-sized
+            // (it's only the zero-extent fallback, which never renders).
+            let scene_ext = self.scene_extent();
             self.depth_image = Some(image::AllocatedImage::new_depth(
                 unsafe { &*dev_handle },
                 unsafe { &mut *dev_alloc },
-                self.swapchain.extent,
+                scene_ext,
                 self.msaa_sample_count,
             )?);
             self.msaa_image = Some(image::AllocatedImage::new_msaa_color(
@@ -2352,19 +2408,25 @@ impl Rhi {
                 self.swapchain.format,
                 self.msaa_sample_count,
             )?);
-            // Recreate TAA offscreen images at the new extent (history resets).
-            if self.taa.is_some() {
-                let images = taa_pass::TaaImages::new(
+            // Recreate scene offscreen images at the new extent.
+            if self.scene.is_some() {
+                let images = scene_targets::SceneImages::new(
                     unsafe { &*dev_handle },
                     unsafe { &mut *dev_alloc },
-                    self.swapchain.extent,
+                    scene_ext,
                     self.swapchain.format,
                     self.msaa_sample_count,
                 )?;
-                let taa = self.taa.as_mut().unwrap();
-                taa.images = Some(images);
-                taa.history_layout = [vk::ImageLayout::UNDEFINED; 2];
-                taa.write_index = 0;
+                self.scene.as_mut().unwrap().images = Some(images);
+                // Re-point the FXAA sampler at the NEW `current` view (the pipeline +
+                // descriptor set persist across resize; only the image view changed).
+                let (set, new_view) = {
+                    let s = self.scene.as_ref().unwrap();
+                    (s.fxaa_set, s.images.as_ref().unwrap().current.view)
+                };
+                self.write_sampled_image_binding(
+                    set, 0, new_view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                );
             }
         }
 
@@ -2411,13 +2473,12 @@ impl Drop for Rhi {
             }
             self.buffers.destroy_all(&mut *dev_alloc);
 
-            // 4b. Destroy TAA images + sampler (its layout/pipeline/sets/UBOs were
-            //     freed by the pipeline/descriptor/buffer stores above).
+            // 4b. Destroy scene-composite images.
             let dev_handle: *const ash::Device = &self.device.handle;
             let dev_alloc: *mut gpu_allocator::vulkan::Allocator =
                 &mut *self.device.allocator;
-            if let Some(taa) = self.taa.take() {
-                taa.destroy(&*dev_handle, &mut *dev_alloc);
+            if let Some(scene) = self.scene.take() {
+                scene.destroy(&*dev_handle, &mut *dev_alloc);
             }
 
             // 4c. Destroy sun shadow maps + comparison sampler.
@@ -2507,5 +2568,24 @@ fn depth_subresource_range() -> vk::ImageSubresourceRange {
         level_count: 1,
         base_array_layer: 0,
         layer_count: 1,
+    }
+}
+
+#[cfg(test)]
+mod post_aa_tests {
+    use super::FXAA_WGSL;
+
+    /// The FXAA post-process shader must parse + validate under naga (headless —
+    /// no device), mirroring the runtime `create_shader_module` validation.
+    #[test]
+    fn fxaa_wgsl_parses_and_validates() {
+        let module = naga::front::wgsl::parse_str(FXAA_WGSL)
+            .unwrap_or_else(|e| panic!("FXAA WGSL parse failed:\n{}", e.emit_to_string(FXAA_WGSL)));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("FXAA WGSL validation failed: {e:?}"));
     }
 }

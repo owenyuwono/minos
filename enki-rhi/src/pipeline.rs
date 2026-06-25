@@ -327,8 +327,10 @@ impl PipelineStore {
 
     /// Create a fullscreen post-process pipeline: no vertex input (the VS emits a
     /// fullscreen triangle via `vertex_index`), no depth, no culling, a single
-    /// color attachment, and a caller-supplied descriptor set layout (e.g. the TAA
-    /// resolve's sampled-image + UBO set). 1-sample.
+    /// color attachment, and a caller-supplied descriptor set layout. 1-sample.
+    /// Currently unused (the TAA resolve was its only caller) but kept as a generic
+    /// primitive for a future post-process pass (FXAA / bloom / tonemap).
+    #[allow(dead_code)]
     pub(crate) fn create_fullscreen(
         &mut self,
         shader: &ShaderModule,

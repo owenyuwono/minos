@@ -28,8 +28,8 @@ use glam::{DVec3, Mat4, Vec3, Vec4};
 /// frame + 3 cascade depth maps + comparison sampler). See `character.wgsl`.
 const CHARACTER_WGSL: &str = include_str!("character.wgsl");
 
-/// Number of sun shadow cascades — MUST match `character.wgsl` SHADOW_CASCADES and
-/// `enki_nanite::render::SHADOW_CASCADES`.
+/// Number of sun shadow cascades — MUST match `character.wgsl`, `voxel_view.rs`,
+/// and `flora.wgsl` SHADOW_CASCADES (the CSM receivers must agree).
 const SHADOW_CASCADES: u32 = 3;
 
 /// GPU mirror of `character.wgsl`'s `CharFrame` UBO (std140-friendly, all vec4/mat4).

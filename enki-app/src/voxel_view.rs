@@ -109,12 +109,13 @@ struct ResidentVoxel {
     indices: Arc<[u32]>,
 }
 
-/// An immutable snapshot of the resident voxel leaves' CPU geometry — the SINGLE
-/// source of truth for ground collision. The character feet + scattered flora raycast
-/// THESE triangles (the exact ones the GPU draws), so they sit on the rendered surface
-/// rather than a parallel analytic approximation that always sinks or floats. Rebuilt
-/// each frame (cheap: per-leaf geometry is `Arc`-shared) and handed out as an `Arc`, so
-/// consumers query it without borrowing `VoxelView`.
+/// An immutable snapshot of the resident voxel leaves' CPU geometry — the SINGLE source
+/// of truth for ground collision. The character feet + scattered flora raycast THESE
+/// triangles (the exact ones the GPU draws), so they sit on the rendered surface. That
+/// matters because while the LOD streams in, the drawn mesh is COARSER than the
+/// full-detail analytic curve, so the analytic sinks BELOW it (= "everything submerged").
+/// Rebuilt each frame (cheap: per-leaf geometry is `Arc`-shared) and handed out as an
+/// `Arc`, so consumers query it without borrowing `VoxelView`.
 pub struct VoxelCollider {
     leaves: Vec<ColliderLeaf>,
 }
@@ -195,7 +196,7 @@ impl SurfaceCollider for VoxelCollider {
 pub struct VoxelView {
     tree: LodTree,
     resident: HashMap<ChunkKey, ResidentVoxel>,
-    /// Keys with an outstanding mesh request → their latest generation. Present means
+    /// Keys with an outstanding mesh request → its generation. Present means
     /// "wanted/in-flight"; a result is accepted only if its gen still matches.
     requested: HashMap<ChunkKey, u64>,
     gen: u64,
@@ -205,15 +206,21 @@ pub struct VoxelView {
     /// "meshed" from "drawn" so LOD thrash + async latency never drop results — the
     /// fix for the resident=0 deadlock.
     cache: LruCache<ChunkKey, (ChunkMeshArrays, TransitionSides)>,
-    /// Caves/data-view/edit changes → invalidate cache + resident, re-mesh next update.
+    /// Caves toggled/retuned → invalidate cache + resident, re-mesh next update.
     dirty_caves: bool,
     /// Data debug view selector (0 none; 1 Height/2 Material/3 Wetness/4 Volcano),
-    /// baked into vertex color by the mesher. Change → rebuild ctx + dirty remesh.
+    /// baked into vertex color by the mesher.
     dbg_field: u8,
+    /// Data-view field changed → re-mesh resident leaves IN PLACE with the new color
+    /// (old mesh stays drawn until the new one arrives — never blanks, unlike caves).
+    dirty_recolor: bool,
     req_txs: Vec<Sender<MeshReq>>,
     rr: usize,
     done_rx: Receiver<MeshDone>,
     _workers: Vec<JoinHandle<()>>,
+    /// Count of leaves that panicked in the mesher. If this climbs while the LOD won't
+    /// subdivide, fine chunks are crashing (a bug), not just slow.
+    mesh_panics: Arc<std::sync::atomic::AtomicU64>,
     ctx: Arc<MeshCtx>,
     cave_params: CaveParams,
     caves_on: bool,
@@ -350,14 +357,18 @@ impl VoxelView {
 
         // A small pool of mesher threads (the real heightfield is expensive, so one
         // thread can't keep up with the visible cut). Round-robin requests across
-        // per-worker channels — no shared lock contention on the hot path.
-        const N_WORKERS: usize = 4;
+        // per-worker channels — no shared lock contention on the hot path. (More cores
+        // don't unlock finer LOD: the churn at finer target_tri_px is LOD instability,
+        // not mesher throughput — see main.rs LodConfig.)
+        let n_workers = 4;
         let (done_tx, done_rx) = mpsc::channel::<MeshDone>();
-        let mut req_txs = Vec::with_capacity(N_WORKERS);
-        let mut workers = Vec::with_capacity(N_WORKERS);
-        for w in 0..N_WORKERS {
+        let mesh_panics = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let mut req_txs = Vec::with_capacity(n_workers);
+        let mut workers = Vec::with_capacity(n_workers);
+        for w in 0..n_workers {
             let (req_tx, req_rx) = mpsc::channel::<MeshReq>();
             let done_tx = done_tx.clone();
+            let panics = Arc::clone(&mesh_panics);
             let worker = std::thread::Builder::new()
                 .name(format!("voxel-mesher-{w}"))
                 .spawn(move || {
@@ -386,6 +397,7 @@ impl VoxelView {
                         let arrays = match meshed {
                             Ok(a) => a,
                             Err(_) => {
+                                panics.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 log::error!("voxel mesh_leaf panicked for key {:?} — skipped", req.key);
                                 continue;
                             }
@@ -412,10 +424,12 @@ impl VoxelView {
             cache: LruCache::new(NonZeroUsize::new(4096).unwrap()),
             dirty_caves: false,
             dbg_field: 0,
+            dirty_recolor: false,
             req_txs,
             rr: 0,
             done_rx,
             _workers: workers,
+            mesh_panics,
             ctx,
             cave_params,
             caves_on: true,
@@ -481,7 +495,7 @@ impl VoxelView {
         if field != self.dbg_field {
             self.dbg_field = field;
             self.rebuild_ctx();
-            self.dirty_caves = true;
+            self.dirty_recolor = true;
         }
     }
 
@@ -657,6 +671,22 @@ impl VoxelView {
             self.requested.clear();
         }
 
+        // 2b. Data-view field changed → re-mesh resident leaves IN PLACE with the new
+        //     color. Old meshes stay drawn until replaced (never blanks), the stale-
+        //     colored cache is dropped, and we supersede any in-flight (older-field)
+        //     request so the latest field wins. Bounded by the resident (drawn) set.
+        if self.dirty_recolor {
+            self.dirty_recolor = false;
+            self.cache.clear();
+            let keys: Vec<ChunkKey> = self.resident.keys().copied().collect();
+            for key in keys {
+                if let Some(sides) = self.resident.get(&key).map(|r| r.sides) {
+                    self.requested.remove(&key);
+                    self.request(key, sides);
+                }
+            }
+        }
+
         // 3. Apply queued edits → rebuild ctx + invalidate overlapping leaves (cache +
         //    resident + in-flight) so they re-mesh with the edit.
         if !self.pending_edits.is_empty() {
@@ -765,24 +795,24 @@ impl VoxelView {
         });
 
         self.dbg = self.dbg.wrapping_add(1);
-        // Log only while still populating (or if blank) — silent once settled.
-        if self.dbg % 90 == 1 && (!self.requested.is_empty() || self.resident.is_empty()) {
+        // LOD telemetry: altitude + resident level histogram make a zoom test a glance —
+        // watch `levels` climb (orbit ~{2..4} → surface ~{11,12}) as you zoom in. Always
+        // on, every ~1.5 s. If `levels` never climbs on zoom-in, the LOD is stalled, not
+        // the mesher.
+        if self.dbg % 90 == 1 {
+            use std::collections::BTreeMap;
+            let mut levels: BTreeMap<u8, u32> = BTreeMap::new();
+            for k in self.resident.keys() {
+                *levels.entry(k.1).or_default() += 1;
+            }
+            let alt = cam.local_pos.length() - self.ctx.radius;
+            let panics = self.mesh_panics.load(std::sync::atomic::Ordering::Relaxed);
             log::info!(
-                "[voxel] resident={} cache={} requested={} | builds={} show={} hide={}",
-                self.resident.len(),
-                self.cache.len(),
-                self.requested.len(),
-                sel.builds.len(),
-                sel.show.len(),
-                sel.hide.len(),
+                "[voxel] alt={:.0}m resident={} cache={} req={} panics={} | builds={} show={} hide={} levels={:?}",
+                alt, self.resident.len(), self.cache.len(), self.requested.len(), panics,
+                sel.builds.len(), sel.show.len(), sel.hide.len(), levels,
             );
         }
-    }
-
-    /// The current collision snapshot (immutable `Arc`) — hand to the character + flora
-    /// so they ground on the EXACT rendered triangles (the single source of truth).
-    pub fn collider(&self) -> Arc<VoxelCollider> {
-        Arc::clone(&self.collider)
     }
 
     /// The collision snapshot as the generic `SurfaceCollider` trait object — for the
@@ -791,8 +821,8 @@ impl VoxelView {
         self.collider.clone()
     }
 
-    /// Convenience: raycast the rendered surface along `dir` (`None` if no resident leaf
-    /// covers it → caller falls back to the analytic grounding).
+    /// Raycast the rendered surface along `dir` (`None` if no resident leaf covers it →
+    /// caller falls back to the analytic grounding). For per-frame flora re-grounding.
     pub fn ground_radius(&self, dir: DVec3) -> Option<f64> {
         self.collider.ground_radius(dir)
     }

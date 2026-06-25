@@ -2,13 +2,12 @@
 //!
 //! Builds the terrain height field on a worker thread while the main loop renders
 //! a progress bar — removing the multi-second blank window at startup. The shared
-//! `Arc<dyn HeightField>` is then used by BOTH the quadtree `PlanetView` and (when
-//! enabled) the Nanite streamer, so it's built once.
+//! `Arc<dyn HeightField>` is then shared by the voxel terrain / `PlanetView`, so
+//! it's built once.
 //!
-//! Only `Send` data crosses the thread boundary: the finished `Arc<dyn HeightField>`
-//! and (when enabled) the 6 baked per-face Nanite cluster-DAGs. The (cheap)
-//! `PlanetView` construction and GPU upload happen back on the main thread once
-//! the result arrives.
+//! Only `Send` data crosses the thread boundary: the finished `Arc<dyn HeightField>`.
+//! The (cheap) terrain-view construction + GPU upload happen back on the main thread
+//! once the result arrives.
 
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
@@ -25,20 +24,15 @@ pub struct LoadProgress {
 }
 
 /// Wall-clock breakdown of the load, shown in a one-time popup when it finishes.
-/// All milliseconds. The bake sub-stages are the slowest face (the 6 bake in
-/// parallel), so they sum to ≈ `bake_wall_ms`; bake fields are 0 without `nanite`.
+/// All milliseconds.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LoadTimings {
     pub total_ms: f64,
     pub heightfield_ms: f64,
-    pub bake_wall_ms: f64,
-    pub tessellate_ms: f64,
-    pub clusters_ms: f64,
-    pub dag_ms: f64,
 }
 
 /// Parameters handed to the loader thread (all `Send`).
-#[allow(dead_code)] // radius/height_scale/nanite_resolution are read only with the `nanite` feature.
+#[allow(dead_code)] // radius/height_scale are read only by the voxel terrain build.
 pub struct LoadParams {
     pub seed: u32,
     pub use_tectonics: bool,
@@ -110,17 +104,10 @@ impl Loader {
             let heightfield_ms = t_load.elapsed().as_secs_f64() * 1e3;
             log::info!("load: heightfield built in {:.0}ms", heightfield_ms);
 
-            // Terrain is meshed on demand by the voxel renderer — no startup bake.
-            let (bake_wall_ms, tessellate_ms, clusters_ms, dag_ms) = (0.0_f64, 0.0, 0.0, 0.0);
-
             set(0.95, "Uploading to GPU…");
             let timings = LoadTimings {
                 total_ms: t_load.elapsed().as_secs_f64() * 1e3,
                 heightfield_ms,
-                bake_wall_ms,
-                tessellate_ms,
-                clusters_ms,
-                dag_ms,
             };
             let _ = tx.send(LoadOutput {
                 hf,

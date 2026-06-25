@@ -18,7 +18,7 @@ use enki_planet::height::HeightField;
 use enki_render::camera::Camera;
 use glam::{DVec3, Mat3, Quat, Vec3};
 
-use super::tangent::{project_onto_tangent_plane, surface_radius, MoveInput, SPRINT_MULTIPLIER};
+use super::tangent::{project_onto_tangent_plane, MoveInput, SPRINT_MULTIPLIER};
 use super::terrain_grid::SurfaceCollider;
 
 // ── Constants ─────────────────────────────────────────────────────────────
@@ -130,37 +130,33 @@ impl ThirdPersonController {
         ctrl
     }
 
-    /// Set the live collision surface (the voxel mesh). Called once per frame by the
-    /// app before `on_move`/`update`; `None` keeps the analytic fallback.
+    /// Set the live collision surface (the voxel mesh). Called once per frame by the app
+    /// before `on_move`/`update`; `None` keeps the analytic fallback (pre-streaming).
     pub fn set_collider(&mut self, collider: Option<Arc<dyn SurfaceCollider>>) {
         self.collider = collider;
     }
 
-    /// Surface radius (m from the planet centre) along `dir` — the rendered voxel mesh
-    /// if a leaf is resident, else the analytic fallback. The ONE surface both the feet
-    /// and the camera-occlusion march use, so they can never disagree.
+    /// Surface radius (m from the planet centre) along `dir` — the RENDERED voxel mesh
+    /// (raycast) if a leaf is resident, else the analytic fallback. Feet AND the
+    /// camera-occlusion march both use this, so they agree (no neck snap). Reading the
+    /// DRAWN mesh (not the analytic) is what stops submersion: while the LOD streams in,
+    /// the drawn surface is coarser — and higher — than the full-detail analytic curve.
     fn surface_radius_at(&self, dir: DVec3) -> f64 {
         self.collider
             .as_ref()
             .and_then(|c| c.ground_radius(dir))
-            // Fallback (no resident leaf yet): the analytic surface. Feet + camera both
-            // go through surface_radius_at, so they still agree; honours the controller's
-            // own base_radius (so small test planets ground correctly too).
             .unwrap_or_else(|| self.ground_radius(dir))
     }
 
-    /// Analytic surface radius — the FALLBACK `surface_radius_at` uses when no rendered
-    /// leaf is resident along `dir` (the primary source is the voxel mesh collider).
+    /// Analytic FALLBACK surface radius (`GROUND_LEVEL` octaves) — used only where no
+    /// rendered leaf is resident (spawn / streaming gap / small test planets).
     fn ground_radius(&self, dir: DVec3) -> f64 {
-        surface_radius(self.hf.as_ref(), self.base_radius, self.height_scale, dir)
+        self.base_radius
+            + self.hf.height(dir, super::terrain_grid::GROUND_LEVEL) * self.height_scale
     }
 
-    /// Feet world position for unit `dir`: the **rendered** (grid-faceted) surface
-    /// under `dir`, lifted by [`FOOT_CLEARANCE`]. Riding the grid (not the analytic
-    /// curve) is what keeps the body on the drawn ground instead of diving.
+    /// Feet world position for unit `dir`: the rendered surface lifted by [`FOOT_CLEARANCE`].
     fn grounded(&self, dir: DVec3) -> DVec3 {
-        // Rides `surface_radius_at` — the rendered voxel mesh (single source of truth),
-        // the SAME surface the camera-occlusion march uses, so feet + camera agree.
         dir * (self.surface_radius_at(dir) + FOOT_CLEARANCE)
     }
 
@@ -307,10 +303,10 @@ impl ThirdPersonController {
         for i in 1..=COLLISION_STEPS {
             let d = self.cam_dist * (i as f32 / COLLISION_STEPS as f32);
             let pos = anchor + out * d as f64;
-            // Same surface as the feet (surface_radius_at → the rendered voxel mesh).
-            // The anchor sits ANCHOR_HEIGHT above the feet on that same surface, so
-            // nearby samples are always clear — the boom only pulls in behind REAL hills,
-            // never to the neck from a feet-vs-occlusion surface mismatch.
+            // Same surface as the feet (surface_radius_at → the rendered voxel mesh) — the
+            // anchor sits ANCHOR_HEIGHT above the feet on that same surface, so nearby
+            // samples are always clear; the boom only pulls in behind REAL hills, never to
+            // the neck from a feet-vs-occlusion mismatch.
             let ground = self.surface_radius_at(pos.normalize()) + CAM_MARGIN;
             if pos.length() < ground {
                 break; // blocked here → keep the last clear distance

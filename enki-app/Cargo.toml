@@ -5,15 +5,9 @@ edition = "2021"
 
 [features]
 default = ["flora", "voxel"]
-# Plug-and-play Nanite virtualized terrain. UNPLUGGED from the default build
-# (Phase 0 of the voxel-terrain migration): the app now renders the classic
-# on-demand quadtree (PlanetView). The crate + integration stay behind this
-# feature — re-add with `--features nanite` (e.g. for the flora Nanite debug
-# view). Off → classic engine with zero references to enki-nanite.
-nanite = ["dep:enki-nanite"]
 # Plug-and-play deterministic procedural flora. ON by default → the enki bin
-# scatters trees on the planet surface; drop it with `--no-default-features`
-# (re-add nanite if wanted). Pulls in ash + naga for the flora-OWNED Vulkan
+# scatters trees on the planet surface; drop it with `--no-default-features`.
+# Pulls in ash + naga for the flora-OWNED Vulkan
 # sub-renderer (flora_render.rs), which builds its own pipelines/descriptor sets
 # from raw RHI handles (egui-ash-renderer precedent). Still fully gated/deletable:
 # off → none of this compiles.
@@ -32,17 +26,12 @@ name = "enki"
 path = "src/main.rs"
 
 # Standalone flora debug viewer. Only builds with `--features flora`.
-# Add `nanite` (`--features flora,nanite`) to also bake the branch mesh into
-# enki-nanite ClusterAssets (src/flora_nanite.rs, gated on BOTH features).
-# `flora` and `nanite` are kept INDEPENDENT (flora does NOT imply nanite) so the
-# flora-only build still compiles with the Nanite path cfg'd out.
 [[bin]]
 name = "flora_viewer"
 path = "src/bin/flora_viewer.rs"
 required-features = ["flora"]
 
 [dependencies]
-enki-nanite = { version = "0.1.0", path = "../enki-nanite", optional = true }
 enki-voxel = { version = "0.1.0", path = "../enki-voxel", optional = true }
 enki-flora = { version = "0.1.0", path = "../enki-flora", optional = true }
 # Flora-only: same ash + naga versions as enki-rhi so the raw vk handles + the

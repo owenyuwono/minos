@@ -1004,6 +1004,26 @@ struct LeafVsOut {
 // — dryad's flutter ∝ position.y (leafMesh.js:321-322). The bone-follow is NOT
 // graduated (the whole leaf rides its twig's sway as a rigid anchor offset). The
 // bend/droop are baked into the CPU strip geometry (shape, present at strength 0).
+// Shared world-space leaf gust: a SLOW sway ALONG windDir (wind.zw), graduated by
+// the strip param t (base pinned → tip sways most), low-freq (F1≈1.2, matches the
+// branch gust) so leaves & twigs move together. Used by BOTH the lit leaf
+// (leaf_local_displaced) AND the shadow caster (vs_leaf_depth) so the cast
+// silhouette sways in lockstep — they MUST share this. (A prior copy drifted: the
+// caster kept a fast isotropic flutter (sin·8/11/9) while the lit leaf moved to
+// this slow directional gust → the shadow buzzed while the leaf swayed slowly.)
+// `ph = seed*1.7` is a small per-leaf phase so the canopy isn't a rigid sheet.
+// strength (wind.y) == 0 → gust 0 → exact static, deterministic.
+fn leaf_gust(seed: f32, t: f32, wind: vec4<f32>) -> vec3<f32> {
+    let s = wind.y;
+    let wd_len = max(length(vec2<f32>(wind.z, wind.w)), 1e-4);
+    let wd = vec3<f32>(wind.z, 0.0, wind.w) / wd_len;
+    let ph = seed * 1.7;
+    let gust = s * 0.09 * sin(wind.x * 1.2 + ph)
+             + s * 0.035 * sin(wind.x * 2.73 + ph * 2.17 + 1.3);
+    let tip = clamp(t, 0.0, 1.0);
+    return wd * (gust * tip);
+}
+
 fn leaf_local_displaced(position: vec3<f32>, seed: f32, boneIdx: f32, t: f32, m3: mat3x3<f32>, wind: vec4<f32>) -> vec3<f32> {
     let s   = wind.y;
     // Bone-follow in BONE space (the rest anchor), then rotate the delta into the
@@ -1012,23 +1032,8 @@ fn leaf_local_displaced(position: vec3<f32>, seed: f32, boneIdx: f32, t: f32, m3
     let follow_obj = windBoneFollowDelta(position, boneIdx, s);
     let local  = m3 * position;                // rotated, NO translation
     let follow = m3 * follow_obj;
-
-    // Shared directional gust ALONG windDir. wind.zw is the horizontal wind dir;
-    // normalize_or-style guard via length check keeps it naga-safe & finite.
-    let wd_len = max(length(vec2<f32>(wind.z, wind.w)), 1e-4);
-    let wd = vec3<f32>(wind.z, 0.0, wind.w) / wd_len;
-    // Low frequency (matches the branch gust F1≈1.2) so leaves & twigs move
-    // together; a SMALL per-leaf phase (seed) gives natural life without decohering.
-    let ph    = seed * 1.7;
-    // Amplitudes modestly raised (0.05→0.09, 0.02→0.035) so 'leaves follow the
-    // set wind direction' reads clearly. Both terms scale by s, so strength==0
-    // is exactly static (deterministic) and the gust always lies ALONG windDir.
-    let gust  = s * 0.09 * sin(wind.x * 1.2 + ph)
-              + s * 0.035 * sin(wind.x * 2.73 + ph * 2.17 + 1.3);
-    // Graduate the gust by the strip parameter t (base=0 pinned, tip=1 sways most),
-    // so the leaf pivots at its base on the twig. clamp keeps it finite/naga-safe.
-    let tip = clamp(t, 0.0, 1.0);
-    return local + follow + wd * (gust * tip);
+    // Directional gust ALONG windDir, added in WORLD space (after m3, shared helper).
+    return local + follow + leaf_gust(seed, t, wind);
 }
 
 @vertex
@@ -1388,24 +1393,20 @@ struct LeafDepthVsOut {
 @vertex
 fn vs_leaf_depth(v: LeafVsIn) -> LeafDepthVsOut {
     var out: LeafDepthVsOut;
-    // IDENTICAL skin to the lit leaf: rotate the anchor into tree-local, bone-
-    // follow the nearest branch bone, then add the same per-leaf flutter.
-    let t   = leaf_depth_pc.wind.x;
-    let s   = leaf_depth_pc.wind.y;
-    // Bone-follow in BONE space, then rotate (mirrors leaf_local_displaced).
+    // Skin IDENTICALLY to the lit leaf so the cast silhouette sways in lockstep:
+    // bone-follow the nearest branch bone + the SHARED leaf_gust (the same slow
+    // directional sway vs_leaf uses). This previously ran a fast isotropic flutter
+    // that had drifted from the lit gust → the shadow buzzed while the leaf swayed.
+    let s = leaf_depth_pc.wind.y;
     let follow_obj = windBoneFollowDelta(v.position, v.uv.z, s);
     let rotated = quat_rotate(leaf_depth_pc.rot, v.position);
     let follow  = quat_rotate(leaf_depth_pc.rot, follow_obj);
-    let ph    = v.attr.z * 6.2831853;
-    // Graduate the flutter by the strip parameter t (uv.y): base pinned, tip sways,
-    // so the cast shadow silhouette pivots at the base in lockstep with the lit leaf.
-    let tip   = clamp(v.uv.y, 0.0, 1.0);
-    let fl    = s * 0.06 * tip;
-    let flutter = vec3<f32>(
-        sin(t * 8.0  + ph)        * fl,
-        sin(t * 11.3 + ph * 1.7)  * fl * 0.5,
-        cos(t * 9.1  + ph * 0.6)  * fl);
-    let local = rotated + follow + flutter;
+    // ponytail: the gust is added in the caster's local frame (the model rotation is
+    // folded into light_view_proj here, so it can't be undone to place a world-space
+    // vector) → a tree's shadow gust is yaw-rotated vs its lit gust. Minor on a soft
+    // canopy shadow; exact match needs the model rotation passed separately (the 128B
+    // push is full). The frequency/amplitude/graduation now match, which is the bug.
+    let local = rotated + follow + leaf_gust(v.attr.z, v.uv.y, leaf_depth_pc.wind);
     out.clip_pos = leaf_depth_pc.light_view_proj * vec4<f32>(local, 1.0);
     out.uv = v.uv.xy;
     return out;

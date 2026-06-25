@@ -25,12 +25,6 @@ use crate::flora_render::{BranchDepthPush, FloraPipeline, FloraRenderer, LeafDep
 /// the `debug_mode` push lane (0/1/2/3); `Wireframe` swaps to the `fill:false`
 /// line pipelines instead (its FS output is irrelevant, so it carries mode 0).
 ///
-/// `Triangle/Cluster/Lod` are the enki-nanite virtualized-geometry debug views:
-/// they are only meaningful when the branch mesh is drawn through the Nanite
-/// cull+draw path (`--features flora,nanite`). They select nanite_draw.wgsl's
-/// per-triangle / per-cluster / per-LOD id-color modes (3/4/5). Without nanite
-/// they fall through `is_nanite()==false` and the viewer renders the plain branch
-/// (treated like Lit) — see `nanite_debug_mode`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum RenderMode {
     #[default]
@@ -39,58 +33,21 @@ pub enum RenderMode {
     Wireframe,
     Normals,
     Ao,
-    /// Nanite per-triangle id color (nanite_draw mode 3).
-    Triangle,
-    /// Nanite per-cluster id color (nanite_draw mode 4).
-    Cluster,
-    /// Nanite per-LOD id color (nanite_draw mode 5).
-    Lod,
 }
 
 impl RenderMode {
     /// The FS `debug_mode` lane value (0=lit, 1=unlit, 2=normals, 3=ao).
     /// Wireframe falls through the lit FS (drawn by the line pipeline), so 0.
-    /// The Nanite-only modes have no plain-FS arm; they render Lit (0) when the
-    /// plain branch path is used (nanite off), so the tree still shows.
     fn debug_mode(self) -> f32 {
         match self {
             RenderMode::Lit | RenderMode::Wireframe => 0.0,
             RenderMode::Unlit => 1.0,
             RenderMode::Normals => 2.0,
             RenderMode::Ao => 3.0,
-            // No plain-branch FS arm — fall back to Lit's lane.
-            RenderMode::Triangle | RenderMode::Cluster | RenderMode::Lod => 0.0,
         }
     }
     fn is_wireframe(self) -> bool {
         matches!(self, RenderMode::Wireframe)
-    }
-
-    /// True ONLY for the enki-nanite virtualized-geometry debug views
-    /// (Triangle/Cluster/Lod) — the modes whose whole purpose is to show the
-    /// branch meshlets in per-triangle/cluster/LOD debug colors via Nanite's
-    /// cull+draw. Lit/Unlit/Wireframe/Normals/Ao all use flora's OWN full render
-    /// path (textured PBR bark + IBL + PCF shadows + green leaf cards + bloom);
-    /// routing Lit through Nanite's generic draw flattens the bark and miscolors
-    /// the leaves, so Lit deliberately stays OFF the Nanite path.
-    pub fn uses_nanite(self) -> bool {
-        matches!(
-            self,
-            RenderMode::Triangle | RenderMode::Cluster | RenderMode::Lod
-        )
-    }
-
-    /// The nanite_draw.wgsl push-constant color mode for this view (3=triangle,
-    /// 4=cluster, 5=LOD). Only meaningful when `uses_nanite()`; other modes
-    /// return 0.
-    pub fn nanite_debug_mode(self) -> u32 {
-        match self {
-            RenderMode::Triangle => 3,
-            RenderMode::Cluster => 4,
-            RenderMode::Lod => 5,
-            // Non-Nanite modes → unused (caller gates on `uses_nanite()`).
-            _ => 0,
-        }
     }
 }
 

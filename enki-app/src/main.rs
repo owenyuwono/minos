@@ -3,10 +3,10 @@
 //
 // # Render loop overview
 //   resumed()  → create window → Rhi::new → terrain pipelines + overlays
-//             → async load (heightfield + Nanite bake) → EguiState::new
+//             → async load (heightfield) → EguiState::new
 //
 //   RedrawRequested:
-//     begin_frame() → PlanetView/Nanite update → begin_rendering() →
+//     begin_frame() → terrain update → begin_rendering() →
 //     terrain + overlays draw → EguiState::render() → end_frame()
 //
 // # Navigation mode cycle (Tab: Globe → Placement → Surface → Globe)
@@ -17,7 +17,7 @@
 //   Escape      — return from Surface → Globe at any time.
 //
 // # View hot-swap keys (not consumed by egui)
-//   M    — cycle view_mode (0–10; skips Nanite-only 3–5 on the classic path)
+//   M    — cycle view_mode (0–10; skips geometry-debug 3–5 on the classic path)
 //   W    — toggle wireframe (Globe/Placement modes)
 //   V    — toggle 1st/3rd-person camera (Surface mode)
 //   Tab  — advance nav mode
@@ -45,7 +45,6 @@ mod aerial;
 mod clouds;
 mod clouds_advect;
 mod markers;
-mod rivers;
 mod solar;
 mod planet_view;
 #[cfg(feature = "voxel")]
@@ -93,7 +92,6 @@ use atmosphere::{Atmosphere, AtmoParams};
 use aerial::{Aerial, AerialParams};
 use clouds::{Clouds, CloudParams};
 use markers::Markers;
-use rivers::Rivers;
 use solar::BodyRenderer;
 use controls::space::FreeCam;
 use planet_view::{PlanetConfig, PlanetView, PlanetViewStats, planet_view_from_hf};
@@ -139,8 +137,6 @@ struct App {
     clouds:       Option<Clouds>,
     /// Equator + pole reference markers.
     markers:      Option<Markers>,
-    /// Drainage-network river ribbons (traced from the erosion flow field).
-    rivers:       Option<Rivers>,
     /// CPU-skinned humanoid drawn in third-person surface mode (built at startup
     /// in Planet mode; only drawn while walking the surface in third-person view).
     character:    Option<Character>,
@@ -185,7 +181,7 @@ struct App {
     /// feature is on this REPLACES the classic quadtree (PlanetView) as the terrain.
     #[cfg(feature = "voxel")]
     voxel_view: Option<voxel_view::VoxelView>,
-    /// In-progress async startup load (heightfield + Nanite bake); `None` once done.
+    /// In-progress async startup load (heightfield build); `None` once done.
     loader:       Option<loading::Loader>,
     /// Planet config held until the async load completes (then `PlanetView` is built).
     pending_planet_cfg: Option<PlanetConfig>,
@@ -212,7 +208,7 @@ struct App {
     /// This frame's sun direction (body frame, toward the sun) — stashed so the TAA
     /// resolve's screen-space sun shadow can read it (it's built in the Planet arm).
     sun_dir_body: glam::Vec3,
-    /// Sun shadow map (Nanite path): on/off + tuning. The light ortho is built
+    /// Sun shadow map: on/off + tuning. The light ortho is built
     /// camera-relative each frame; the map is allocated once with `shadow_size`.
     shadow_map_enabled: bool,
     shadow_size: u32,
@@ -236,14 +232,8 @@ struct App {
     /// 5 LOD; Planet: 6 Plate,7 Height,8 Material,9 Wetness,10 Volcano).
     view_mode:     u32,
     wireframe:     bool,
-    /// TAA toggle (off by default; the proven non-TAA path stays the default).
-    taa_enabled:   bool,
-    /// Sub-pixel jitter + view-proj history for the TAA resolve.
-    taa_jitter:    enki_render::taa::TaaJitter,
-    /// Nanite UI state.
-    nanite_enabled:    bool,
-    /// LOD pixel-error threshold (lower = finer/smoother, heavier).
-    nanite_tau:        f32,
+    /// Post-process anti-aliasing mode (chosen in the Settings panel).
+    aa_mode:       crate::gui::AaMode,
     /// Voxel caves on/off + carve strength (GUI; feature-agnostic so the panel
     /// compiles without the `voxel` feature — the effect is what's gated).
     voxel_caves:       bool,
@@ -268,8 +258,6 @@ struct App {
     /// Reference marker toggles (pole spikes / equator ring).
     markers_poles:     bool,
     markers_equator:   bool,
-    /// Draw the traced river network.
-    rivers_enabled:    bool,
     /// Draw the FFT spectral wave surface (camera-anchored detail).
     wave_enabled:      bool,
     /// Wave choppiness (horizontal displacement gain) — GUI-tunable.
@@ -318,7 +306,6 @@ impl App {
             aerial:        None,
             clouds:        None,
             markers:       None,
-            rivers:        None,
             character:     None,
             #[cfg(feature = "flora")]
             flora_renderer: None,
@@ -371,28 +358,23 @@ impl App {
             terrain_height_scale: 0.0,
             view_mode:     0,
             wireframe:     false,
-            taa_enabled:   true, // ON: the FFT ocean + aerial + clouds render in the TAA
-                                 // water-split (begin_water_pass); it also AAs the voxel
-                                 // terrain. Toggle in GUI View — OFF drops those effects.
-            taa_jitter:    enki_render::taa::TaaJitter::new(),
-            nanite_enabled:    true,
-            nanite_tau:        1.0,
+            aa_mode:       crate::gui::AaMode::Fxaa,
             voxel_caves:       true,
             voxel_cave_strength: 90.0,
             ocean_enabled:     true,
             wind_enabled:      false,
             atmo_enabled:      true,
             atmo_params:       AtmoParams::default(),
-            aerial_enabled:    true,
+            // Aerial + clouds are HIDDEN by default (they were the TAA water-split
+            // passes; with TAA removed the atmosphere shell provides the sky). The GUI
+            // toggles still exist to re-enable them for testing.
+            aerial_enabled:    false,
             aerial_params:     AerialParams::default(),
-            clouds_enabled:    true,
+            clouds_enabled:    false,
             cloud_params:      CloudParams::default(),
             cloud_time:        0.0,
             markers_poles:     false,
             markers_equator:   false,
-            // Off by default: the overlay ribbons clutter the Height-view check and
-            // the real goal is carved incisions (Step 2). Toggle on under Reference.
-            rivers_enabled:    false,
             wave_enabled:      true,
             wave_choppiness:   1.3,
             wave_foam:         0.4,
@@ -583,11 +565,11 @@ impl App {
                     if self.scroll.abs() > 0.01 {
                         tpc.on_zoom(self.scroll);
                     }
-                    // Camera-relative WASD; remember the speed for the gait.
-                    // Hand the controller the live voxel collision surface FIRST, so the
-                    // feet AND the camera-occlusion march ride the SAME rendered triangles
-                    // this frame — no feet-vs-occlusion mismatch, so the boom never snaps
-                    // to the neck. Falls back to analytic until the player's leaf streams in.
+                    // Camera-relative WASD; remember the speed for the gait. Hand the
+                    // controller the live voxel collision surface FIRST, so feet AND the
+                    // camera-occlusion march ride the SAME rendered triangles (no neck) — and
+                    // the feet sit on the DRAWN mesh, not the analytic that sinks below the
+                    // still-streaming coarse surface. Falls back to analytic until resident.
                     #[cfg(feature = "voxel")]
                     {
                         let collider = self.voxel_view.as_ref().map(|vv| vv.collider_dyn());
@@ -758,11 +740,6 @@ impl ApplicationHandler for App {
                     Ok(m)  => self.markers = Some(m),
                     Err(e) => log::error!("Markers::new failed: {e}"),
                 }
-                // River-network ribbons (geometry traced once the heightfield loads).
-                match Rivers::new(&mut rhi, color_format, samples, PLANET_RADIUS) {
-                    Ok(r)  => self.rivers = Some(r),
-                    Err(e) => log::error!("Rivers::new failed: {e}"),
-                }
                 // Solar-system bodies (sun + distant planets as lit spheres).
                 match BodyRenderer::new(&mut rhi, color_format, samples) {
                     Ok(b)  => self.bodies = Some(b),
@@ -788,6 +765,12 @@ impl ApplicationHandler for App {
                         height_scale:  1_200.0,
                         resolution:    32,
                         max_depth:     12,
+                        // Stable LOD threshold (split at 64px). Finer (1.5/1.0) CHURNS even
+                        // with a static camera + more mesher cores: the LodTree's wanted set
+                        // oscillates faster than meshing settles, so leaves never converge
+                        // (resident stuck ~600 with ~700 perpetually in-flight, hide≈30/frame).
+                        // Higher terrain resolution needs an LOD-stability fix (hysteresis /
+                        // GPU meshing) first — see Known open items. Don't drop this blindly.
                         target_tri_px: 2.0,
                         hysteresis:    0.15,
                         lru_capacity:  1024,
@@ -825,10 +808,9 @@ impl ApplicationHandler for App {
                     equator_taper_width: None,
                 };
 
-                // Kick off the async load (heightfield + 6 deep per-face Nanite
-                // DAGs) on a worker thread. The main loop renders a progress bar
-                // until it completes, then builds PlanetView + uploads the resident
-                // Nanite DAGs on the main thread. The heightfield is built ONCE.
+                // Kick off the async heightfield build on a worker thread. The main
+                // loop renders a progress bar until it completes; the terrain is
+                // meshed on demand by the voxel renderer. The heightfield is built ONCE.
                 let params = loading::LoadParams {
                     seed: cfg.seed,
                     use_tectonics: cfg.use_tectonics,
@@ -839,12 +821,10 @@ impl ApplicationHandler for App {
                     climate,
                     radius: cfg.lod.radius,
                     height_scale: cfg.lod.height_scale,
-                    // Stage 2: bake DEEP (DAG exceeds the GPU pool); only the
-                    // near-cut subset is streamed resident per frame.
                 };
                 self.loader = Some(loading::Loader::spawn(params));
                 self.pending_planet_cfg = Some(cfg);
-                log::info!("Async load started (heightfield + Nanite bake on a worker thread)");
+                log::info!("Async load started (heightfield on a worker thread)");
             }
         }
 
@@ -853,17 +833,12 @@ impl ApplicationHandler for App {
         // egui draws at TYPE_1 in its own 1-sample pass on the resolved swapchain image.
         log::info!("egui initialised (1-sample UI pass, swapchain format {:?})", rhi.swapchain_format());
 
-        // Initialise the TAA resolve resources (toggle starts OFF; the proven
-        // non-TAA path remains the default until the user enables it).
-        match rhi.create_shader_module(enki_render::taa::TAA_RESOLVE_WGSL) {
-            Ok(module) => {
-                let ubo_size = std::mem::size_of::<enki_render::taa::ResolveParams>() as u64;
-                if let Err(e) = rhi.init_taa(&module, "vs_fullscreen", "fs_resolve", ubo_size) {
-                    log::error!("TAA init failed: {e}");
-                }
-                rhi.destroy_shader_module(module);
-            }
-            Err(e) => log::error!("TAA resolve shader compile failed: {e}"),
+        // Initialise the scene-composite offscreen targets (MSAA + resolved
+        // current/depth + the refraction copies). The 3D pass renders into them and
+        // `present_composite` blits the result to the swapchain; the refractive ocean
+        // samples the opaque copies. No temporal AA.
+        if let Err(e) = rhi.init_scene_targets() {
+            log::error!("scene targets init failed: {e}");
         }
 
         self.last_tick = Instant::now();
@@ -1064,7 +1039,7 @@ impl App {
                     KeyCode::KeyM if pressed => {
                         // Geometry views (3–5) work on the Nanite path AND the voxel
                         // terrain; only the bare classic quadtree lacks them.
-                        let geom_views = cfg!(feature = "nanite") || cfg!(feature = "voxel");
+                        let geom_views = cfg!(feature = "voxel");
                         loop {
                             // 0–10 View/Planet, 11–12 Ocean (Surface/Intensity).
                             self.view_mode = (self.view_mode + 1) % 13;
@@ -1191,11 +1166,6 @@ impl App {
                         if let Some(c) = self.clouds.as_mut() {
                             c.set_source(Arc::clone(&out.hf));
                         }
-                        // Hand the heightfield to the river tracer; the (one-time)
-                        // trace + GPU upload run lazily on the first record() call.
-                        if let Some(r) = self.rivers.as_mut() {
-                            r.set_source(Arc::clone(&out.hf), cfg.lod.height_scale);
-                        }
                         self.terrain_height_scale = cfg.lod.height_scale;
                         // Phase 2: stand up the on-demand voxel terrain (transvoxel
                         // quadtree). It drives the same LOD selection as PlanetView but
@@ -1252,15 +1222,10 @@ impl App {
         let (camera, altitude) = (self.active_camera(), self.altitude_m());
         let nav_mode      = self.nav.mode();
         let view_mode     = self.view_mode;
-        // Ocean view modes (11–12) don't recolor the terrain — show it lit.
-        // 11–13 are ocean/cloud views → terrain falls back to Lit; 14 is the Nanite
-        // shadow-map debug view, which the Nanite draw DOES handle.
-        let terrain_view  = if view_mode >= 11 && view_mode != 14 { 0 } else { view_mode };
+        // Ocean/cloud view modes (11–13) don't recolor the terrain — show it lit.
+        let terrain_view  = if view_mode >= 11 { 0 } else { view_mode };
         let wireframe     = self.wireframe;
-        let taa_on        = self.taa_enabled;
-        // This frame's sub-pixel jitter (for rasterization); advance() rolls it
-        // forward after the 3D draws so the resolve uses the matching history.
-        let jitter_px     = if taa_on { self.taa_jitter.jitter_px() } else { glam::Vec2::ZERO };
+        let aa_mode       = self.aa_mode;
 
         // ── Planet LOD stats (for HUD + egui) ────────────────────────────
         let planet_stats: Option<PlanetViewStats> = self
@@ -1272,8 +1237,6 @@ impl App {
         // Egui texture uploads happen here via one-shot submit.
         // This must run before begin_frame → begin_rendering.
         let ui_out = if self.egui.is_some() && self.window.is_some() && self.rhi.is_some() {
-            let nanite_enabled    = self.nanite_enabled;
-            let nanite_tau        = self.nanite_tau;
             let voxel_caves          = self.voxel_caves;
             let voxel_cave_strength  = self.voxel_cave_strength;
             let shadow_map_enabled = self.shadow_map_enabled;
@@ -1291,7 +1254,6 @@ impl App {
             let cloud_params      = self.cloud_params;
             let markers_poles     = self.markers_poles;
             let markers_equator   = self.markers_equator;
-            let rivers_enabled    = self.rivers_enabled;
             let wind_params       = self.wind.as_ref().map(|w| w.params).unwrap_or_default();
             let sea_level_m       = self.sea_level_m;
             let wave_enabled      = self.wave_enabled;
@@ -1308,7 +1270,7 @@ impl App {
             // Profiler counters for the top-right Stats panel (all ~1–2 frames stale).
             let gpu_ms = self.rhi.as_ref().map(|r| r.gpu_time_ms()).unwrap_or(0.0);
             #[allow(unused_mut)]
-            let (mut triangles, mut visible_clusters, mut resident_clusters) = (0u64, 0u32, 0u32);
+            let mut triangles = 0u64;
             // Real terrain geometry (voxel leaves + any classic quadtree chunks).
             if let Some(pv) = self.planet_view.as_ref() {
                 triangles += pv.triangle_count() as u64;
@@ -1318,7 +1280,7 @@ impl App {
                 triangles += vv.triangle_count() as u64;
             }
             let profiler = crate::gui::Profiler {
-                cpu_ms: self.cpu_ms, gpu_ms, triangles, visible_clusters, resident_clusters,
+                cpu_ms: self.cpu_ms, gpu_ms, triangles,
             };
 
             // egui, window, and rhi are independent fields — split-borrow.
@@ -1327,9 +1289,8 @@ impl App {
             let rhi    = self.rhi.as_ref().unwrap();
 
             Some(egui.build_frame(
-                window, rhi, nav_mode, altitude, frame_time, view_mode, wireframe, taa_on,
+                window, rhi, nav_mode, altitude, frame_time, view_mode, wireframe, aa_mode,
                 shadow_map_enabled, shadow_half_extent, shadow_depth, shadow_depth_bias, shadow_normal_bias,
-                nanite_enabled, nanite_tau, cfg!(feature = "nanite"),
                 cfg!(feature = "voxel"), voxel_caves, voxel_cave_strength,
                 ocean_enabled, sea_level_m, wave_enabled, wave_choppiness, wave_foam,
                 cfg!(feature = "flora"), flora_enabled, flora_density,
@@ -1339,7 +1300,7 @@ impl App {
                 atmo_enabled, atmo_params,
                 aerial_enabled, aerial_params,
                 clouds_enabled, cloud_params,
-                markers_poles, markers_equator, rivers_enabled,
+                markers_poles, markers_equator,
                 planet_stats.as_ref(), load_stats.as_ref(),
                 profiler,
             ))
@@ -1353,14 +1314,12 @@ impl App {
         if let Some(out) = ui_out {
             self.view_mode         = out.view_mode;
             self.wireframe         = out.wireframe;
-            self.taa_enabled       = out.taa;
+            self.aa_mode           = out.aa_mode;
             self.shadow_map_enabled  = out.shadow_map_enabled;
             self.shadow_half_extent  = out.shadow_half_extent;
             self.shadow_depth        = out.shadow_depth;
             self.shadow_depth_bias   = out.shadow_depth_bias;
             self.shadow_normal_bias  = out.shadow_normal_bias;
-            self.nanite_enabled    = out.nanite_enabled;
-            self.nanite_tau        = out.nanite_tau;
             self.voxel_caves          = out.voxel_caves;
             self.voxel_cave_strength  = out.voxel_cave_strength;
             #[cfg(feature = "voxel")]
@@ -1368,9 +1327,9 @@ impl App {
                 vv.set_caves_enabled(out.voxel_caves);
                 vv.set_cave_strength(out.voxel_cave_strength as f64);
             }
-            // Geometry views (3–5) work on the Nanite path AND the voxel terrain; only
-            // the bare classic quadtree lacks them → collapse to Lit there.
-            let geom_views = cfg!(feature = "nanite") || cfg!(feature = "voxel");
+            // Geometry views (3–5) work on the voxel terrain; only the bare classic
+            // quadtree lacks them → collapse to Lit there.
+            let geom_views = cfg!(feature = "voxel");
             if !geom_views && (3..=5).contains(&self.view_mode) {
                 self.view_mode = 0;
             }
@@ -1395,7 +1354,6 @@ impl App {
             self.cloud_params      = out.clouds;
             self.markers_poles     = out.markers_poles;
             self.markers_equator   = out.markers_equator;
-            self.rivers_enabled    = out.rivers_enabled;
             self.sky.time_scale    = out.time_scale;
             self.sky.paused        = out.paused;
             if out.cycle_nav {
@@ -1421,9 +1379,9 @@ impl App {
         // ── Frame begin ───────────────────────────────────────────────────
         let rhi = match self.rhi.as_mut() { Some(r) => r, None => return };
 
-        // Select the TAA path for this frame (must be set before begin_frame, which
-        // branches its image-layout barriers on it). No-op until init_taa ran.
-        rhi.set_taa_enabled(taa_on);
+        // SSAA: apply the selected mode's supersample factor before begin_frame (it may
+        // rebuild the scene targets). Cheap no-op when unchanged.
+        rhi.set_render_scale(aa_mode.render_scale());
 
         let fi = match rhi.begin_frame() {
             Ok(idx) => idx,
@@ -1437,6 +1395,12 @@ impl App {
                 return;
             }
         };
+
+        // Free streaming buffers the GPU has finished with (retired terrain leaves).
+        // MUST run once per frame — without it the deferred-destruction graveyard grows
+        // unbounded as leaves churn (LOD/camera), VRAM fills, and uploads start failing,
+        // so leaves can't refine and degrade into stale/coarse blocks over time.
+        rhi.collect_streaming_garbage();
 
         if fi == u32::MAX {
             if let Err(e) = rhi.end_frame(fi) {
@@ -1453,8 +1417,7 @@ impl App {
         {
             {
                 // Build frame uniforms with rotation-only camera-relative view,
-                // as documented in FrameUniforms::new. With TAA on, jitter the
-                // projection sub-pixel (terrain + Nanite both read this view-proj).
+                // as documented in FrameUniforms::new.
                 // Sun direction from the focused body's heliocentric position. The
                 // planet-spin (day/night) applies ONLY when on/orbiting the planet; in
                 // free space the sun is FIXED (heliocentric), so spin = identity.
@@ -1466,15 +1429,9 @@ impl App {
                 let sun_dir_body = spin
                     .mul_vec3(self.system.sun_dir_focused().as_vec3())
                     .normalize_or_zero();
-                self.sun_dir_body = sun_dir_body; // for the TAA-resolve sun shadow
+                self.sun_dir_body = sun_dir_body; // stashed for shadow/light reuse
                 let lights = Lights::from_sun(sun_dir_body, self.sky.sun_light_color());
-                let fu     = if taa_on {
-                    FrameUniforms::new_jittered(
-                        &camera, aspect, &lights, jitter_px, aspect * screen_h_px, screen_h_px,
-                    )
-                } else {
-                    FrameUniforms::new(&camera, aspect, &lights)
-                };
+                let fu     = FrameUniforms::new(&camera, aspect, &lights);
 
                 // Build the LOD camera with full world view-proj for frustum culling.
                 let proj = reversed_z_perspective(
@@ -1651,24 +1608,37 @@ impl App {
                                 hf.as_ref(), self.terrain_height_scale, center,
                                 self.flora_density, self.flora_radius_m,
                             );
-                            // Re-ground every tree on the EXACT voxel mesh (the renderer's
-                            // own triangles), the same single source the character uses —
-                            // so trees sit on the drawn surface, not scatter()'s analytic
-                            // curve. Far trees on coarser leaves still ride their real mesh.
-                            #[cfg(feature = "voxel")]
-                            if let Some(vv) = self.voxel_view.as_ref() {
-                                for inst in self.flora_instances.iter_mut() {
-                                    let dir = inst.origin.normalize_or_zero();
-                                    if dir.length_squared() > 0.5 {
-                                        if let Some(r) = vv.ground_radius(dir) {
-                                            inst.origin = dir * r;
-                                        }
-                                    }
-                                }
-                            }
                             self.flora_scatter_center = Some(center);
                             self.flora_last_density = self.flora_density;
                             self.flora_last_radius_m = self.flora_radius_m;
+                        }
+                    }
+                    // Re-ground only NEAR trees (within the geometry-LOD ring) each frame on
+                    // the rendered voxel mesh — per-frame so they track the surface as the LOD
+                    // streams/refines, with no submersion and no dip where it's VISIBLE. Beyond
+                    // the ring a tree draws as a flat impostor billboard, where a sub-metre
+                    // LOD offset is sub-pixel, so it keeps its scatter-time origin (skip the
+                    // raycast). This cuts the loop from O(all trees) to ~the near ~7% — the fps
+                    // fix (the full O(trees×resident×tris) raycast/frame was ~200ms in debug).
+                    // ponytail: if a maxed density slider re-spikes the near ring, bucket
+                    //   resident leaves by face-cell in VoxelCollider (O(1) leaf-find) + a
+                    //   per-leaf (cu,cv) tri-grid (O(few) raycast), cached on ResidentVoxel.
+                    #[cfg(feature = "voxel")]
+                    if let Some(vv) = self.voxel_view.as_ref() {
+                        // = TREE_GEOM_M (40) + TREE_FADE_M (25): the draw's geometry→impostor
+                        //   crossover, so every tree whose trunk geometry is drawn re-grounds.
+                        const TREE_REGROUND_RADIUS_M: f64 = 65.0;
+                        let reg_r2 = TREE_REGROUND_RADIUS_M * TREE_REGROUND_RADIUS_M;
+                        for inst in self.flora_instances.iter_mut() {
+                            if (inst.origin - camera_world_pos).length_squared() > reg_r2 {
+                                continue;
+                            }
+                            let dir = inst.origin.normalize_or_zero();
+                            if dir.length_squared() > 0.5 {
+                                if let Some(r) = vv.ground_radius(dir) {
+                                    inst.origin = dir * r;
+                                }
+                            }
                         }
                     }
                     // 3. Frame uniforms + ONE wind solve (shared by every instance —
@@ -1722,7 +1692,7 @@ impl App {
                 }
 
                 // Sun shadow caster pass (depth-only, before the main instance): one
-                // pass PER CASCADE — render the casters (terrain Nanite cut, character,
+                // pass PER CASCADE — render the casters (voxel terrain cut, character,
                 // nearby trees) into each cascade map from the light. The terrain then
                 // PCF-samples the tightest covering cascade in fs_color.
                 if self.shadow_map_enabled && rhi.has_shadow_map() {
@@ -1817,11 +1787,11 @@ impl App {
                     }
                 }
 
-                // Atmosphere shell — TAA-OFF fallback only. With TAA on, the
-                // depth-aware `Aerial` pass (water split) IS the scattering, the sky
-                // dome AND the limb halo; drawing the shell too just double-tints the
-                // planet blue from orbit. Mutually exclusive (matches aerial.rs).
-                if self.atmo_enabled && !(self.taa_enabled && self.aerial_enabled) {
+                // Atmosphere shell — the sky/halo whenever the depth-aware `Aerial`
+                // pass is OFF (the default now). When aerial is on it IS the scattering,
+                // the sky dome AND the limb halo, so drawing the shell too would
+                // double-tint the planet blue — mutually exclusive (matches aerial.rs).
+                if self.atmo_enabled && !self.aerial_enabled {
                     if let Some(a) = self.atmosphere.as_ref() {
                         if let Err(e) = a.record(rhi, fi, &fu, camera_world_pos, self.atmo_params) {
                             log::error!("Atmosphere::record error: {e}");
@@ -1837,16 +1807,6 @@ impl App {
                     if let Some(m) = self.markers.as_mut() {
                         if let Err(e) = m.record(rhi, fi, &fu, camera_world_pos, sea, poles, eq) {
                             log::error!("Markers::record error: {e}");
-                        }
-                    }
-                }
-
-                // River-network ribbons — translucent water draped on land (above
-                // sea level), so the later ocean pass never paints over them.
-                if self.rivers_enabled {
-                    if let Some(r) = self.rivers.as_mut() {
-                        if let Err(e) = r.record(rhi, fi, &fu, camera_world_pos) {
-                            log::error!("Rivers::record error: {e}");
                         }
                     }
                 }
@@ -1958,15 +1918,16 @@ impl App {
                     c.set_advect_active(self.clouds_enabled);
                 }
                 // Open the refraction split (1× instance + resolved opaque colour/depth)
-                // if EITHER the ocean or the clouds want it; both need TAA on (the split
-                // returns false otherwise). Clouds are independent of the ocean toggle.
+                // if the ocean, aerial, or clouds want it. The split needs the scene
+                // targets allocated (always, except at zero extent). Clouds/aerial are
+                // OFF by default now (TAA gone); the FFT ocean drives the split.
                 let want_split = (self.ocean_enabled && self.wave.is_some())
                     || (self.aerial_enabled && self.aerial.is_some())
                     || (self.clouds_enabled && self.clouds.is_some());
                 if want_split || self.ocean_enabled {
                     let sea = self.sea_level_m;
                     // The expensive FFT patch is drawn only near the surface; the shell
-                    // covers the rest. begin_water_pass returns false when TAA is off.
+                    // covers the rest. begin_water_pass returns false only at zero extent.
                     let draw_waves = self.wave_enabled && altitude < 20_000.0;
                     let split = want_split && rhi.begin_water_pass(fi).unwrap_or(false);
                     water_split = split;
@@ -2058,41 +2019,21 @@ impl App {
             }
         }
 
-        // ── TAA resolve ──────────────────────────────────────────────────
-        // Must run AFTER all 3D draws and BEFORE begin_ui_pass. Rolls the view-
-        // proj/camera history forward, then reprojects + neighborhood-clamps +
-        // blends the current frame against history and blits to the swapchain.
-        // No-op when TAA is off (begin_rendering rendered straight to the swapchain).
-        if taa_on {
-            let proj = reversed_z_perspective(
-                camera.fov_y_radians, aspect, camera.near, camera.far,
-            );
-            let unjittered_vp = proj * camera.view_matrix_rotation_only();
-            self.taa_jitter.advance(unjittered_vp, camera.position);
-            // The voxel terrain now RECEIVES the crisp CSM (terrain_csm.wgsl), so the
-            // screen-space sun shadow — a dithered, blocky stopgap — would just double
-            // up and stipple the ground. Turn it OFF when the CSM map is active; keep it
-            // as the fallback only when there's no shadow map.
-            let ss_shadow = if rhi.has_shadow_map() { 0.0_f32 } else { 1.0_f32 };
-            let params = self.taa_jitter.resolve_params(
-                aspect * screen_h_px,
-                screen_h_px,
-                enki_render::taa::DEFAULT_HISTORY_BLEND,
-                self.sun_dir_body,
-                ss_shadow, // screen-space sun-shadow strength (0 = off; map active)
-            );
-            if let Err(e) = rhi.taa_resolve(fi, params.as_bytes()) {
-                log::error!("taa_resolve error: {e}");
-            }
+        // ── Composite to the swapchain ───────────────────────────────────
+        // Close the 3D / water instance and blit the composited `current` to the
+        // swapchain. Must run AFTER all 3D draws and BEFORE begin_ui_pass. No-op at
+        // zero extent (begin_rendering rendered straight to the swapchain).
+        if let Err(e) = rhi.present_composite(fi, self.aa_mode.into()) {
+            log::error!("present_composite error: {e}");
         }
 
         // ── Transition to 1-sample UI pass ───────────────────────────────
-        // begin_ui_pass closes the MSAA 3D instance (non-TAA path), inserts a
+        // begin_ui_pass closes the MSAA 3D instance (zero-extent path), inserts a
         // resolve→load barrier on the swapchain image, and opens a 1-sample
         // rendering instance (loadOp=LOAD, no depth attachment). egui-ash-renderer
         // 0.11 hardcodes TYPE_1 samples, so it MUST draw in this separate pass.
-        // (On the TAA path the 3D instance + swapchain were already handled by
-        // taa_resolve; begin_ui_pass just opens the UI instance.)
+        // (On the composite path the 3D instance + swapchain were already handled by
+        // present_composite; begin_ui_pass just opens the UI instance.)
         //
         // This call is always made (all render modes) so that end_frame always
         // closes a UI instance — maintaining the begin/end bracket invariant.
@@ -2122,14 +2063,12 @@ impl App {
 /// `world_rel` lives in). Reversed-Z ortho fit to a fixed region around the camera.
 /// ponytail: a single cascade centred on the camera; a player-centred / multi-
 /// cascade fit (and texel-snap for crawl-free edges) is the upgrade.
-#[cfg_attr(not(feature = "nanite"), allow(dead_code))]
 /// `focus_world` = the world point the cascade is centred on (the player's feet in
 /// third-person; the camera otherwise). `half_extent` = cascade radius in metres —
 /// SMALL is sharp: texel size = `2*half_extent/shadow_size`, so 60 m @ 4096² ≈
 /// 0.03 m/texel (vs 180 m ≈ 0.09 m). An ortho's density is uniform + translation-
 /// invariant, so centring is purely a *reach* choice (a small box must sit on the
 /// player to cover the wedge ahead); shrinking `half_extent` is the density lever.
-#[cfg_attr(not(feature = "nanite"), allow(dead_code))]
 /// The four SIDE frustum planes (left, right, bottom, top) of a view-projection
 /// matrix, normalized (Gribb–Hartmann). A point `p` is inside a plane iff
 /// `dot(plane.xyz, p) + plane.w >= 0`. Near/far are omitted on purpose: for the
@@ -2192,8 +2131,9 @@ fn sun_light_view_proj(
 
 /// Build the 3 cascade light matrices — concentric player-centred boxes with
 /// geometrically-growing half-extents (`base`, `base*2`, `base*4`): cascade 0 sharp
-/// + near, cascade 2 coarse + far. The `3` MUST match `enki_nanite::render::SHADOW_CASCADES`.
-#[cfg_attr(not(feature = "nanite"), allow(dead_code))]
+/// + near, cascade 2 coarse + far. The `3` MUST match `SHADOW_CASCADES` (= 3) used
+/// by the voxel terrain + character CSM receivers.
+#[allow(dead_code)] // used by the voxel shadow caster (dead under --no-default-features)
 fn sun_cascade_matrices(
     sun_dir: glam::Vec3,
     cam_world: glam::DVec3,

@@ -387,14 +387,30 @@ pub fn mesh_leaf(
         let height = hf.height(dir, level);
         let (temp, moisture) = hf.climate(dir, height);
         let slope = (1.0 - normal.dot(dir)).clamp(0.0, 1.0) as f32;
-        // Data debug views bake one heightfield channel into vertex color as a
-        // grayscale ramp (terrain*.wgsl shows it raw for modes 7–10); 0 = biome color.
-        let gray = |t: f32| { let t = t.clamp(0.0, 1.0); [t, t, t] };
+        // Data debug views bake one heightfield channel into vertex color (terrain*.wgsl
+        // shows it raw for modes 7–10); 0 = biome color. A jet colormap (blue→red) reveals
+        // narrow-band + sparse fields a grayscale ramp washed out: t=0 is blue (not black),
+        // so zero areas stay visible and rivers/cones pop. Height also gets 40 m contour
+        // bands (hue = global elevation, bands = local relief, visible at any zoom).
+        // ponytail: hardcoded gain/contour spacing — baked per-vertex, so a GUI slider
+        // would remesh on every drag; tune the constants here if a scale reads wrong.
+        let jet = |t: f32| {
+            let t = t.clamp(0.0, 1.0);
+            [
+                (1.5 - (4.0 * t - 3.0).abs()).clamp(0.0, 1.0),
+                (1.5 - (4.0 * t - 2.0).abs()).clamp(0.0, 1.0),
+                (1.5 - (4.0 * t - 1.0).abs()).clamp(0.0, 1.0),
+            ]
+        };
         colors.push(match dbg_field {
-            1 => gray(height as f32 * 0.5 + 0.5), // raw height [-1,1] → [0,1]
-            2 => gray(hf.material(dir)),
-            3 => gray(hf.wetness(dir)),
-            4 => gray(hf.volcanism(dir)),
+            1 => {
+                let hue = jet((height as f32 * 2.0 + 0.5).clamp(0.0, 1.0));
+                let band = 0.55 + 0.45 * (height as f32 * height_scale as f32 / 40.0).fract().abs();
+                [hue[0] * band, hue[1] * band, hue[2] * band]
+            }
+            2 => jet(hf.material(dir)),         // rock hardness 0..1 (full range)
+            3 => jet(hf.wetness(dir).sqrt()),   // river mask — sparse; sqrt lifts thin lines
+            4 => jet(hf.volcanism(dir).sqrt()), // volcano cones — sparse
             _ => enki_planet::coloring::biome_color(temp, moisture, height as f32, slope),
         });
         plate.push(hf.plate_color(dir));

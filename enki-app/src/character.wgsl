@@ -11,7 +11,7 @@
 //   1,2,3 : per-cascade depth textures (re-pointed per frame-in-flight)
 //   4 : comparison sampler (GREATER_OR_EQUAL → 2×2 hardware PCF per tap)
 
-const SHADOW_CASCADES: u32 = 3u; // MUST match enki_nanite::render::SHADOW_CASCADES
+const SHADOW_CASCADES: u32 = 3u; // MUST match character.rs / voxel_view.rs / flora.wgsl
 
 struct CharFrame {
     view_proj   : mat4x4<f32>,

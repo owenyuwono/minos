@@ -35,6 +35,54 @@ use crate::controls::nav_mode::NavMode;
 use crate::loading::LoadTimings;
 use crate::planet_view::PlanetViewStats;
 
+// ── Anti-aliasing ─────────────────────────────────────────────────────────────
+
+/// Anti-aliasing mode (chosen in the Settings panel). MSAA 4× is always on
+/// underneath; this picks the post-process AA and/or SSAA supersample factor. Each
+/// mode maps to a `(render_scale, enki_rhi::PostAa)` pair the app applies per frame.
+/// To add a method: add a variant + its mappings here, and (for a post-process pass)
+/// the matching RHI pipeline (see `present_composite`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AaMode {
+    Off,
+    Fxaa,
+    Ssaa15,
+    Ssaa2,
+}
+
+impl AaMode {
+    /// All selectable modes, in display order (for the Settings combo).
+    pub const ALL: [AaMode; 4] = [AaMode::Off, AaMode::Fxaa, AaMode::Ssaa15, AaMode::Ssaa2];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AaMode::Off => "Off (MSAA only)",
+            AaMode::Fxaa => "FXAA",
+            AaMode::Ssaa15 => "SSAA 1.5×",
+            AaMode::Ssaa2 => "SSAA 2×",
+        }
+    }
+
+    /// SSAA supersample factor for the 3D pass (1.0 = native).
+    pub fn render_scale(self) -> f32 {
+        match self {
+            AaMode::Off | AaMode::Fxaa => 1.0,
+            AaMode::Ssaa15 => 1.5,
+            AaMode::Ssaa2 => 2.0,
+        }
+    }
+}
+
+impl From<AaMode> for enki_rhi::PostAa {
+    fn from(m: AaMode) -> Self {
+        match m {
+            // SSAA needs no post filter — the downsampling blit IS the AA.
+            AaMode::Off | AaMode::Ssaa15 | AaMode::Ssaa2 => enki_rhi::PostAa::None,
+            AaMode::Fxaa => enki_rhi::PostAa::Fxaa,
+        }
+    }
+}
+
 // ── UiOutput ────────────────────────────────────────────────────────────────
 
 /// Control changes produced by the debug panel in one frame.
@@ -44,13 +92,13 @@ use crate::planet_view::PlanetViewStats;
 #[derive(Debug, Clone, Copy)]
 pub struct UiOutput {
     /// Unified view mode 0–10 — View: 0 Lit, 1 Unlit, 2 Normal, 3 Triangle,
-    /// 4 Cluster, 5 LOD (3–5 Nanite-only); Planet: 6 Plate, 7 Height, 8 Material,
+    /// 4 Cluster, 5 LOD (3–5 geometry-debug); Planet: 6 Plate, 7 Height, 8 Material,
     /// 9 Wetness, 10 Volcano.
     pub view_mode: u32,
     pub wireframe: bool,
-    /// Temporal anti-aliasing (hides discrete-LOD shimmer + edge aliasing).
-    pub taa: bool,
-    /// Sun shadow map (Nanite path): on/off + cascade + bias tuning.
+    /// Post-process anti-aliasing mode (Settings panel).
+    pub aa_mode: AaMode,
+    /// Sun shadow map: on/off + cascade + bias tuning.
     pub shadow_map_enabled: bool,
     /// Cascade radius (m) — smaller = sharper, less reach — and depth span (m).
     pub shadow_half_extent: f32,
@@ -58,9 +106,6 @@ pub struct UiOutput {
     /// Reversed-Z ADD bias (kills acne) + along-normal offset (m, helps slopes).
     pub shadow_depth_bias: f32,
     pub shadow_normal_bias: f32,
-    pub nanite_enabled: bool,
-    /// LOD pixel-error threshold (lower = finer / smoother LOD, heavier).
-    pub nanite_tau: f32,
     /// Carve dig-able caves into the voxel terrain.
     pub voxel_caves: bool,
     /// Cave carve strength (m).
@@ -69,7 +114,7 @@ pub struct UiOutput {
     pub ocean_enabled: bool,
     /// Sea level as a metre offset from the terrain's `e = 0` datum.
     pub sea_level_m: f64,
-    /// Draw the FFT spectral wave surface (near-surface detail; needs TAA on).
+    /// Draw the FFT spectral wave surface (near-surface refractive detail).
     pub wave_enabled: bool,
     /// Wave horizontal displacement gain ("choppiness").
     pub wave_choppiness: f32,
@@ -112,8 +157,6 @@ pub struct UiOutput {
     /// Reference markers: pole spikes / equator ring.
     pub markers_poles: bool,
     pub markers_equator: bool,
-    /// Draw the traced river network.
-    pub rivers_enabled: bool,
 }
 
 // ── Profiler ──────────────────────────────────────────────────────────────
@@ -127,12 +170,8 @@ pub struct Profiler {
     pub cpu_ms: f32,
     /// Whole-frame GPU time from timestamp queries (ms); 0.0 if unsupported.
     pub gpu_ms: f32,
-    /// Triangles submitted by the Nanite indirect draw last frame.
+    /// Triangles drawn by the terrain (voxel leaves / quadtree chunks) last frame.
     pub triangles: u64,
-    /// Nanite clusters passing the GPU cull last frame.
-    pub visible_clusters: u32,
-    /// Nanite clusters resident in the GPU page pool.
-    pub resident_clusters: u32,
 }
 
 /// Compact count: `2.41M` / `18.3K` / `742`.
@@ -155,6 +194,8 @@ pub struct EguiState {
     renderer: Renderer,
     /// Cached FullOutput from the last `build_frame`.
     output:   Option<FullOutput>,
+    /// Settings window open/closed (toggled by the ⚙ Settings button).
+    show_settings: bool,
 }
 
 impl EguiState {
@@ -207,6 +248,7 @@ impl EguiState {
             winit,
             renderer,
             output: None,
+            show_settings: false,
         }
     }
 
@@ -242,15 +284,12 @@ impl EguiState {
         frame_time_s:      f32,
         view_mode:         u32,
         wireframe:         bool,
-        taa:               bool,
+        aa_mode:           AaMode,
         shadow_map_enabled: bool,
         shadow_half_extent: f32,
         shadow_depth:       f32,
         shadow_depth_bias:  f32,
         shadow_normal_bias: f32,
-        nanite_enabled:    bool,
-        nanite_tau:        f32,
-        nanite_available:  bool,
         voxel_available:   bool,
         voxel_caves:       bool,
         voxel_cave_strength: f32,
@@ -276,7 +315,6 @@ impl EguiState {
         clouds:            crate::clouds::CloudParams,
         markers_poles:     bool,
         markers_equator:   bool,
-        rivers_enabled:    bool,
         planet_stats:      Option<&PlanetViewStats>,
         load_stats:        Option<&LoadTimings>,
         profiler:          Profiler,
@@ -286,14 +324,12 @@ impl EguiState {
         let mut out = UiOutput {
             view_mode,
             wireframe,
-            taa,
+            aa_mode,
             shadow_map_enabled,
             shadow_half_extent,
             shadow_depth,
             shadow_depth_bias,
             shadow_normal_bias,
-            nanite_enabled,
-            nanite_tau,
             voxel_caves,
             voxel_cave_strength,
             ocean_enabled,
@@ -317,13 +353,41 @@ impl EguiState {
             clouds,
             markers_poles,
             markers_equator,
-            rivers_enabled,
             cycle_nav: false,
             exit_surface: false,
             dismiss_load_stats: false,
         };
 
+        let mut show_settings = self.show_settings;
         let full_output = self.ctx.run(raw_input, |ctx| {
+            // Standalone ⚙ button — a top-right screen overlay, always visible
+            // (independent of the debug panel) — toggles the Settings window.
+            egui::Area::new("settings_btn".into())
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 8.0))
+                .show(ctx, |ui| {
+                    if ui.button("⚙").clicked() {
+                        show_settings = !show_settings;
+                    }
+                });
+
+            // Settings window — toggled by the ⚙ overlay above. Order-independent in
+            // egui; more graphics settings slot in here as the engine grows.
+            egui::Window::new("⚙ Settings")
+                .open(&mut show_settings)
+                .resizable(true)
+                .default_width(260.0)
+                .show(ctx, |ui| {
+                    ui.heading("Graphics");
+                    egui::ComboBox::from_label("Anti-aliasing")
+                        .selected_text(out.aa_mode.label())
+                        .show_ui(ui, |ui| {
+                            for m in AaMode::ALL {
+                                ui.selectable_value(&mut out.aa_mode, m, m.label());
+                            }
+                        });
+                    ui.label("MSAA 4× is always on; this picks the post-process / supersampling AA.");
+                });
+
             egui::Window::new("enki · debug")
                 .resizable(true)
                 .default_pos([8.0, 8.0])
@@ -361,29 +425,17 @@ impl EguiState {
 
                     // ── View ─────────────────────────────────────────────────
                     CollapsingHeader::new("View").default_open(true).show(ui, |ui| {
-                        let nanite_active = nanite_available && out.nanite_enabled;
-                        // Triangle/Cluster/LOD now work on the voxel terrain too
-                        // (terrain.wgsl / terrain_csm.wgsl modes 3/4/5), so show them
-                        // whenever the active path supports them. Shadow⊙ stays
-                        // Nanite-only (its cascade debug lives in nanite_draw.wgsl).
-                        let geom_available = nanite_available || voxel_available;
-                        let geom_active = nanite_active || voxel_available;
+                        // Triangle/Cluster/LOD work on the voxel terrain (modes 3/4/5
+                        // in terrain.wgsl / terrain_csm.wgsl); shown when voxel is active.
                         ui.horizontal(|ui| {
                             ui.label("View:");
                             ui.selectable_value(&mut out.view_mode, 0, "Lit");
                             ui.selectable_value(&mut out.view_mode, 1, "Unlit");
                             ui.selectable_value(&mut out.view_mode, 2, "Normal");
-                            if geom_available {
-                                ui.add_enabled_ui(geom_active, |ui| {
-                                    ui.selectable_value(&mut out.view_mode, 3, "Triangle");
-                                    ui.selectable_value(&mut out.view_mode, 4, "Cluster");
-                                    ui.selectable_value(&mut out.view_mode, 5, "LOD");
-                                });
-                            }
-                            if nanite_available {
-                                ui.add_enabled_ui(nanite_active, |ui| {
-                                    ui.selectable_value(&mut out.view_mode, 14, "Shadow⊙");
-                                });
+                            if voxel_available {
+                                ui.selectable_value(&mut out.view_mode, 3, "Triangle");
+                                ui.selectable_value(&mut out.view_mode, 4, "Cluster");
+                                ui.selectable_value(&mut out.view_mode, 5, "LOD");
                             }
                         });
                         ui.horizontal(|ui| {
@@ -391,9 +443,9 @@ impl EguiState {
                             ui.selectable_value(&mut out.view_mode, 6, "Plate");
                             // Height/Material/Wetness/Volcano need per-vertex data the
                             // 4×vec3 format lacks. The voxel path bakes the selected field
-                            // into vertex color on demand (remesh on switch); Nanite carries
-                            // all four per-vertex. Greyed only on the classic quadtree path.
-                            ui.add_enabled_ui(nanite_active || voxel_available, |ui| {
+                            // into vertex color on demand (remesh on switch). Greyed only
+                            // on the classic quadtree path.
+                            ui.add_enabled_ui(voxel_available, |ui| {
                                 ui.selectable_value(&mut out.view_mode, 7, "Height");
                                 ui.selectable_value(&mut out.view_mode, 8, "Material");
                                 ui.selectable_value(&mut out.view_mode, 9, "Wetness");
@@ -411,10 +463,10 @@ impl EguiState {
                         });
                         ui.checkbox(&mut out.wireframe, "Wireframe");
                         // Sun shadow map: re-homed onto the voxel terrain (Phase 3), so
-                        // the controls show for a `voxel` build (or `nanite`). Tunes the
-                        // CSM that the character + trees receive on top of the SS shadow.
-                        if nanite_available || voxel_available {
-                            ui.add_enabled_ui(nanite_active || voxel_available, |ui| {
+                        // the controls show for a `voxel` build. Tunes the CSM that the
+                        // character + trees receive on top of the SS shadow.
+                        if voxel_available {
+                            ui.add_enabled_ui(voxel_available, |ui| {
                                 ui.checkbox(&mut out.shadow_map_enabled, "Sun shadows (map)");
                                 if out.shadow_map_enabled {
                                     ui.add(egui::Slider::new(&mut out.shadow_half_extent, 8.0..=64.0)
@@ -429,10 +481,6 @@ impl EguiState {
                             });
                         }
                     });
-
-                    // ── TAA — gates the refraction split that the FFT ocean,
-                    //    aerial scattering, and clouds all render inside. ─────────
-                    ui.checkbox(&mut out.taa, "TAA (FFT ocean / aerial / clouds need it)");
 
                     // ── Ocean ────────────────────────────────────────────────
                     CollapsingHeader::new("Ocean").default_open(true).show(ui, |ui| {
@@ -479,9 +527,9 @@ impl EguiState {
                             egui::Slider::new(&mut out.atmo.density, 0.0..=2.0).text("Density"));
                     });
 
-                    // ── Aerial scattering (depth-aware; needs TAA on) ────────
+                    // ── Aerial scattering (depth-aware; OFF by default) ──────
                     CollapsingHeader::new("Aerial (scattering)").default_open(true).show(ui, |ui| {
-                        ui.checkbox(&mut out.aerial_enabled, "Show aerial perspective");
+                        ui.checkbox(&mut out.aerial_enabled, "Show aerial perspective (experimental)");
                         let on = out.aerial_enabled;
                         ui.add_enabled(on,
                             egui::Slider::new(&mut out.aerial.height, 1000.0..=40000.0).text("Top (m)"));
@@ -496,9 +544,9 @@ impl EguiState {
                             egui::Slider::new(&mut out.aerial.sky_strength, 0.0..=6.0).text("Sky brightness"));
                     });
 
-                    // ── Clouds (needs TAA on) ────────────────────────────────
+                    // ── Clouds (OFF by default) ──────────────────────────────
                     CollapsingHeader::new("Clouds").default_open(true).show(ui, |ui| {
-                        ui.checkbox(&mut out.clouds_enabled, "Show clouds");
+                        ui.checkbox(&mut out.clouds_enabled, "Show clouds (experimental)");
                         let on = out.clouds_enabled;
                         ui.add_enabled(on,
                             egui::Slider::new(&mut out.clouds.coverage, 0.0..=1.0).text("Coverage"));
@@ -534,7 +582,6 @@ impl EguiState {
                     CollapsingHeader::new("Reference").default_open(false).show(ui, |ui| {
                         ui.checkbox(&mut out.markers_equator, "Equator");
                         ui.checkbox(&mut out.markers_poles, "Poles + axis");
-                        ui.checkbox(&mut out.rivers_enabled, "Rivers");
                     });
 
                     // ── Trees (flora) ────────────────────────────────────────
@@ -566,17 +613,6 @@ impl EguiState {
                             ui.small("Built without the `flora` feature.");
                         }
                     });
-
-                    // ── Nanite (only in a `--features nanite` build) ─────────
-                    if nanite_available {
-                        CollapsingHeader::new("Nanite").default_open(true).show(ui, |ui| {
-                            ui.checkbox(&mut out.nanite_enabled, "Enable Nanite");
-                            ui.add(
-                                egui::Slider::new(&mut out.nanite_tau, 0.25..=8.0)
-                                    .text("LOD threshold (px)"),
-                            );
-                        });
-                    }
 
                     // ── Voxel terrain (only in a `--features voxel` build) ────
                     if voxel_available {
@@ -613,8 +649,9 @@ impl EguiState {
                 });
 
             // ── Top-right Stats / profiler panel ─────────────────────────────
+            // y=44 clears the ⚙ settings overlay button (top-right, ~26 px) above it.
             egui::Window::new("Stats")
-                .anchor(egui::Align2::RIGHT_TOP, [-8.0, 8.0])
+                .anchor(egui::Align2::RIGHT_TOP, [-8.0, 44.0])
                 .resizable(false)
                 .default_width(150.0)
                 .show(ctx, |ui| {
@@ -645,12 +682,6 @@ impl EguiState {
                         ui.label("Triangles");
                         ui.label(fmt_count(profiler.triangles));
                         ui.end_row();
-                        // Clusters are Nanite-specific — only in a `--features nanite` build.
-                        if nanite_available {
-                            ui.label("Clusters");
-                            ui.label(format!("{} vis / {} res", profiler.visible_clusters, profiler.resident_clusters));
-                            ui.end_row();
-                        }
                         ui.label("Resolution");
                         ui.label(format!("{}×{}", ext.width, ext.height));
                         ui.end_row();
@@ -678,13 +709,6 @@ impl EguiState {
                                 ui.end_row();
                             };
                             row(ui, "Heightfield", t.heightfield_ms, true);
-                            // Bake fields are 0 without the `nanite` feature — hide them then.
-                            if t.bake_wall_ms > 0.0 {
-                                row(ui, "Nanite bake", t.bake_wall_ms, true);
-                                row(ui, "    tessellate", t.tessellate_ms, false);
-                                row(ui, "    clusters", t.clusters_ms, false);
-                                row(ui, "    dag", t.dag_ms, false);
-                            }
                         });
                         ui.add_space(8.0);
                         if ui.button("OK").clicked() {
@@ -696,6 +720,7 @@ impl EguiState {
                 }
             }
         });
+        self.show_settings = show_settings;
 
         // Upload any new/changed textures (font atlas, etc.) to the GPU.
         // `set_textures` does an immediate one-shot submit internally.

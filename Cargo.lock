@@ -546,7 +546,6 @@ dependencies = [
  "egui-winit",
  "enki-flora",
  "enki-jobs",
- "enki-nanite",
  "enki-planet",
  "enki-render",
  "enki-rhi",

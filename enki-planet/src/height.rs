@@ -26,7 +26,8 @@ pub trait HeightField: Send + Sync {
         0.0
     }
 
-    /// Surface wetness 0..1 (open water: rivers ∪ lakes) — debug "wetness" view. Default 0.0.
+    /// Surface wetness 0..1 (open water) — debug "wetness" view. Default 0.0. No source
+    /// is wired post-river-removal; the Nanite bake still carries it as a vertex channel.
     fn wetness(&self, _dir: DVec3) -> f32 {
         0.0
     }
@@ -54,37 +55,5 @@ pub trait HeightField: Send + Sync {
     /// Default 0.5 (neutral) for height fields without a climate bake.
     fn moisture(&self, _dir: DVec3) -> f32 {
         0.5
-    }
-
-    /// Log-normalized drainage discharge 0..1 at `dir` (river-network tracer).
-    /// Default 0 (no erosion field). See `erosion::Erosion::acc_at`.
-    fn flow_accum_at(&self, _dir: DVec3) -> f32 {
-        0.0
-    }
-
-    /// UNblurred log-discharge 0..1 at `dir` — the river-network EXTRACTION reads
-    /// this (the blurred `flow_accum_at` smears channel peaks into fat gradients).
-    /// Default 0. See `erosion::Erosion::acc_sharp_at`.
-    fn flow_accum_sharp_at(&self, _dir: DVec3) -> f32 {
-        0.0
-    }
-
-    /// World-space downhill flow tangent at `dir` (magnitude = coherence signal,
-    /// NOT unit). Default zero. See `erosion::Erosion::flow_at`.
-    fn flow_dir_at(&self, _dir: DVec3) -> DVec3 {
-        DVec3::ZERO
-    }
-
-    /// UNwarped downhill flow tangent at `dir` — the river-network ROUTING reads
-    /// this (the domain warp in `flow_dir_at` misaligns routing from the unwarped
-    /// channel raster). Default zero. See `erosion::Erosion::flow_dir_raw_at`.
-    fn flow_dir_sharp_at(&self, _dir: DVec3) -> DVec3 {
-        DVec3::ZERO
-    }
-
-    /// Lake-basin presence mask 0..1 at `dir` (river tracer terminates in lakes).
-    /// Default 0. See `erosion::Erosion::lake_mask_at`.
-    fn lake_mask_at(&self, _dir: DVec3) -> f32 {
-        0.0
     }
 }

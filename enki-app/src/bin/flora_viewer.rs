@@ -26,8 +26,6 @@ use std::time::Instant;
 use enki_app::flora_render::{FloraRenderer, ShadowUniforms};
 use enki_app::flora_view::{FloraView, LeafLod, LeafMode, LeafTuning, RenderMode, TreeSpec};
 use enki_app::fps::FpsMeter;
-#[cfg(all(feature = "flora", feature = "nanite"))]
-use enki_app::flora_nanite::FloraNanite;
 use enki_app::staging::Staging;
 use enki_flora::genome::{random_genome, Env, Genome, Medium};
 use enki_render::{camera::Camera, frame::FrameUniforms, lights::Lights};
@@ -54,21 +52,7 @@ mod presets;
 // debug_mode push lane); the viewer just drives the selector and forwards it via
 // `FloraView::set_render_mode`.
 
-/// Selectable render modes + their labels, in panel order. The Triangle/Cluster/
-/// LOD trio drives the enki-nanite virtualized-geometry debug views and is only
-/// compiled in when BOTH `flora` and `nanite` are on (the Nanite branch path).
-#[cfg(all(feature = "flora", feature = "nanite"))]
-const RENDER_MODES: [(RenderMode, &str); 8] = [
-    (RenderMode::Lit, "Lit"),
-    (RenderMode::Unlit, "Unlit"),
-    (RenderMode::Wireframe, "Wireframe"),
-    (RenderMode::Normals, "Normals"),
-    (RenderMode::Ao, "AO"),
-    (RenderMode::Triangle, "Triangle"),
-    (RenderMode::Cluster, "Cluster"),
-    (RenderMode::Lod, "LOD"),
-];
-#[cfg(not(all(feature = "flora", feature = "nanite")))]
+/// Selectable render modes + their labels, in panel order.
 const RENDER_MODES: [(RenderMode, &str); 5] = [
     (RenderMode::Lit, "Lit"),
     (RenderMode::Unlit, "Unlit"),
@@ -1345,12 +1329,6 @@ struct App {
     /// through it. Mirrors how `egui` is held alongside the Rhi.
     flora_renderer: Option<FloraRenderer>,
     flora: Option<FloraView>,
-    /// The Nanite branch path: the current tree's branch mesh baked into a
-    /// ClusterAsset + the cull/draw renderer. Rebuilt with every tree (build_tree).
-    /// Drives ONLY the Triangle/Cluster/LOD branch-meshlet debug views (Lit and the
-    /// other flora views use flora's own full render path, not Nanite).
-    #[cfg(all(feature = "flora", feature = "nanite"))]
-    flora_nanite: Option<FloraNanite>,
     staging: Option<Staging>,
     egui: Option<FloraGui>,
     /// Interactive orbit/zoom/pan camera (replaces the auto-spin). Re-framed from
@@ -1483,12 +1461,6 @@ impl App {
             Some(s) if s.eq_ignore_ascii_case("wireframe") => RenderMode::Wireframe,
             Some(s) if s.eq_ignore_ascii_case("normals") => RenderMode::Normals,
             Some(s) if s.eq_ignore_ascii_case("ao") => RenderMode::Ao,
-            #[cfg(all(feature = "flora", feature = "nanite"))]
-            Some(s) if s.eq_ignore_ascii_case("triangle") => RenderMode::Triangle,
-            #[cfg(all(feature = "flora", feature = "nanite"))]
-            Some(s) if s.eq_ignore_ascii_case("cluster") => RenderMode::Cluster,
-            #[cfg(all(feature = "flora", feature = "nanite"))]
-            Some(s) if s.eq_ignore_ascii_case("lod") => RenderMode::Lod,
             _ => RenderMode::Lit,
         };
         // FLORA_WIND override (parsed once) seeds the initial wind strength/dir/clock.
@@ -1498,8 +1470,6 @@ impl App {
             rhi: None,
             flora_renderer: None,
             flora: None,
-            #[cfg(all(feature = "flora", feature = "nanite"))]
-            flora_nanite: None,
             staging: None,
             egui: None,
             // Real framing is set by the first build_tree(); this is a placeholder.
@@ -1630,36 +1600,6 @@ impl App {
                 match Staging::new(rhi, shadow_radius) {
                     Ok(s) => self.staging = Some(s),
                     Err(e) => log::error!("Staging::new failed: {e}"),
-                }
-
-                // ── Nanite branch bake: feed THIS tree's branch mesh through
-                //    enki-nanite's cluster_build + dag, then build the cull/draw
-                //    renderer against the flora SCENE pass color format (so its draw
-                //    records inside begin_scene_pass). Rebuilt every tree (the mesh
-                //    changes per genome). ponytail: all clusters permanently resident
-                //    — one static tree, no streamer. The old renderer's GPU buffers
-                //    leak until shutdown (like FloraView), acceptable for a debug
-                //    tool; we wait_idle in rebuild() before replacing it.
-                #[cfg(all(feature = "flora", feature = "nanite"))]
-                {
-                    let resolved = enki_flora::genome::resolve(&self.genome, &self.env);
-                    let bm = enki_flora::mesh::build_branch_mesh(&resolved.graph);
-                    let scene_fmt = self
-                        .flora_renderer
-                        .as_ref()
-                        .map(|r| r.scene_color_format());
-                    if let Some(scene_fmt) = scene_fmt {
-                        match FloraNanite::new(rhi, &bm, DVec3::ZERO, scene_fmt) {
-                            Ok(n) => {
-                                log::info!(
-                                    "FloraNanite: {} clusters resident (branch mesh → nanite)",
-                                    n.cluster_count()
-                                );
-                                self.flora_nanite = Some(n);
-                            }
-                            Err(e) => log::error!("FloraNanite::new failed: {e}"),
-                        }
-                    }
                 }
 
                 self.flora = Some(f);
@@ -2061,38 +2001,6 @@ impl App {
             renderer.end_shadow_pass(rhi, fi);
         }
 
-        // ── NANITE branch path: per-frame update + cull. The cull is a COMPUTE
-        //    dispatch, so it MUST be recorded OUTSIDE any rendering instance — here,
-        //    in the begin_frame→begin_rendering gap, after the (now-closed) shadow
-        //    pass and BEFORE begin_scene_pass. The matching record_draw runs INSIDE
-        //    the scene pass below. Only run it for the Nanite debug views
-        //    (Triangle / Cluster / LOD); every other mode (Lit/Unlit/Wireframe/
-        //    Normals/Ao) uses flora's own branch pipeline and skips the cull. ──
-        #[cfg(all(feature = "flora", feature = "nanite"))]
-        let nanite_branch = self.mode.uses_nanite() && self.flora_nanite.is_some();
-        #[cfg(all(feature = "flora", feature = "nanite"))]
-        if nanite_branch {
-            let screen_h = cur_extent.height as f32;
-            // tau: screen-space error cut in pixels. ~1px gives near-LOD0 detail at
-            // the viewer's tight framing; the small static tree never starves.
-            const NANITE_TAU_PX: f32 = 1.0;
-            if let Some(n) = self.flora_nanite.as_mut() {
-                if let Err(e) = n.update_and_cull(
-                    rhi,
-                    fi,
-                    camera_world_pos,
-                    &fu,
-                    screen_h,
-                    camera.fov_y_radians,
-                    NANITE_TAU_PX,
-                    self.mode.nanite_debug_mode(),
-                    self.frame_count,
-                ) {
-                    log::error!("FloraNanite update_and_cull error: {e}");
-                }
-            }
-        }
-
         // ── OFFSCREEN SCENE pass — sky/ground/tree into the flora-owned LINEAR-HDR
         //    MSAA target (RGBA16F), recorded in the begin_frame→begin_rendering gap
         //    (like the shadow pass). Resolves to a single-sample HDR texture, then
@@ -2108,33 +2016,8 @@ impl App {
                 log::error!("Staging::record error: {e}");
             }
         }
-        // ── Tree: branches + leaves into the scene pass. The Nanite debug views
-        //    (Triangle / Cluster / LOD) draw ONLY the branch meshlets through the
-        //    Nanite vertex-pulling indirect draw (its cull already ran in the gap
-        //    above), in the chosen per-tri/cluster/LOD color mode, and DELIBERATELY
-        //    SKIP the leaf cards — a geometry/cluster debug view is about the branch
-        //    meshlets, not foliage (and Nanite's generic draw miscolors leaf cards).
-        //    Every other view (Lit/Unlit/Wireframe/Normals/Ao) runs flora's FULL
-        //    branch+leaf path: textured PBR bark + IBL + PCF shadows + green leaf
-        //    cards — the photoreal render, never routed through Nanite. ──
-        #[cfg(all(feature = "flora", feature = "nanite"))]
-        if nanite_branch {
-            // Branches ONLY, via Nanite (indirect, vertex-pulling) — inside the
-            // scene pass. No leaf draw: these are branch-meshlet debug views.
-            if let Some(n) = self.flora_nanite.as_ref() {
-                if let Err(e) = n.record_draw(rhi, fi) {
-                    log::error!("FloraNanite::record_draw error: {e}");
-                }
-            }
-        } else if let (Some(renderer), Some(flora)) =
-            (self.flora_renderer.as_ref(), self.flora.as_mut())
-        {
-            // Same `wind` vec4 the shadow caster used → cast silhouette matches.
-            if let Err(e) = flora.record(rhi, renderer, fi, camera_world_pos, wind, leaf_lod) {
-                log::error!("FloraView::record error: {e}");
-            }
-        }
-        #[cfg(not(all(feature = "flora", feature = "nanite")))]
+        // ── Tree: branches + leaves into the scene pass (flora's full render path:
+        //    textured PBR bark + IBL + PCF shadows + green leaf cards). ──
         if let (Some(renderer), Some(flora)) =
             (self.flora_renderer.as_ref(), self.flora.as_mut())
         {

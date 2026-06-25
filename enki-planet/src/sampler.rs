@@ -34,7 +34,6 @@ use crate::climate::{Climate, ClimateParams, WindSample};
 // relief. The type is kept only for that (now-unused) field. ponytail: `erosion.rs`
 // is dead at runtime — deletable once we're sure A* rivers + A-path terrain stick.
 use crate::erosion::Erosion;
-use crate::river_carve::RiverCarve;
 
 /// ki `_deriveSeed` — child seed from (master, stream). Verbatim port:
 /// `s = master ^ (stream+1)*0xdeadbeef; s ^ (s >> 16)` (single xor-shift, NOT a
@@ -239,8 +238,6 @@ pub struct TectonicHeightField {
     pub noise:     Noise3D,
     is_stagnant_lid: bool,
     shelf_w_base:    f64,
-    /// Baked river-valley incision (A* drainage from springs; carves valleys + banks).
-    river_carve: RiverCarve,
     /// Process-palette noise streams (40/41/42 via ki `_deriveSeed`).
     glacial_noise: Noise3D,
     aeolian_noise: Noise3D,
@@ -330,36 +327,12 @@ impl TectonicHeightField {
             crust_dist_at,
         ));
 
-        // --- Bake river-valley incision (A* pathfinding from springs to sea, NO
-        //     erosion). Route on the base + tectonic-stamp terrain — what the shipping
-        //     height() now uses for relief (erosion removed) — precip = the wind-driven
-        //     climate moisture. ---
-        let river_carve = {
-            let tect_for_r = Arc::clone(&tectonics);
-            let noise_for_r = Noise3D::new(seed);
-            let route_h = move |dir: DVec3, level: u32| -> f64 {
-                tect_height(
-                    &tect_for_r,
-                    &noise_for_r,
-                    dir,
-                    level as u8,
-                    is_stagnant_lid_c,
-                    shelf_w_base_c,
-                    &HeightExtras::stamps_only(),
-                )
-            };
-            let climate_for_r = Arc::clone(&climate);
-            let moisture = move |dir: DVec3| -> f64 { climate_for_r.moisture(dir) as f64 };
-            RiverCarve::new(route_h, moisture)
-        };
-
         TectonicHeightField {
             tectonics,
             climate,
             noise,
             is_stagnant_lid,
             shelf_w_base,
-            river_carve,
             glacial_noise,
             aeolian_noise,
             karst_noise,
@@ -379,15 +352,13 @@ impl TectonicHeightField {
 
 impl HeightField for TectonicHeightField {
     fn height(&self, dir: DVec3, level: u8) -> f64 {
-        // A-path: tectonic stamps own the relief, climate process palette active,
-        // river_carve cuts the valleys (erosion pass removed).
+        // A-path: tectonic stamps own the relief, climate process palette active
+        // (erosion + river passes removed).
         let ex = HeightExtras {
-            // Erosion removed → the orogenic STAMPS (boundary relief, plateau, broad
-            // uplift/deform) own the mountain relief again (A-path); river_carve cuts
-            // the valleys.
+            // The orogenic STAMPS (boundary relief, plateau, broad uplift/deform) own
+            // the mountain relief (A-path).
             gate_stamps: false,
             erosion: None,
-            river_carve: Some(&self.river_carve),
             climate: Some(self.climate.as_ref()),
             glacial_noise: Some(&self.glacial_noise),
             aeolian_noise: Some(&self.aeolian_noise),
@@ -467,12 +438,6 @@ impl HeightField for TectonicHeightField {
     fn moisture(&self, dir: DVec3) -> f32 {
         self.climate.moisture(dir)
     }
-
-    fn wetness(&self, dir: DVec3) -> f32 {
-        // Open water = the A* river network. Drives the debug Wetness view (crisp
-        // line streaks + branches) + flora-on-water avoidance.
-        self.river_carve.river_mask_at(dir) as f32
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -488,9 +453,6 @@ impl HeightField for TectonicHeightField {
 struct HeightExtras<'a> {
     gate_stamps: bool,
     erosion: Option<&'a Erosion>,
-    /// Baked river-valley incision. `None` during the climate/erosion/river-carve
-    /// bakes (no incision feedback → no circularity); `Some` in the shipping height().
-    river_carve: Option<&'a RiverCarve>,
     /// Climate reference for the process-palette weights (moisture + wind). `None`
     /// during Climate's own bake (→ neutral moisture / no wind / pure FLUVIAL).
     climate: Option<&'a Climate>,
@@ -513,7 +475,6 @@ impl<'a> HeightExtras<'a> {
         HeightExtras {
             gate_stamps: true,
             erosion: None,
-            river_carve: None,
             climate: None,
             glacial_noise: None,
             aeolian_noise: None,
@@ -524,16 +485,6 @@ impl<'a> HeightExtras<'a> {
             proc_gradient: 0.0,
             proc_lapse_factor: 0.0,
             proc_invert_blend: 0.0,
-        }
-    }
-
-    /// Routing extras for the river A* bake: tectonic STAMPS ON (`gate_stamps:false`)
-    /// so water routes on the same mountain relief the shipping height() uses, but no
-    /// erosion / climate palette / river feedback (avoids circularity, keeps it cheap).
-    fn stamps_only() -> Self {
-        HeightExtras {
-            gate_stamps: false,
-            ..HeightExtras::base_only()
         }
     }
 }
@@ -825,18 +776,7 @@ fn tect_height(
     let erosion_h = ex.erosion.map(|e| e.delta_at(dir)).unwrap_or(0.0);
     let pre = surface_h + erosion_h + volcano * headroom;
 
-    // River-valley incision (≤0): carve a thin channel along the drainage line so the
-    // un-cut terrain on either side forms the BANKS (Step 2; `None` during bakes).
-    // Clamp so a LAND column never carves below sea level — rivers bottom out AT the
-    // coast, they don't drown the land into an archipelago.
-    let river_incision = ex.river_carve.map(|r| r.incision_at(dir)).unwrap_or(0.0);
-    let carved = if pre > 0.0 {
-        (pre + river_incision).max(0.0)
-    } else {
-        pre
-    };
-
-    carved.clamp(-1.0, 1.0)
+    pre.clamp(-1.0, 1.0)
 }
 
 // ---------------------------------------------------------------------------
@@ -971,119 +911,6 @@ mod tests {
         let mut map = cache.lock().unwrap();
         *map.entry(seed)
             .or_insert_with(|| &*Box::leak(Box::new(build_hf(seed))))
-    }
-
-    /// TEMP diagnostic — is the river incision actually produced + reaching height()?
-    /// Run: cargo test -p enki-planet diag_river -- --ignored --nocapture
-    #[test]
-    #[ignore]
-    fn diag_river_incision() {
-        let hf = make_hf(42);
-        let dirs = sample_sphere_dirs(40000);
-        let (mut land, mut faint, mut deep) = (0usize, 0usize, 0usize);
-        let mut min_inc = 0.0f64;
-        for &d in &dirs {
-            let h = hf.height(d, 8);
-            if h >= 0.0 {
-                land += 1;
-                let inc = hf.river_carve.incision_at(d);
-                if inc < -0.001 { faint += 1; }
-                if inc < -0.05 { deep += 1; } // visibly carved channel (not the fringe)
-                if inc < min_inc { min_inc = inc; }
-            }
-        }
-        eprintln!(
-            "DIAG-RIVER land={land} faint(<-0.001)={faint} ({:.1}%) channel(<-0.05)={deep} ({:.1}%) min_inc={min_inc:.4}",
-            100.0 * faint as f64 / land.max(1) as f64,
-            100.0 * deep as f64 / land.max(1) as f64,
-        );
-    }
-
-    /// Headless verification of the A* rivers: render the CARVED height over an
-    /// equirect map and hillshade it so the V-incised valleys read as dendritic
-    /// grooves — the "verify rivers by looking at the heightmap" artifact. No water
-    /// is drawn; the grooves ARE the incision. Writes `river_heightmap.png` at the
-    /// workspace root. Run: `cargo test -p enki-planet dump_heightmap -- --ignored`.
-    #[test]
-    #[ignore]
-    fn dump_heightmap_png() {
-        let env = |k: &str, d: f64| std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d);
-        let hf = make_hf(42);
-        let (w, h, level) = (2048usize, 1024usize, 6u8);
-        // Window (degrees): full globe by default; set CLON/CLAT/SPAN to zoom in.
-        let clon = env("CLON", 0.0).to_radians();
-        let clat = env("CLAT", 0.0).to_radians();
-        let span = env("SPAN", 360.0).to_radians();
-        let span_lat = span * h as f64 / w as f64;
-        // Meters scale of the window (radius 50 km, height_scale 1200 m).
-        let radius = 50_000.0_f64;
-        let win_w_m = radius * span;
-        let m_per_px = win_w_m / w as f64;
-        let mut deepest_m = 0.0f64; // deepest river incision seen, in metres
-        let mut river_px = 0usize; // count of river-core pixels (width gauge)
-
-        // 1. Sample carved height on an equirect (lon,lat) grid over the window.
-        let overlay = std::env::var("RIVERS").is_ok(); // tint the A* network red
-        let mut hbuf = vec![0.0f64; w * h];
-        let mut wet = vec![0.0f32; w * h];
-        for py in 0..h {
-            let lat = clat + (0.5 - (py as f64 + 0.5) / h as f64) * span_lat;
-            let (cla, sla) = (lat.cos(), lat.sin());
-            for px in 0..w {
-                let lon = clon + ((px as f64 + 0.5) / w as f64 - 0.5) * span;
-                let dir = DVec3::new(cla * lon.cos(), sla, cla * lon.sin());
-                hbuf[py * w + px] = hf.height(dir, level);
-                if overlay {
-                    wet[py * w + px] = hf.wetness(dir);
-                }
-                // Measure carved channel depth (metres) + river-pixel count (width gauge).
-                let inc_m = -hf.river_carve.incision_at(dir) * 1200.0;
-                if inc_m > deepest_m {
-                    deepest_m = inc_m;
-                }
-                if hf.river_carve.river_mask_at(dir) > 0.9 {
-                    river_px += 1;
-                }
-            }
-        }
-        eprintln!(
-            "SCALE window={win_w_m:.0}m wide ({:.1}m/px); deepest channel={deepest_m:.1}m; river core ≈ {:.0}m wide-equiv ({river_px}px)",
-            m_per_px,
-            (river_px as f64 / h as f64) * m_per_px, // avg horizontal river extent per row
-        );
-
-        // 2. Land = hillshade (rivers groove the relief); ocean = depth-blue.
-        let light = DVec3::new(-0.5, -0.7, 0.7).normalize();
-        let strength = 8.0;
-        let mut img = image::RgbImage::new(w as u32, h as u32);
-        for py in 0..h {
-            for px in 0..w {
-                let c = hbuf[py * w + px];
-                let rgb = if c < 0.0 {
-                    let t = (1.0 + c / 0.4).clamp(0.0, 1.0);
-                    image::Rgb([(10.0 + 25.0 * t) as u8, (30.0 + 55.0 * t) as u8, (70.0 + 90.0 * t) as u8])
-                } else {
-                    let (xm, xp) = (px.saturating_sub(1), (px + 1).min(w - 1));
-                    let (ym, yp) = (py.saturating_sub(1), (py + 1).min(h - 1));
-                    let dx = hbuf[py * w + xp] - hbuf[py * w + xm];
-                    let dy = hbuf[yp * w + px] - hbuf[ym * w + px];
-                    let n = DVec3::new(-dx * strength, -dy * strength, 1.0).normalize();
-                    let s = n.dot(light).max(0.0);
-                    let base = 0.35 + 0.5 * (c / 0.5).clamp(0.0, 1.0);
-                    let g = (base * (0.35 + 0.65 * s) * 255.0).clamp(0.0, 255.0) as u8;
-                    let m = wet[py * w + px];
-                    if m > 0.1 {
-                        image::Rgb([(g as f32 * 0.4 + 150.0 * m).min(255.0) as u8, (g as f32 * 0.4) as u8, (g as f32 * 0.4) as u8])
-                    } else {
-                        image::Rgb([g, g, g])
-                    }
-                };
-                img.put_pixel(px as u32, py as u32, rgb);
-            }
-        }
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../river_heightmap.png");
-        img.save(path).unwrap();
-        eprintln!("wrote {path}");
     }
 
     fn sample_sphere_dirs(n: usize) -> Vec<DVec3> {

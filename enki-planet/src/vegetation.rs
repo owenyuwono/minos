@@ -64,9 +64,6 @@ pub fn vegetation_density(hf: &dyn HeightField, dir: DVec3) -> f32 {
     if h <= BEACH {
         return 0.0; // ocean / shore
     }
-    if hf.wetness(dir) > 0.5 || hf.lake_mask_at(dir) > 0.5 {
-        return 0.0; // standing in a river / lake
-    }
     let (temp_c, precip) = hf.climate(dir, h);
     // Vegetated-forest band: warm enough (tundra→forest by ~8 °C), wet enough
     // (desert/steppe→forest past ~0.45 precip), below the rock treeline (e~0.5).

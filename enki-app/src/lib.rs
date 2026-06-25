@@ -21,12 +21,6 @@ pub mod flora_ibl;
 #[cfg(feature = "flora")]
 pub mod flora_view;
 
-// Flora branch mesh → enki-nanite virtualized-geometry bake. Composes the two
-// otherwise-independent features: present ONLY when BOTH are on. Default
-// (nanite, no flora) and flora-only (no nanite) builds skip it cleanly.
-#[cfg(all(feature = "flora", feature = "nanite"))]
-pub mod flora_nanite;
-
 // SCENE staging (sky/ground/contact-shadow) for the standalone flora viewer.
 // Lives behind `flora` alongside flora_view; deleting flora drops both.
 #[cfg(feature = "flora")]
