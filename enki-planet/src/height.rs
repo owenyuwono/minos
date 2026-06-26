@@ -50,6 +50,18 @@ pub trait HeightField: Send + Sync {
         WindSample::default()
     }
 
+    /// Live "peak sharpness" control 0..1 (0 = generator default, 1 = cusped/pointy
+    /// mountain crests). No-op by default — only height fields with a tunable detail
+    /// ridge (e.g. `TectonicHeightField`) act on it. Read lock-free per mesh sample, so
+    /// the caller remeshes after changing it.
+    fn set_peak_sharpness(&self, _s: f64) {}
+
+    /// Live "ground roughness" control 0..1 (0 = generator default smooth, 1 = strong
+    /// human-scale surface relief). No-op by default — only height fields with a tunable
+    /// detail spectrum (e.g. `TectonicHeightField`) act on it. Read lock-free per mesh
+    /// sample, so the caller remeshes after changing it.
+    fn set_ground_roughness(&self, _s: f64) {}
+
     /// Baked atmospheric moisture 0..1 along `dir` (humidity — drives cloud
     /// placement). NOTE distinct from [`Self::wetness`] (surface rivers/lakes).
     /// Default 0.5 (neutral) for height fields without a climate bake.

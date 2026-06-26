@@ -24,6 +24,7 @@
 
 use glam::DVec3;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::height::HeightField;
 use crate::noise::Noise3D;
@@ -127,6 +128,27 @@ const TECT_DETAIL_FBM_SCALE: f64 = 3.2;
 // Coastal ridging
 const TECT_DETAIL_RIDGE:       f64 = 0.025;
 const TECT_DETAIL_RIDGE_SCALE: f64 = 7.0;
+
+// Mid-scale ground relief (~25–400 m rolling hills). A DEDICATED fixed-frequency FBM: the
+// main detail FBM's base wavelength is ~15 km (TECT_DETAIL_FBM_SCALE 3.2 over R), so its
+// octaves in the 20–400 m band carry almost no amplitude — a "red" spectrum that reads as
+// smooth, blobby slopes from altitude. This injects that band directly, so subdivided LOD
+// has real relief to resolve. Fixed octaves ⇒ value is identical at every LOD level ⇒
+// crack-free by construction (same contract as `undulation`/`island_h`). Scaled by the live
+// `ground_rough` knob: gr 0 ⇒ exactly 0 ⇒ height golden + LOD-additive invariant untouched.
+const MID_RELIEF_AMP:  f64 = 0.07;  // ±~84 m at height_scale 1200 (RMS ≈ ±30 m) at gr 1.0
+const MID_RELIEF_FREQ: f64 = 130.0; // octave-0 wavelength ≈ R/130 ≈ 385 m
+const MID_RELIEF_OCT:  u32 = 5;     // 385 m → ~24 m across 5 octaves
+
+// Global "peak sharpness" ridge — sharp cusped ridges added to ELEVATED land (not just
+// the rare convergent belts), so highlands read as mountains. Scaled by the live knob
+// (`ex.ruggedness`); 0 → off (golden-identical). Mid-scale frequency, 6 fixed octaves →
+// bounded [0,1] and LOD-stable (no seam). Gated to high land + positive-only so it never
+// floods coasts or carves land below sea (an earlier unbounded version buried the whole
+// continent). ~km-scale ridges; the `ground_rough` knob owns finer human-scale relief.
+const PEAK_RIDGE_FREQ: f64 = 10.0;
+const PEAK_RIDGE_AMP:  f64 = 0.25;
+const PEAK_RIDGE_OCT:  u32 = 6;
 
 // Broad undulation
 const UNDULATION_AMP:      f64 = 0.17;
@@ -249,6 +271,22 @@ pub struct TectonicHeightField {
     proc_gradient:    f64,
     proc_lapse_factor: f64,
     proc_invert_blend: f64,
+    /// Live "peak sharpness" knob (interior-mutable so the mesher's `&self` height
+    /// reads stay lock-free; written by the GUI). Defaults reproduce the original
+    /// rounded detail ridge EXACTLY, so `cargo test` / the height golden are byte-
+    /// identical until something dials it up. Stored as f64 bits.
+    /// `peak_ridge_amp` = detail-ridge amplitude; `peak_ridge_pow` = ridge crest
+    /// exponent (2.0 = squared/rounded crest, →1.0 = cusped/pointy);
+    /// `peak_ruggedness` = hybrid-multifractal weight 0..1 (0 = plain FBM/ridged,
+    /// 1 = each octave's fine detail gated by the prior octave's local height →
+    /// roughness concentrates on peaks, valleys stay smooth). Default 0 = current.
+    peak_ridge_amp: AtomicU64,
+    peak_ridge_pow: AtomicU64,
+    peak_ruggedness: AtomicU64,
+    /// Live "ground roughness" knob 0..1 (0 = generator default = byte-identical). Lifts the
+    /// fine-octave gain (flatter spectrum → human-scale lumps) AND the off-channel detail-amp
+    /// floor (so flats aren't clamped smooth). Read lock-free per sample; caller remeshes.
+    ground_rough: AtomicU64,
 }
 
 impl TectonicHeightField {
@@ -342,7 +380,34 @@ impl TectonicHeightField {
             proc_gradient,
             proc_lapse_factor,
             proc_invert_blend,
+            peak_ridge_amp: AtomicU64::new(TECT_DETAIL_RIDGE.to_bits()),
+            peak_ridge_pow: AtomicU64::new(2.0f64.to_bits()),
+            peak_ruggedness: AtomicU64::new(0.0f64.to_bits()),
+            ground_rough: AtomicU64::new(0.0f64.to_bits()),
         }
+    }
+
+    /// Set the live peak-sharpness (0 = generator default rounded crests, 1 = strong
+    /// cusped alpine ridgelines). Maps one slider onto THREE coupled detail-shaping
+    /// params: detail-ridge amplitude, ridge crest exponent, and the hybrid-multifractal
+    /// ruggedness weight (Musgrave: concentrate fine octaves on already-high terrain).
+    /// `&self` + `Relaxed` atomics so concurrent mesher threads read it lock-free; the
+    /// caller triggers a remesh after changing it. ponytail: three coupled params behind
+    /// one knob — split ruggedness into its own slider only if the user wants finer control.
+    pub fn set_peak_sharpness(&self, s: f64) {
+        let s = s.clamp(0.0, 1.0);
+        let amp = TECT_DETAIL_RIDGE + (0.10 - TECT_DETAIL_RIDGE) * s; // 0.025 → 0.10
+        let pow = 2.0 - s;                                            // 2.0 → 1.0 (squared → cusped)
+        self.peak_ridge_amp.store(amp.to_bits(), Ordering::Relaxed);
+        self.peak_ridge_pow.store(pow.to_bits(), Ordering::Relaxed);
+        self.peak_ruggedness.store(s.to_bits(), Ordering::Relaxed);  // 0 → 1
+    }
+
+    /// Set the live ground roughness (0 = generator default smooth, 1 = strong human-scale
+    /// surface relief). Lifts the fine-octave gain + the off-channel detail floor. `&self` +
+    /// Relaxed so concurrent mesher threads read it lock-free; the caller remeshes after.
+    pub fn set_ground_roughness(&self, s: f64) {
+        self.ground_rough.store(s.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
     }
 }
 
@@ -369,6 +434,10 @@ impl HeightField for TectonicHeightField {
             proc_gradient: self.proc_gradient,
             proc_lapse_factor: self.proc_lapse_factor,
             proc_invert_blend: self.proc_invert_blend,
+            ridge_amp: f64::from_bits(self.peak_ridge_amp.load(Ordering::Relaxed)),
+            ridge_pow: f64::from_bits(self.peak_ridge_pow.load(Ordering::Relaxed)),
+            ruggedness: f64::from_bits(self.peak_ruggedness.load(Ordering::Relaxed)),
+            ground_rough: f64::from_bits(self.ground_rough.load(Ordering::Relaxed)),
         };
         tect_height(
             &self.tectonics,
@@ -466,6 +535,15 @@ struct HeightExtras<'a> {
     proc_gradient: f64,
     proc_lapse_factor: f64,
     proc_invert_blend: f64,
+    /// Live peak-sharpness (detail-ridge amplitude + crest exponent + multifractal
+    /// ruggedness). `base_only` and the climate bake use the generator defaults
+    /// (ruggedness 0) so they stay byte-identical.
+    ridge_amp: f64,
+    ridge_pow: f64,
+    ruggedness: f64,
+    /// Live "ground roughness" 0..1 (0 = byte-identical). Lifts fine-octave gain + the
+    /// off-channel detail floor for human-scale relief. base_only / climate bake use 0.
+    ground_rough: f64,
 }
 
 impl<'a> HeightExtras<'a> {
@@ -485,6 +563,10 @@ impl<'a> HeightExtras<'a> {
             proc_gradient: 0.0,
             proc_lapse_factor: 0.0,
             proc_invert_blend: 0.0,
+            ridge_amp: TECT_DETAIL_RIDGE,
+            ridge_pow: 2.0,
+            ruggedness: 0.0,
+            ground_rough: 0.0,
         }
     }
 }
@@ -578,19 +660,31 @@ fn tect_height(
         + (ocean_base - combined_land) * (1.0 - smoothstep(-shelf_w, TECT_COAST_LERP_HI, c));
 
     // --- Boundary relief (gated off in B-path) ---
+    // Peak sharpness sharpens AND refines the macro orogenic ridges: crest exponent
+    // 2.0 (rounded parabola) → 1.0 (cusped tent = the sharpest ridge), and frequency
+    // 1× → 6× (coarse ~50 km humps → finer ~km crests). s == 0 → byte-identical.
+    let r_pow    = 2.0 - ex.ruggedness;        // squared → cusped crest
+    let r_fscale = 1.0 + 5.0 * ex.ruggedness;  // coarse → finer ridges
     let ridged_at = |d: DVec3, freq: f64, octaves: u32| -> f64 {
-        ridged_fixed(noise, d.x * freq, d.y * freq, d.z * freq, octaves)
+        let f = freq * r_fscale;
+        ridged_fixed(noise, d.x * f, d.y * f, d.z * f, octaves, r_pow)
     };
     let relief = if ex.gate_stamps {
         0.0
     } else {
-        boundary_relief(&q, &tectonics.plates, dir, &ridged_at, base)
+        boundary_relief(&q, &tectonics.plates, dir, &ridged_at, base, ex.ruggedness)
     };
 
     // --- LOD-adaptive octave counts ---
     let fbm_octaves: u32    = (level as u32 + 2).clamp(FBM_BASE_OCTAVES, 18);
     let ridged_octaves: u32 = (level as i32 - 2).max(0) as u32;
     let ridged_octaves: u32 = ridged_octaves.clamp(RIDGED_BASE_OCTAVES, 10);
+
+    // Ground-roughness knob (ex.ground_rough 0..1; 0 = byte-identical). Flattens the
+    // fine-octave spectrum (more 1-20 m relief) AND lifts the off-channel detail-amp floor
+    // so flats get human-scale lumps instead of a smooth sheet. Both are no-ops at 0.
+    let tail_gain    = FBM_GAIN     + (0.72 - FBM_GAIN)     * ex.ground_rough; // 0.50 → 0.72
+    let craton_floor = CRATON_FLOOR + (0.70 - CRATON_FLOOR) * ex.ground_rough; // 0.22 → 0.70
 
     // ---- Erosion-steered fine detail (erosion present only) ----
     // Warp the FBM input along the downhill flow and read drainage discharge.
@@ -616,9 +710,9 @@ fn tect_height(
         rugged
     };
     let detail_amp_base = if drain_proxy.is_finite() {
-        TECT_DETAIL_FBM_BASE * (CRATON_FLOOR + (1.0 - CRATON_FLOOR) * smoothstep(0.10, 0.70, drain_proxy))
+        TECT_DETAIL_FBM_BASE * (craton_floor + (1.0 - craton_floor) * smoothstep(0.10, 0.70, drain_proxy))
     } else {
-        TECT_DETAIL_FBM_BASE * CRATON_FLOOR
+        TECT_DETAIL_FBM_BASE * craton_floor
     };
 
     // ---- Rock-hardness fine-detail modulation (continuous, no seams) ----
@@ -712,7 +806,7 @@ fn tect_height(
     };
 
     // --- Detail FBM (additive-octave, LOD-consistent, warped) ---
-    let fbm_raw = fbm_additive(noise, proc_warp_x, proc_warp_y, proc_warp_z, fbm_octaves);
+    let fbm_raw = fbm_additive_tail(noise, proc_warp_x, proc_warp_y, proc_warp_z, fbm_octaves, ex.ruggedness, tail_gain);
     let detail_fbm = detail_amp_proc * fbm_raw;
 
     // --- Detail ridged (discharge-gated; coastal weighting) ---
@@ -721,7 +815,7 @@ fn tect_height(
     let rx = x * TECT_DETAIL_RIDGE_SCALE;
     let ry = y * TECT_DETAIL_RIDGE_SCALE;
     let rz = z * TECT_DETAIL_RIDGE_SCALE;
-    let ridged_raw = ridged_additive(noise, rx, ry, rz, ridged_octaves);
+    let ridged_raw = ridged_additive(noise, rx, ry, rz, ridged_octaves, ex.ridge_pow, ex.ruggedness);
     let ridged_scale_base = if ex.erosion.is_some() {
         EROSION_RIDGED_FLOOR + (1.0 - EROSION_RIDGED_FLOOR) * chan
     } else {
@@ -729,7 +823,8 @@ fn tect_height(
     };
     let ridged_scale = ridged_scale_base * hardness_term;
     // In B/erosion mode boundary relief is gated off, so use the un-halved ridge amp.
-    let ridge_amp = if ex.erosion.is_some() { 0.05 } else { TECT_DETAIL_RIDGE };
+    // A-path (runtime) uses the live peak-sharpness amplitude (defaults to TECT_DETAIL_RIDGE).
+    let ridge_amp = if ex.erosion.is_some() { 0.05 } else { ex.ridge_amp };
     let detail_ridged = ridge_amp
         * ridged_scale
         * ridged_raw
@@ -749,7 +844,19 @@ fn tect_height(
         0.0
     };
 
-    let detail = detail_fbm + detail_ridged + v_incision + karst_add + cirque_add + aeolian_ripple_add;
+    // Mid-scale relief: fills the 20–400 m band the main detail FBM leaves nearly empty.
+    // Fixed-frequency ⇒ LOD-invariant ⇒ crack-free; gated to land + scaled by the live
+    // ground_rough knob (0 ⇒ exactly 0 ⇒ golden untouched). ponytail: signed relief on low
+    // coastal plains can dip a touch below sea level (small tide pools) — add an elevation
+    // fade `smoothstep(0.0, 0.08, base)` here if spurious coastal ponds show.
+    let mid_relief = if ex.ground_rough > 0.0 {
+        let mr = fbm_fixed(noise, x * MID_RELIEF_FREQ, y * MID_RELIEF_FREQ, z * MID_RELIEF_FREQ, MID_RELIEF_OCT);
+        ex.ground_rough * MID_RELIEF_AMP * mr * land_gate
+    } else {
+        0.0
+    };
+
+    let detail = detail_fbm + detail_ridged + v_incision + karst_add + cirque_add + aeolian_ripple_add + mid_relief;
 
     // --- Offshore skerries / archipelagos ---
     let mid_band = TECT_ISLAND_COAST_LO * 0.5 + TECT_ISLAND_COAST_HI * 0.5;
@@ -769,8 +876,34 @@ fn tect_height(
         0.0
     };
 
+    // --- Global peak-sharpness ridge (ALL land, scaled by the knob) ---
+    // The convergent-belt sharpening only hits rare plate-collision zones; this adds
+    // sharp cusped ridges (crest_pow 1.0, multifractal-concentrated) to ALL land so
+    // highlands everywhere read as mountains, not smooth hills. `ridged_octaves` is
+    // LOD-adaptive → fine ridges near the camera. s == 0 → 0 (golden-safe).
+    // ponytail: on the tallest terrain the amplitude can hit the ±1 clamp → flat tops;
+    // lower PEAK_RIDGE_AMP if that shows.
+    let peak_ridge = if ex.ruggedness > 0.0 {
+        // Bounded [0,1] ridge (ridged_fixed self-normalizes; the additive form overshoots
+        // to ~2 with many octaves and buried the terrain). Cusped tent crest (1.0).
+        let gr = ridged_fixed(
+            noise,
+            x * PEAK_RIDGE_FREQ,
+            y * PEAK_RIDGE_FREQ,
+            z * PEAK_RIDGE_FREQ,
+            PEAK_RIDGE_OCT,
+            1.0,
+        );
+        // Only on already-elevated land — gating by land alone flooded + buried the whole
+        // continent; coasts/plains (base near sea level) stay put.
+        let elev_gate = smoothstep(0.12, 0.40, base);
+        ex.ruggedness * PEAK_RIDGE_AMP * gr * elev_gate
+    } else {
+        0.0
+    };
+
     // --- Arc volcanoes (headroom-aware, keyed to PRE-erosion surface) ---
-    let surface_h = base + relief + detail + island_h + undulation + broad_deform;
+    let surface_h = base + relief + detail + island_h + undulation + broad_deform + peak_ridge;
     let volcano   = (tectonics.volcano_elevation(dir)).min(TECT_VOLC_SUM_MAX);
     let headroom  = 1.0 - smoothstep(TECT_VOLC_HEADROOM_LO, TECT_VOLC_HEADROOM_HI, surface_h);
     let erosion_h = ex.erosion.map(|e| e.delta_at(dir)).unwrap_or(0.0);
@@ -790,32 +923,66 @@ fn smoothstep(e0: f64, e1: f64, x: f64) -> f64 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// Hybrid-multifractal weight gain (Musgrave): a half-height octave (height proxy 0.5)
+/// still passes full fine detail (0.5·2 = 1); below that, detail fades toward smooth.
+const MF_GAIN: f64 = 2.0;
+
 /// Accumulate `octaves` fbm octaves; divide by FIXED `MAX_AMP_FBM6`.
 ///
-/// This is the additive-invariant form: the result for octaves 0..FBM_BASE_OCTAVES
-/// is bit-identical across different `octaves` values (extra octaves only add on top).
-fn fbm_additive(n: &Noise3D, x: f64, y: f64, z: f64, octaves: u32) -> f64 {
-    let mut value = 0.0f64;
-    let mut amp   = 1.0f64;
-    let mut f     = 1.0f64;
-    for _ in 0..octaves {
-        value += amp * n.sample(x * f, y * f, z * f);
-        amp   *= FBM_GAIN;
-        f     *= FBM_LAC;
+/// `mf` (0..1) is the hybrid-multifractal ruggedness: each octave's amplitude is scaled
+/// by `weight`, a one-step feedback from the PRIOR octave's local height — so fine detail
+/// concentrates on already-high terrain (rough peaks) and fades in flats (smooth valleys).
+/// `mf == 0` → `eff == 1.0` exactly → byte-identical to plain additive FBM. The weight is
+/// a pure fn of octaves ≤ i, so the additive-octave LOD invariant (octaves 0..BASE
+/// identical across levels, extra octaves additive) is preserved.
+fn fbm_additive(n: &Noise3D, x: f64, y: f64, z: f64, octaves: u32, mf: f64) -> f64 {
+    fbm_additive_tail(n, x, y, z, octaves, mf, FBM_GAIN)
+}
+
+/// As [`fbm_additive`], but octaves ≥ `FBM_BASE_OCTAVES` use `tail_gain` instead of
+/// `FBM_GAIN` — a flatter high-frequency spectrum (more fine-scale relief without adding
+/// octaves). `tail_gain == FBM_GAIN` → byte-identical to plain additive FBM, and octaves
+/// 0..BASE are untouched for ANY `tail_gain` (the boosted multiply starts at index BASE-1,
+/// which only sets the amplitude of octave BASE onward) → the height golden / LOD-additive
+/// invariant hold at the generator default (ground_rough 0 ⇒ tail_gain == FBM_GAIN).
+fn fbm_additive_tail(n: &Noise3D, x: f64, y: f64, z: f64, octaves: u32, mf: f64, tail_gain: f64) -> f64 {
+    let mut value  = 0.0f64;
+    let mut amp    = 1.0f64;
+    let mut f      = 1.0f64;
+    let mut weight = 1.0f64;
+    for i in 0..octaves {
+        let s = n.sample(x * f, y * f, z * f);
+        let eff = 1.0 + mf * (weight - 1.0);
+        value  += amp * eff * s;
+        weight  = ((0.5 + 0.5 * s) * MF_GAIN).clamp(0.0, 1.0); // [-1,1] sample → [0,1] height proxy
+        amp    *= if i >= FBM_BASE_OCTAVES - 1 { tail_gain } else { FBM_GAIN };
+        f      *= FBM_LAC;
     }
     value / MAX_AMP_FBM6
 }
 
 /// Accumulate `octaves` ridged octaves; divide by FIXED `MAX_AMP_RIDGED4`.
-fn ridged_additive(n: &Noise3D, x: f64, y: f64, z: f64, octaves: u32) -> f64 {
-    let mut value = 0.0f64;
-    let mut amp   = 1.0f64;
-    let mut f     = 1.0f64;
+///
+/// `crest_pow` shapes each ridge crest: 2.0 = the original squared (rounded) crest;
+/// →1.0 = a cusped (pointy) crest. The `== 2.0` fast path keeps the default bit-
+/// identical to the old `.powi(2)` (so the height golden is untouched at sharpness 0).
+/// `mf` is the hybrid-multifractal ruggedness weight (see `fbm_additive`); `mf == 0` →
+/// `eff == 1.0` exactly → byte-identical. The crest itself is the [0,1] height proxy that
+/// gates the next octave, so fine ridge detail concentrates on the high crests.
+fn ridged_additive(n: &Noise3D, x: f64, y: f64, z: f64, octaves: u32, crest_pow: f64, mf: f64) -> f64 {
+    let mut value  = 0.0f64;
+    let mut amp    = 1.0f64;
+    let mut f      = 1.0f64;
+    let mut weight = 1.0f64;
     for _ in 0..octaves {
         let s = n.sample(x * f, y * f, z * f);
-        value += amp * (1.0 - s.abs()).powi(2);
-        amp   *= FBM_GAIN;
-        f     *= FBM_LAC;
+        let r = 1.0 - s.abs();
+        let crest = if crest_pow == 2.0 { r * r } else { r.powf(crest_pow) };
+        let eff = 1.0 + mf * (weight - 1.0);
+        value  += amp * eff * crest;
+        weight  = (crest * MF_GAIN).clamp(0.0, 1.0);
+        amp    *= FBM_GAIN;
+        f      *= FBM_LAC;
     }
     value / MAX_AMP_RIDGED4
 }
@@ -839,14 +1006,20 @@ fn fbm_fixed(n: &Noise3D, x: f64, y: f64, z: f64, octaves: u32) -> f64 {
 }
 
 /// Ridged with self-normalising max-amp (used in `boundary_relief` callback).
-fn ridged_fixed(n: &Noise3D, x: f64, y: f64, z: f64, octaves: u32) -> f64 {
+///
+/// `crest_pow` shapes each ridge crest: 2.0 = the original squared (rounded) crest;
+/// 1.0 = a cusped tent (sharp ridge). The `== 2.0` fast path keeps the default bit-
+/// identical to the old `.powi(2)` (height golden untouched at sharpness 0).
+fn ridged_fixed(n: &Noise3D, x: f64, y: f64, z: f64, octaves: u32, crest_pow: f64) -> f64 {
     let mut value   = 0.0f64;
     let mut amp     = 1.0f64;
     let mut max_amp = 0.0f64;
     let mut f       = 1.0f64;
     for _ in 0..octaves {
         let s = n.sample(x * f, y * f, z * f);
-        value   += amp * (1.0 - s.abs()).powi(2);
+        let r = 1.0 - s.abs();
+        let crest = if crest_pow == 2.0 { r * r } else { r.powf(crest_pow) };
+        value   += amp * crest;
         max_amp += amp;
         amp     *= FBM_GAIN;
         f       *= FBM_LAC;
@@ -997,9 +1170,9 @@ mod tests {
             let z = dir.z * TECT_DETAIL_FBM_SCALE;
 
             // 6 octaves (base): bit-identical regardless of how many more follow.
-            let base6 = fbm_additive(&n, x, y, z, FBM_BASE_OCTAVES);
+            let base6 = fbm_additive(&n, x, y, z, FBM_BASE_OCTAVES, 0.0);
             // 7 octaves: first 6 must equal base6 / MAX_AMP_FBM6 up to the extra octave.
-            let oct7 = fbm_additive(&n, x, y, z, FBM_BASE_OCTAVES + 1);
+            let oct7 = fbm_additive(&n, x, y, z, FBM_BASE_OCTAVES + 1, 0.0);
 
             // base6 * MAX_AMP_FBM6 == raw 6-oct sum == first-6-oct raw sum of oct7 * MAX_AMP_FBM6
             // ↔ oct7 - base6 == amplitude of octave 7 / MAX_AMP_FBM6 (small)
@@ -1009,6 +1182,32 @@ mod tests {
                 delta < 0.04,
                 "delta between 6- and 7-octave fbm too large ({delta}); normalization broken"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Multifractal ruggedness preserves the additive-octave LOD invariant.
+    // The weight feedback is a pure fn of octaves ≤ i, so octave i's contribution
+    // (and thus the 6-octave prefix) is independent of how many octaves follow —
+    // no LOD seam even with ruggedness fully on. Same bounded-tail check as above.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn multifractal_additive_invariant() {
+        let n = Noise3D::new(123);
+        for &dir in &sample_sphere_dirs(50) {
+            let (x, y, z) = (dir.x * 3.0, dir.y * 3.0, dir.z * 3.0);
+            for mf in [0.5_f64, 1.0] {
+                let base6 = fbm_additive(&n, x, y, z, FBM_BASE_OCTAVES, mf);
+                let oct9  = fbm_additive(&n, x, y, z, FBM_BASE_OCTAVES + 3, mf);
+                // Extra octaves 7..9 add only their (weight-gated, ≤1) bounded tail.
+                // Σ_{i=6}^{8} 0.5^i / MAX_AMP_FBM6 ≈ 0.028 — well under 0.05.
+                let delta = (oct9 - base6).abs();
+                assert!(delta < 0.05, "mf={mf}: prefix not stable (delta {delta}) — LOD seam");
+                // Same ridged check (crest-gated weight).
+                let rb = ridged_additive(&n, x, y, z, RIDGED_BASE_OCTAVES, 1.0, mf);
+                let ro = ridged_additive(&n, x, y, z, RIDGED_BASE_OCTAVES + 3, 1.0, mf);
+                assert!((ro - rb).abs() < 0.10, "mf={mf}: ridged prefix not stable");
+            }
         }
     }
 

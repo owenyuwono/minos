@@ -3157,12 +3157,18 @@ const BR_RIDGE2_WIDTH:         f64 = 0.008;
 /// Returns a height contribution in normalized units ≈[-1,1].
 /// `ridged_at(dir, freq, octaves)` should return ridged multifractal noise ≈[0,1].
 /// Mirrors `boundaryRelief` in tectonics.ts exactly.
+/// `sharpness` (0..1, the live "peak sharpness" knob) lerps the orogenic ridge
+/// modulation from a smooth Gaussian whaleback (constant-base-dominated) toward a ridged
+/// crestline (noise-swing-dominated): the constant ridge BASE shrinks and the noise SWING
+/// grows, so the belt/cordillera break into ridges + notches instead of a rounded dome.
+/// `sharpness == 0` reproduces the original ki coefficients byte-for-byte.
 pub fn boundary_relief(
     q: &TectonicQuery,
     plates: &[Plate],
     dir: DVec3,
     ridged_at: &dyn Fn(DVec3, f64, u32) -> f64,
     base: f64,
+    sharpness: f64,
 ) -> f64 {
     let d         = q.boundary_dist;
     let side_ramp = ss(0.002, 0.015, d);
@@ -3204,8 +3210,10 @@ pub fn boundary_relief(
         relief += w_oc * (-BR_TRENCH_DEPTH * cp2r * gauss(d, 0.0, BR_TRENCH_WIDTH)
                          + BR_FLEX_BULGE  * cp2r * gauss(d, BR_FLEX_POS, BR_FLEX_WIDTH));
 
-        // CO: Andes / Cascades
-        let ridge_factor = BR_CORD_RIDGE_BASE + BR_CORD_RIDGE * ridged_at(dir, 6.0, 4);
+        // CO: Andes / Cascades — sharpness shrinks the smooth base, grows the ridged swing.
+        let cord_base  = BR_CORD_RIDGE_BASE * (1.0 - sharpness) + 0.12 * sharpness; // 0.55 → 0.12
+        let cord_swing = BR_CORD_RIDGE + (1.0 - BR_CORD_RIDGE) * sharpness;         // 0.60 → 1.0
+        let ridge_factor = cord_base + cord_swing * ridged_at(dir, 6.0, 4);
         relief += w_co * (BR_CORD_HEIGHT  * cp2r * gauss(d, BR_CORD_POS, BR_CORD_WIDTH) * ridge_factor * cord_scale_factor
                          - BR_SHELF_DIP  * cp2r * gauss(d, 0.004, BR_SHELF_WIDTH));
 
@@ -3226,8 +3234,10 @@ pub fn boundary_relief(
             + (1.0 - oo_subduct) * arc_relief
         );
 
-        // CC: Himalaya / Alps collision belt
-        let belt_ridged = BR_BELT_RIDGE_BASE + BR_BELT_RIDGE * ridged_at(dir, 6.0, 5);
+        // CC: Himalaya / Alps collision belt — sharpness breaks the smooth dome into ridges.
+        let belt_base  = BR_BELT_RIDGE_BASE * (1.0 - sharpness) + 0.12 * sharpness; // 0.58 → 0.12
+        let belt_swing = BR_BELT_RIDGE + (0.90 - BR_BELT_RIDGE) * sharpness;        // 0.40 → 0.90
+        let belt_ridged = belt_base + belt_swing * ridged_at(dir, 6.0, 5);
         relief += w_cc * (BR_BELT_HEIGHT * cp2r * gauss(d, 0.0, BR_BELT_WIDTH) * belt_ridged * cord_scale_factor);
 
         // Tibetan Plateau
@@ -3419,7 +3429,7 @@ mod tests {
             let q = t.query(dir);
             let r = boundary_relief(&q, &t.plates, dir, &|d, freq, oct| {
                 ridged(&ridged_noise, d.x, d.y, d.z, oct, freq, 2.0, 0.5)
-            }, 0.0);
+            }, 0.0, 0.0);
             assert!(r.is_finite(), "boundary_relief not finite at i={}", i);
             assert!(r > -3.0 && r < 3.0, "boundary_relief {} out of plausible range at i={}", r, i);
         }
@@ -3443,10 +3453,10 @@ mod tests {
             let q2 = t2.query(dir.normalize());
             let r1 = boundary_relief(&q1, &t1.plates, dir, &|d, freq, oct| {
                 ridged(&ridged_noise, d.x, d.y, d.z, oct, freq, 2.0, 0.5)
-            }, 0.0);
+            }, 0.0, 0.0);
             let r2 = boundary_relief(&q2, &t2.plates, dir, &|d, freq, oct| {
                 ridged(&ridged_noise, d.x, d.y, d.z, oct, freq, 2.0, 0.5)
-            }, 0.0);
+            }, 0.0, 0.0);
             assert_eq!(r1.to_bits(), r2.to_bits(),
                 "boundary_relief differs between identical seeds at {:?}", dir);
         }
@@ -3472,7 +3482,7 @@ mod tests {
         let rn = crate::noise::Noise3D::new(99);
         let _ = boundary_relief(&q, &t.plates, dir, &|d, freq, oct| {
             ridged(&rn, d.x, d.y, d.z, oct, freq, 2.0, 0.5)
-        }, 0.0);
+        }, 0.0, 0.0);
     }
 
     /// volcano_elevation must be deterministic and finite.

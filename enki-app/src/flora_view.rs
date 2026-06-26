@@ -1127,17 +1127,13 @@ impl FloraView {
         if blend <= 0.0 {
             return Ok(());
         }
-        // Canopy centre from the local AABB, biased up into the crown; transformed
-        // to camera-relative by the caller's `model` (per-instance for the scatter).
-        let (mn, mx) = self.bounds;
-        let cx = 0.5 * (mn[0] + mx[0]);
-        let cz = 0.5 * (mn[2] + mx[2]);
-        let dy = mx[1] - mn[1];
-        let local_center = Vec3::new(cx, mn[1] + 0.62 * dy, cz);
+        // Reproduce the impostor atlas's framing EXACTLY so the billboard sits
+        // GROUNDED, not floating: the same local AABB centre + cube half-extent the
+        // bake used, placed by the caller's per-instance `model` and scaled by the
+        // instance's uniform scale (recovered from the model's x column).
+        let (local_center, half) = self.impostor_frame();
         let center = model.transform_point3(local_center);
-        // Blob radius: cover the crown (a bit under the full half-height), floored
-        // by the bounding radius so squat crowns still read.
-        let radius = (0.55 * dy).max(0.6 * self.bounding_radius());
+        let radius = half * model.x_axis.truncate().length();
         // Camera-facing billboard: local quad x→cam_right, y→cam_up, scaled.
         let fwd = cam_right.cross(cam_up).normalize_or(Vec3::Z);
         let model = Mat4::from_cols(
@@ -1334,12 +1330,18 @@ impl FloraView {
         Ok(())
     }
 
-    /// The tree-LOCAL-WORLD AABB (min, max) the impostor bake fits its ortho tiles
-    /// to — same frame `record_bake_draws` records in (model = identity at the
-    /// origin → this equals `world_bounds()`). Exposed so `bake_impostor` can size
-    /// the TOP/SIDE ortho frustums without reaching into private fields.
-    pub fn bake_bounds(&self) -> (Vec3, Vec3) {
-        self.world_bounds()
+    /// The cube the impostor atlas is baked into — and that the runtime billboard
+    /// must reproduce: the centre of the RAW LOCAL branch AABB (the frame
+    /// `record_bake_draws` actually draws — model = identity) plus a uniform cube
+    /// half-extent (largest axis, floored at 1, +0.5 pad). Handing the SAME pair to
+    /// both the bake (`bake_impostor`) and the draw (`record_impostor_at`) frames
+    /// the billboard exactly as the atlas captured the tree, so a far tree sits
+    /// GROUNDED instead of floating. Multiply `half` by the instance scale at draw.
+    pub fn impostor_frame(&self) -> (Vec3, f32) {
+        let (mn, mx) = self.bounds;
+        let (mn, mx) = (Vec3::from(mn), Vec3::from(mx));
+        let half = 0.5 * (mx - mn).max_element().max(1.0) + 0.5;
+        (0.5 * (mn + mx), half)
     }
 }
 

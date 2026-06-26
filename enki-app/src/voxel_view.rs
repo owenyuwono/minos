@@ -68,6 +68,8 @@ struct TerrainCsmFrame {
     ambient:       [f32; 4],
     cascade_vp:    [[[f32; 4]; 4]; SHADOW_CASCADES as usize], // camera-relative world → light clip
     shadow_params: [f32; 4],                                 // [depth_bias, normal_bias, strength, enabled]
+    morph_a:       [f32; 4],                                 // CDLOD: [radius, screen_k, split_px, merge_px]
+    morph_b:       [f32; 4],                                 // [morph_region, _, _, _]
 }
 
 /// Immutable snapshot the worker meshes against (cheap to Arc-clone per request).
@@ -97,6 +99,8 @@ struct MeshDone {
     sides: TransitionSides,
     gen: u64,
     arrays: ChunkMeshArrays,
+    /// Per-vertex CDLOD geomorph displacement (parallel to `arrays.positions`).
+    morph: Vec<[f32; 3]>,
 }
 
 struct ResidentVoxel {
@@ -106,6 +110,10 @@ struct ResidentVoxel {
     /// CPU geometry kept for collision — the rendered triangles ARE the collider.
     /// `Arc` so the per-frame collider snapshot clones a handle, not the data.
     positions: Arc<[[f32; 3]]>,
+    /// Per-vertex CDLOD morph displacement (parallel to `positions`), kept CPU-side so
+    /// the collider can morph the triangles EXACTLY like the GPU draws them (with the
+    /// same boundary/cave zeros) → grounding can't drift from the drawn surface.
+    morph: Arc<[[f32; 3]]>,
     indices: Arc<[u32]>,
 }
 
@@ -118,12 +126,20 @@ struct ResidentVoxel {
 /// `Arc`, so consumers query it without borrowing `VoxelView`.
 pub struct VoxelCollider {
     leaves: Vec<ColliderLeaf>,
+    /// CDLOD params (snapshot per frame) so grounding morphs the triangles exactly like
+    /// terrain_csm.wgsl draws them — else the character/trees drift from the drawn surface.
+    camera: DVec3,
+    radius: f64,
+    screen_k: f64,
+    split_px: f64,
+    region: f64,
 }
 
 struct ColliderLeaf {
     key: ChunkKey, // (face, level, ix, iy) → the cube-face patch bounds for the find
     origin: DVec3,
     positions: Arc<[[f32; 3]]>, // leaf-local (relative to `origin`)
+    morph: Arc<[[f32; 3]]>,     // per-vertex CDLOD displacement (parallel to positions)
     indices: Arc<[u32]>,
 }
 
@@ -174,16 +190,34 @@ impl SurfaceCollider for VoxelCollider {
         }
         let leaf = best?;
 
-        // Raycast the planet-centre→dir ray against the leaf's ACTUAL triangles. The
-        // top surface is the FARTHEST hit (caves carve solid below it, but you stand
-        // on top). Verts are leaf-local → world by adding the leaf origin (f64).
-        let world = |i: u32| -> DVec3 {
+        // Raycast the planet-centre→dir ray against the leaf's ACTUAL triangles, MORPHED
+        // per-vertex exactly as terrain_csm.wgsl draws them (CDLOD displacement lerped by
+        // camera distance) — so grounding rides the DRAWN surface: no float, no sink. The
+        // displacement is already 0 at roots and at the boundary/cave verts the mesher
+        // zeroed, so those cases need no special-casing. Top surface = FARTHEST hit (caves
+        // carve solid below; you stand on top).
+        // ponytail: morphs each tested tri (3 smoothsteps/tri); fine for the handful of
+        // grounding queries per frame (1 character + the near trees).
+        let level = leaf.key.1;
+        let ns = std::f64::consts::FRAC_PI_2 * self.radius / (1u64 << level) as f64;
+        let near = ns * self.screen_k / self.split_px;
+        let far = 2.0 * near;
+        let lo = far - self.region * (far - near);
+        let mvert = |i: u32| -> DVec3 {
             let p = leaf.positions[i as usize];
-            leaf.origin + DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64)
+            let w = leaf.origin + DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64);
+            if level == 0 {
+                return w;
+            }
+            let d = leaf.morph[i as usize];
+            let disp = DVec3::new(d[0] as f64, d[1] as f64, d[2] as f64);
+            let dist = (w - self.camera).length();
+            let tt = ((dist - lo) / (far - lo).max(1e-6)).clamp(0.0, 1.0);
+            w + (tt * tt * (3.0 - 2.0 * tt)) * disp // smoothstep — matches terrain_csm.wgsl
         };
         let mut hit: Option<f64> = None;
         for tri in leaf.indices.chunks_exact(3) {
-            if let Some(t) = ray_tri(DVec3::ZERO, dir, world(tri[0]), world(tri[1]), world(tri[2])) {
+            if let Some(t) = ray_tri(DVec3::ZERO, dir, mvert(tri[0]), mvert(tri[1]), mvert(tri[2])) {
                 if hit.map_or(true, |h| t > h) {
                     hit = Some(t);
                 }
@@ -205,7 +239,7 @@ pub struct VoxelView {
     /// CPU cache of meshed leaves (built, maybe not GPU-resident). Decouples
     /// "meshed" from "drawn" so LOD thrash + async latency never drop results — the
     /// fix for the resident=0 deadlock.
-    cache: LruCache<ChunkKey, (ChunkMeshArrays, TransitionSides)>,
+    cache: LruCache<ChunkKey, (ChunkMeshArrays, Vec<[f32; 3]>, TransitionSides)>,
     /// Caves toggled/retuned → invalidate cache + resident, re-mesh next update.
     dirty_caves: bool,
     /// Data debug view selector (0 none; 1 Height/2 Material/3 Wetness/4 Volcano),
@@ -214,6 +248,10 @@ pub struct VoxelView {
     /// Data-view field changed → re-mesh resident leaves IN PLACE with the new color
     /// (old mesh stays drawn until the new one arrives — never blanks, unlike caves).
     dirty_recolor: bool,
+    /// Ground-roughness changed → re-mesh resident leaves IN PLACE with the new relief.
+    /// Uses the recolor (non-blanking) path, NOT dirty_caves (which drains resident → the
+    /// terrain vanishes for seconds while hundreds of leaves re-mesh).
+    dirty_relief: bool,
     req_txs: Vec<Sender<MeshReq>>,
     rr: usize,
     done_rx: Receiver<MeshDone>,
@@ -240,6 +278,77 @@ pub struct VoxelView {
     /// Collision snapshot of the resident leaves (the rendered triangles), rebuilt each
     /// `update`. Handed to the character + flora as the single grounding source.
     collider: Arc<VoxelCollider>,
+    // ── CDLOD geomorph params (drive the per-vertex morph band in terrain_csm.wgsl) ──
+    radius: f64,
+    /// `resolution · target_tri_px` and that ÷ (1+hysteresis) — the LOD split/merge px
+    /// thresholds, captured from `LodConfig` (which is moved into `LodTree`).
+    split_px: f32,
+    merge_px: f32,
+    /// Finest LOD level the quadtree draws (`LodConfig::max_depth`) — clamps the analytic
+    /// grounding level so trees ride the drawn surface, not a finer phantom one.
+    max_depth: u8,
+    /// `screen_h / (2·tan(fov/2))` — pixels-per-radian-ish; refreshed each `update` from
+    /// the camera so the shader can map a vertex's camera distance to a morph factor.
+    screen_k: f32,
+    /// GUI knob: fraction of each leaf's distance range over which the morph happens
+    /// (1.0 = morph across the whole range = smoothest; smaller = later/snappier).
+    morph_region: f32,
+    /// GUI knob: 0 = generator-default rounded peaks, 1 = cusped/pointy alpine crests.
+    /// Pushed into the heightfield's live detail-ridge knob; changing it remeshes (caves path).
+    peak_sharpen: f64,
+    /// Ground detail-normal knobs (terrain_csm.wgsl `fs_main`): `detail_strength` = normal-
+    /// perturb amount (0 = off), `detail_scale` = feature wavelength (m). Pure per-pixel shading
+    /// — uploaded into `frame.morph_b.yz`, no remesh, collider untouched.
+    detail_strength: f32,
+    detail_scale: f32,
+    /// POM parallax amplitude (m) — how far the detail height field parallaxes. 0 = flat
+    /// normal-map only. Uploaded into `frame.morph_b.w`.
+    detail_depth: f32,
+    /// Live ground-roughness knob (heightfield relief amplitude/spectrum). Pushed into the
+    /// shared heightfield (collider rides the same Arc → grounding stays in sync); remeshes
+    /// on change. Inits to a sentinel so the first GUI push reaches the heightfield.
+    ground_rough: f64,
+}
+
+/// Default peak sharpness the app starts with — the heightfield itself defaults to 0
+/// (rounded, golden-identical for tests), so the app dials in a sharper look on startup.
+const DEFAULT_PEAK_SHARPEN: f64 = 0.5;
+
+/// Pure CDLOD morphed-radius math: the radius `terrain_csm.wgsl` draws at `dir` for a
+/// camera at `camera`, given `sr(level)` = `surface_radius` at that LOD level. Free-standing
+/// (no `VoxelView`/`Rhi`) so the level-selection + morph band are unit-testable. Mirrors
+/// `VoxelCollider::ground_radius`'s per-vertex morph exactly.
+fn cdlod_morphed_radius(
+    radius: f64,
+    screen_k: f64,
+    split_px: f64,
+    region: f64,
+    max_depth: u8,
+    camera: DVec3,
+    dir: DVec3,
+    sr: impl Fn(u8) -> f64,
+) -> f64 {
+    use std::f64::consts::FRAC_PI_2;
+    let split_px = split_px.max(1e-3);
+    // Drawn LOD level here = the quadtree's projection cut (same rule as lod.rs): a leaf at
+    // level L stays resident for camera distance in [near(L), 2·near(L)), with
+    // near(L) = (π/2·radius / 2^L)·screen_k / split_px. Invert for L from the distance
+    // (use the fine surface as the distance proxy — the band dwarfs the per-level Δheight).
+    let dist = (dir * sr(max_depth) - camera).length().max(1e-3);
+    let near0 = FRAC_PI_2 * radius * screen_k / split_px;
+    let level = (near0 / dist).log2().ceil().clamp(0.0, max_depth as f64) as u8;
+    if level == 0 {
+        return sr(0); // root: no parent to morph toward
+    }
+    // Morph band for this level — IDENTICAL to VoxelCollider::ground_radius / the shader.
+    let ns = FRAC_PI_2 * radius / (1u64 << level) as f64;
+    let near = ns * screen_k / split_px;
+    let far = 2.0 * near;
+    let lo = far - region * (far - near);
+    let tt = ((dist - lo) / (far - lo).max(1e-6)).clamp(0.0, 1.0);
+    let m = tt * tt * (3.0 - 2.0 * tt); // smoothstep — matches terrain_csm.wgsl
+    let (r_l, r_parent) = (sr(level), sr(level - 1));
+    r_l + m * (r_parent - r_l)
 }
 
 impl VoxelView {
@@ -252,8 +361,14 @@ impl VoxelView {
     ) -> Self {
         let radius = lod.radius;
         let height_scale = lod.height_scale;
+        // CDLOD geomorph thresholds — capture before `lod` moves into LodTree.
+        let split_px = lod.resolution as f32 * lod.target_tri_px;
+        let merge_px = split_px / (1.0 + lod.hysteresis);
+        let max_depth = lod.max_depth; // finest drawn level (clamps analytic grounding)
         let tree = LodTree::new(lod, Arc::clone(&hf));
         let cave_params = CaveParams::default();
+        // Start with sharper-than-default peaks (the heightfield ships rounded for tests).
+        hf.set_peak_sharpness(DEFAULT_PEAK_SHARPEN);
 
         // Depth-only caster pipeline (terrain vertex layout; reads only position).
         // Falls back to the lit pipeline handle if the depth pipeline fails to build.
@@ -312,7 +427,7 @@ impl VoxelView {
                 .create_shader_module(TERRAIN_CSM_WGSL)
                 .expect("terrain_csm.wgsl");
             let pl = rhi
-                .create_graphics_pipeline(&GraphicsPipelineDesc {
+                .create_graphics_pipeline_morph(&GraphicsPipelineDesc {
                     shader,
                     vs_entry: "vs_main",
                     fs_entry: "fs_main",
@@ -394,7 +509,7 @@ impl VoxelView {
                                 c.dbg_field,
                             )
                         }));
-                        let arrays = match meshed {
+                        let (arrays, morph) = match meshed {
                             Ok(a) => a,
                             Err(_) => {
                                 panics.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -403,7 +518,7 @@ impl VoxelView {
                             }
                         };
                         if done_tx
-                            .send(MeshDone { key: req.key, sides: req.sides, gen: req.gen, arrays })
+                            .send(MeshDone { key: req.key, sides: req.sides, gen: req.gen, arrays, morph })
                             .is_err()
                         {
                             break; // main side dropped
@@ -425,6 +540,7 @@ impl VoxelView {
             dirty_caves: false,
             dbg_field: 0,
             dirty_recolor: false,
+            dirty_relief: false,
             req_txs,
             rr: 0,
             done_rx,
@@ -441,7 +557,25 @@ impl VoxelView {
             csm_layout,
             csm_frame_ubo,
             csm_set,
-            collider: Arc::new(VoxelCollider { leaves: Vec::new() }),
+            radius,
+            split_px,
+            merge_px,
+            max_depth,
+            screen_k: 1.0,
+            morph_region: 1.0,
+            peak_sharpen: DEFAULT_PEAK_SHARPEN,
+            detail_strength: 0.6,
+            detail_scale: 1.5,
+            detail_depth: 0.25,
+            ground_rough: -1.0, // sentinel → first GUI readback pushes the real default into the hf
+            collider: Arc::new(VoxelCollider {
+                leaves: Vec::new(),
+                camera: DVec3::ZERO,
+                radius,
+                screen_k: 1.0,
+                split_px: split_px as f64,
+                region: 1.0,
+            }),
         }
     }
 
@@ -525,6 +659,32 @@ impl VoxelView {
         }
     }
 
+    pub fn peak_sharpen(&self) -> f64 {
+        self.peak_sharpen
+    }
+
+    /// Set mountain peak sharpness (0 = rounded, 1 = cusped). Pushes the knob into the
+    /// shared heightfield (the collider rides the same `Arc`, so grounding stays in sync)
+    /// and remeshes via the caves dirty path — a brief global rebuild, like a cave retune.
+    pub fn set_peak_sharpen(&mut self, s: f64) {
+        if (self.peak_sharpen - s).abs() > 1e-6 {
+            self.peak_sharpen = s;
+            self.ctx.hf.set_peak_sharpness(s);
+            self.dirty_caves = true;
+        }
+    }
+
+    /// Set ground roughness (0 = smooth/generator-default, 1 = strong human-scale relief).
+    /// Pushes into the shared heightfield (collider rides the same Arc → grounding stays in
+    /// sync) and remeshes via the caves dirty path. Mirrors `set_peak_sharpen`.
+    pub fn set_ground_roughness(&mut self, s: f64) {
+        if (self.ground_rough - s).abs() > 1e-6 {
+            self.ground_rough = s;
+            self.ctx.hf.set_ground_roughness(s);
+            self.dirty_relief = true; // in-place re-mesh (never blanks), NOT the caves drain
+        }
+    }
+
     /// Queue a sphere edit (applied next `update`). `dig` carves air, else fills solid.
     pub fn queue_edit(&mut self, center: DVec3, radius: f64, dig: bool) {
         self.pending_edits.push(Edit { center, radius, dig });
@@ -584,6 +744,7 @@ impl VoxelView {
         fi: u32,
         key: ChunkKey,
         arrays: ChunkMeshArrays,
+        morph: Vec<[f32; 3]>,
         sides: TransitionSides,
     ) {
         let plate = arrays.plate_colors.as_deref();
@@ -593,6 +754,7 @@ impl VoxelView {
             &arrays.normals,
             &arrays.colors,
             plate,
+            Some(&morph),
             &arrays.indices,
         ) {
             Ok(Some(mesh)) => {
@@ -601,6 +763,7 @@ impl VoxelView {
                     origin: arrays.origin,
                     sides,
                     positions: Arc::from(arrays.positions),
+                    morph: Arc::from(morph),
                     indices: Arc::from(arrays.indices),
                 };
                 if let Some(old) = self.resident.insert(key, rv) {
@@ -608,7 +771,7 @@ impl VoxelView {
                 }
             }
             Ok(None) => {
-                self.cache.put(key, (arrays, sides)); // budget full → cache; retry on show
+                self.cache.put(key, (arrays, morph, sides)); // budget full → cache; retry on show
             }
             Err(e) => log::error!("voxel leaf upload failed: {e}"),
         }
@@ -616,7 +779,7 @@ impl VoxelView {
 
     /// Upload a cached leaf to GPU resident, keeping the cache entry (instant re-show).
     fn upload_from_cache(&mut self, rhi: &mut Rhi, fi: u32, key: ChunkKey) {
-        let res = if let Some((arrays, sides)) = self.cache.peek(&key) {
+        let res = if let Some((arrays, morph, sides)) = self.cache.peek(&key) {
             let plate = arrays.plate_colors.as_deref();
             let r = rhi.streaming_upload(
                 fi,
@@ -624,17 +787,19 @@ impl VoxelView {
                 &arrays.normals,
                 &arrays.colors,
                 plate,
+                Some(morph.as_slice()),
                 &arrays.indices,
             );
             let positions: Arc<[[f32; 3]]> = Arc::from(arrays.positions.as_slice());
+            let morph_arc: Arc<[[f32; 3]]> = Arc::from(morph.as_slice());
             let indices: Arc<[u32]> = Arc::from(arrays.indices.as_slice());
-            Some((r, arrays.origin, *sides, positions, indices))
+            Some((r, arrays.origin, *sides, positions, morph_arc, indices))
         } else {
             None
         };
         match res {
-            Some((Ok(Some(mesh)), origin, sides, positions, indices)) => {
-                let rv = ResidentVoxel { mesh, origin, sides, positions, indices };
+            Some((Ok(Some(mesh)), origin, sides, positions, morph_arc, indices)) => {
+                let rv = ResidentVoxel { mesh, origin, sides, positions, morph: morph_arc, indices };
                 if let Some(old) = self.resident.insert(key, rv) {
                     rhi.streaming_retire(old.mesh);
                 }
@@ -647,15 +812,19 @@ impl VoxelView {
     /// Per-frame: drain meshes → cache; LOD-select; upload the visible cut from cache
     /// (request misses); retire hidden; re-mesh on caves/edits/transition-side changes.
     pub fn update(&mut self, rhi: &mut Rhi, fi: u32, cam: &LodCamera) {
+        // Refresh the geomorph screen factor (screen_h / 2·tan(fov/2)) so the shader can
+        // map a vertex's camera distance to its split/merge thresholds.
+        self.screen_k = cam.screen_h_px / (2.0 * (cam.v_fov_rad * 0.5).tan());
+
         // 1. Drain finished meshes. A re-mesh of a DRAWN leaf replaces it now; others
         //    go to the CPU cache (kept regardless of LOD visibility → never dropped).
         while let Ok(done) = self.done_rx.try_recv() {
             if self.requested.get(&done.key) == Some(&done.gen) {
                 self.requested.remove(&done.key);
                 if self.resident.contains_key(&done.key) {
-                    self.upload_arrays(rhi, fi, done.key, done.arrays, done.sides);
+                    self.upload_arrays(rhi, fi, done.key, done.arrays, done.morph, done.sides);
                 } else {
-                    self.cache.put(done.key, (done.arrays, done.sides));
+                    self.cache.put(done.key, (done.arrays, done.morph, done.sides));
                 }
             }
         }
@@ -671,12 +840,13 @@ impl VoxelView {
             self.requested.clear();
         }
 
-        // 2b. Data-view field changed → re-mesh resident leaves IN PLACE with the new
-        //     color. Old meshes stay drawn until replaced (never blanks), the stale-
-        //     colored cache is dropped, and we supersede any in-flight (older-field)
-        //     request so the latest field wins. Bounded by the resident (drawn) set.
-        if self.dirty_recolor {
+        // 2b. Data-view field OR ground-roughness changed → re-mesh resident leaves IN
+        //     PLACE. Old meshes stay drawn until replaced (NEVER blanks, unlike the caves
+        //     path which drains resident), the stale cache is dropped, and we supersede any
+        //     in-flight request so the latest wins. Bounded by the resident (drawn) set.
+        if self.dirty_recolor || self.dirty_relief {
             self.dirty_recolor = false;
+            self.dirty_relief = false;
             self.cache.clear();
             let keys: Vec<ChunkKey> = self.resident.keys().copied().collect();
             for key in keys {
@@ -789,9 +959,15 @@ impl VoxelView {
                     key: *k,
                     origin: rv.origin,
                     positions: Arc::clone(&rv.positions),
+                    morph: Arc::clone(&rv.morph),
                     indices: Arc::clone(&rv.indices),
                 })
                 .collect(),
+            camera: cam.local_pos,
+            radius: self.ctx.radius,
+            screen_k: self.screen_k as f64,
+            split_px: self.split_px as f64,
+            region: self.morph_region as f64,
         });
 
         self.dbg = self.dbg.wrapping_add(1);
@@ -821,10 +997,47 @@ impl VoxelView {
         self.collider.clone()
     }
 
-    /// Raycast the rendered surface along `dir` (`None` if no resident leaf covers it →
-    /// caller falls back to the analytic grounding). For per-frame flora re-grounding.
-    pub fn ground_radius(&self, dir: DVec3) -> Option<f64> {
-        self.collider.ground_radius(dir)
+    /// Analytic CDLOD-morphed surface radius along `dir` — the radius `terrain_csm.wgsl`
+    /// actually DRAWS at in this direction at the given `camera` distance, reproduced from
+    /// `surface_radius` alone (NO mesh raycast, NO residency dependence). Trees ride this so
+    /// they sit on the drawn surface at every LOD — a far tree no longer floats at the fine
+    /// level-12 height above the coarse far mesh. `camera` is the planet-centred f64 camera
+    /// position (same space as the leaf origins). NOTE: dug/edited terrain isn't in
+    /// `surface_radius` (density-only), so a hole won't show here — those regions still want
+    /// the mesh [`ground_radius`] (collider).
+    pub fn morphed_ground_radius(
+        &self,
+        hf: &dyn HeightField,
+        height_scale: f64,
+        camera: DVec3,
+        dir: DVec3,
+    ) -> f64 {
+        cdlod_morphed_radius(
+            self.radius,
+            self.screen_k as f64,
+            self.split_px as f64,
+            self.morph_region as f64,
+            self.max_depth,
+            camera,
+            dir,
+            |level| enki_voxel::surface_radius(hf, dir, self.radius, height_scale, level),
+        )
+    }
+
+    /// GUI knob: fraction of each leaf's distance range over which the CDLOD geomorph
+    /// happens (1.0 = whole range = smoothest; smaller = later/snappier). See terrain_csm.wgsl.
+    pub fn set_morph_region(&mut self, r: f32) {
+        self.morph_region = r.clamp(0.05, 1.0);
+    }
+    pub fn morph_region(&self) -> f32 {
+        self.morph_region
+    }
+    /// GUI knobs: ground detail-normal strength (0 = off) + feature wavelength (m).
+    /// Pure shading — no remesh, collider unmoved. See terrain_csm.wgsl `detail_h`.
+    pub fn set_detail(&mut self, strength: f32, scale: f32, depth: f32) {
+        self.detail_strength = strength.clamp(0.0, 2.0);
+        self.detail_scale = scale.clamp(0.3, 6.0);
+        self.detail_depth = depth.clamp(0.0, 1.0);
     }
 
     pub fn record(
@@ -873,6 +1086,8 @@ impl VoxelView {
                 ambient: fu.ambient,
                 cascade_vp: cascade_mvps.map(|m| m.to_cols_array_2d()),
                 shadow_params,
+                morph_a: [self.radius as f32, self.screen_k, self.split_px, self.merge_px],
+                morph_b: [self.morph_region, self.detail_strength, self.detail_scale, self.detail_depth],
             };
             rhi.write_storage_bytes(self.csm_frame_ubo[fidx], bytemuck::bytes_of(&cf))?;
             let set = self.csm_set[fidx];
@@ -894,7 +1109,7 @@ impl VoxelView {
                 let push = ChunkPush::camera_relative(
                     rv.origin, camera_world_pos, Mat4::IDENTITY, material_mode,
                 ).with_dbg(dbg_id, level as u32);
-                rhi.bind_vertex_buffers(fi, &[rv.mesh.pos, rv.mesh.nrm, rv.mesh.col, rv.mesh.plate])?;
+                rhi.bind_vertex_buffers_slice(fi, &[rv.mesh.pos, rv.mesh.nrm, rv.mesh.col, rv.mesh.plate, rv.mesh.morph])?;
                 rhi.bind_index_buffer(fi, rv.mesh.idx)?;
                 rhi.cmd_push_constants(fi, layout, stages, bytemuck::bytes_of(&push));
                 rhi.draw_indexed(fi, rv.mesh.index_count);
@@ -941,5 +1156,68 @@ mod tests {
         validator
             .validate(&module)
             .unwrap_or_else(|e| panic!("terrain_csm WGSL failed to validate: {e:?}"));
+    }
+
+    /// Grounding must ride the MORPHED surface (what's drawn), not the raw mesh — else
+    /// the character/trees float (morph pushes the drawn surface out) or sink. One leaf =
+    /// a triangle across +X at radius R, pushed +D radially by the morph; a tiny band so
+    /// the morph saturates at the hit distance → ground_radius must report R+D, not R.
+    #[test]
+    fn collider_grounds_on_the_morphed_surface() {
+        let r = 50_000.0_f64;
+        let d = 7.0_f64;
+        let make = |morph_x: f32| -> VoxelCollider {
+            let positions: Arc<[[f32; 3]]> = Arc::from(
+                vec![[0.0, -100.0, -100.0], [0.0, 100.0, -100.0], [0.0, 0.0, 100.0]].as_slice(),
+            );
+            let morph: Arc<[[f32; 3]]> = Arc::from(vec![[morph_x, 0.0, 0.0]; 3].as_slice());
+            let indices: Arc<[u32]> = Arc::from(vec![0u32, 1, 2].as_slice());
+            VoxelCollider {
+                leaves: vec![ColliderLeaf {
+                    key: (0, 5, 16, 16), // face +X, centre patch → contains dir +X
+                    origin: DVec3::new(r, 0.0, 0.0),
+                    positions,
+                    morph,
+                    indices,
+                }],
+                camera: DVec3::ZERO,
+                radius: r,
+                screen_k: 1.0,
+                split_px: 1000.0, // tiny morph band → saturates to 1 at the hit distance
+                region: 1.0,
+            }
+        };
+        let raw = make(0.0).ground_radius(DVec3::X).expect("ray must hit");
+        assert!((raw - r).abs() < 1.0, "un-morphed should land on the mesh: {raw} != {r}");
+        let morphed = make(d as f32).ground_radius(DVec3::X).expect("ray must hit");
+        assert!(
+            (morphed - (r + d)).abs() < 0.5,
+            "morphed grounding should ride the drawn surface: {morphed} != {}",
+            r + d
+        );
+    }
+
+    /// The analytic tree grounding must ride the COARSER surface when far (the float fix) and
+    /// the FINER one when near — driven purely by camera distance, no mesh.
+    #[test]
+    fn analytic_grounding_rides_the_coarser_far_surface() {
+        // Synthetic surface where a FINER level = HIGHER radius — the float case: the coarse
+        // far mesh sits below the fine level-12 height. Far camera → coarse (lower); near → fine.
+        let radius = 50_000.0_f64;
+        let sr = |level: u8| radius + level as f64;
+        let dir = DVec3::X;
+        let (screen_k, split_px, region, max_depth) = (4.0, 1.0, 1.0, 12u8);
+        let ground = |cam_alt: f64| {
+            cdlod_morphed_radius(
+                radius, screen_k, split_px, region, max_depth, dir * (radius + cam_alt), dir, sr,
+            )
+        };
+        let close = ground(200.0); // near → fine level → higher radius
+        let far = ground(20_000.0); // far → coarse level → lower radius
+        assert!(
+            radius <= far && far < close && close <= radius + max_depth as f64,
+            "far must ground lower (coarser) than close: close={close} far={far}"
+        );
+        assert!(close - far > 3.0, "the LOD level gap should be visible: close={close} far={far}");
     }
 }

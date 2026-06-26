@@ -275,7 +275,7 @@ pub fn mesh_leaf(
     // 4 Volcano bake that heightfield channel into vertex color instead (terrain*.wgsl
     // shows it raw for view modes 7–10). 0 is byte-identical to the pre-debug mesher.
     dbg_field: u8,
-) -> ChunkMeshArrays {
+) -> (ChunkMeshArrays, Vec<[f32; 3]>) {
     use enki_planet::face_bases::{cube_to_sphere, patch_center_dir, FACE_BASES};
 
     let b = &FACE_BASES[face as usize];
@@ -354,7 +354,11 @@ pub fn mesh_leaf(
     let block = Block::new([0.0_f32, 0.0, 0.0], 1.0, subdivisions);
     let mesh = extract_from_field(
         &field,
-        FieldCaching::CacheNothing,
+        // Cache the central block: the (expensive) heightfield field is queried ONCE per
+        // voxel instead of ~8× (every shared cell corner re-evaluated). Identical output —
+        // a pure function of the world point — so seams/determinism tests are unaffected.
+        // This ~8× cut is what lets `subdiv` rise (denser mesh) without raising mesh cost.
+        FieldCaching::CacheCentralBlockOnly,
         block,
         transitions,
         0f32,
@@ -368,6 +372,10 @@ pub fn mesh_leaf(
     let mut normals = Vec::with_capacity(n_verts);
     let mut colors = Vec::with_capacity(n_verts);
     let mut plate = Vec::with_capacity(n_verts);
+    // CDLOD geomorph: per-vertex displacement toward the PARENT LOD's surface. The
+    // vertex shader lerps it in by camera distance so the surface is continuous across
+    // LOD swaps (no pop). Same length/order as `positions`; in the same LOCAL frame.
+    let mut morph = Vec::with_capacity(n_verts);
     for v in 0..n_verts {
         let lx = mesh.positions[v * 3] as f64;
         let ly = mesh.positions[v * 3 + 1] as f64;
@@ -414,6 +422,23 @@ pub fn mesh_leaf(
             _ => enki_planet::coloring::biome_color(temp, moisture, height as f32, slope),
         });
         plate.push(hf.plate_color(dir));
+
+        // Geomorph target = the parent LOD's radial surface along this dir (the dominant
+        // pop is radial). Skip: roots (no parent); cave/overhang verts whose radius strays
+        // > a cell off the radial surface (non-radial → accept their small pop); and verts
+        // on a LATERAL leaf face (lx/ly = 0|1). A boundary vert must stay put so the
+        // transvoxel transition cells keep the seam to a coarser neighbour crack-free — a
+        // fine leaf and its coarser neighbour morph toward DIFFERENT parents, so a moving
+        // boundary opens a gap ("small slice"). Interior verts still morph.
+        let on_lateral_edge = lx < 1e-4 || lx > 1.0 - 1e-4 || ly < 1e-4 || ly > 1.0 - 1e-4;
+        let sr_self = radius + height * height_scale;
+        let disp = if level == 0 || on_lateral_edge || (r - sr_self).abs() > radial_cell {
+            [0.0_f32, 0.0, 0.0]
+        } else {
+            let r_parent = radius + hf.height(dir, level - 1) * height_scale;
+            ((dir * r_parent) - world).as_vec3().to_array()
+        };
+        morph.push(disp);
     }
     // The cube-face basis (u,v,n) is LEFT-handed ((u×v)·n = -1), so the param-space
     // (cu,cv,r)→world map is orientation-reversing: transvoxel emits CCW-from-outside
@@ -426,7 +451,7 @@ pub fn mesh_leaf(
     }
     let plate_colors = Some(plate);
 
-    ChunkMeshArrays { positions, normals, colors, plate_colors, indices, origin }
+    (ChunkMeshArrays { positions, normals, colors, plate_colors, indices, origin }, morph)
 }
 
 #[cfg(test)]
@@ -524,7 +549,7 @@ mod tests {
     fn leaf_isosurface_on_surface() {
         let hf = SimpleHeightField { noise: Noise3D::new(11) };
         let (face, level, ix, iy, subdiv) = (2u8, 5u8, 9u32, 14u32, 24usize);
-        let m = mesh_leaf(&hf, face, level, ix, iy, RADIUS, HEIGHT_SCALE, subdiv, TransitionSide::none(), None, &[], 0);
+        let (m, _) = mesh_leaf(&hf, face, level, ix, iy, RADIUS, HEIGHT_SCALE, subdiv, TransitionSide::none(), None, &[], 0);
         assert!(!m.positions.is_empty(), "leaf produced no geometry");
 
         // node_size = (π/2 · R)/2^level; cell ≈ node_size / subdiv.
@@ -545,8 +570,8 @@ mod tests {
     fn same_level_neighbors_are_crack_free() {
         let hf = SimpleHeightField { noise: Noise3D::new(3) };
         let (face, level, iy, subdiv) = (2u8, 5u8, 12u32, 16usize);
-        let a = mesh_leaf(&hf, face, level, 9, iy, RADIUS, HEIGHT_SCALE, subdiv, TransitionSide::none(), None, &[], 0);
-        let b = mesh_leaf(&hf, face, level, 10, iy, RADIUS, HEIGHT_SCALE, subdiv, TransitionSide::none(), None, &[], 0);
+        let (a, _) = mesh_leaf(&hf, face, level, 9, iy, RADIUS, HEIGHT_SCALE, subdiv, TransitionSide::none(), None, &[], 0);
+        let (b, _) = mesh_leaf(&hf, face, level, 10, iy, RADIUS, HEIGHT_SCALE, subdiv, TransitionSide::none(), None, &[], 0);
         let (aw, bw) = (world_verts(&a), world_verts(&b));
         assert!(!aw.is_empty() && !bw.is_empty(), "a neighbour produced no geometry");
 
@@ -578,8 +603,8 @@ mod tests {
             seed: 9,
         });
         let (face, level, iy, subdiv) = (2u8, 5u8, 12u32, 16usize);
-        let a = mesh_leaf(&hf, face, level, 9, iy, RADIUS, HEIGHT_SCALE, subdiv, TransitionSide::none(), Some(&caves), &[], 0);
-        let b = mesh_leaf(&hf, face, level, 10, iy, RADIUS, HEIGHT_SCALE, subdiv, TransitionSide::none(), Some(&caves), &[], 0);
+        let (a, _) = mesh_leaf(&hf, face, level, 9, iy, RADIUS, HEIGHT_SCALE, subdiv, TransitionSide::none(), Some(&caves), &[], 0);
+        let (b, _) = mesh_leaf(&hf, face, level, 10, iy, RADIUS, HEIGHT_SCALE, subdiv, TransitionSide::none(), Some(&caves), &[], 0);
         let (aw, bw) = (world_verts(&a), world_verts(&b));
         assert!(!aw.is_empty() && !bw.is_empty(), "a cave neighbour produced no geometry");
         let eps = 1e-3;
@@ -600,7 +625,7 @@ mod tests {
     fn coarse_leaves_mesh() {
         let hf = SimpleHeightField { noise: Noise3D::new(1) };
         for level in [0u8, 1, 2, 3] {
-            let m = mesh_leaf(&hf, 0, level, 0, 0, RADIUS, HEIGHT_SCALE, 24, TransitionSide::none(), None, &[], 0);
+            let (m, _) = mesh_leaf(&hf, 0, level, 0, 0, RADIUS, HEIGHT_SCALE, 24, TransitionSide::none(), None, &[], 0);
             assert!(
                 !m.positions.is_empty() && !m.indices.is_empty(),
                 "level {level} coarse leaf produced no geometry ({} verts, {} idx)",
@@ -625,8 +650,8 @@ mod tests {
                 .map(|p| (m.origin + DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64)).length())
                 .fold(f64::INFINITY, f64::min)
         };
-        let plain = mesh_leaf(&hf, face, level, ix, iy, RADIUS, HEIGHT_SCALE, subdiv, TransitionSide::none(), None, &[], 0);
-        let dug = mesh_leaf(&hf, face, level, ix, iy, RADIUS, HEIGHT_SCALE, subdiv, TransitionSide::none(), None, &[edit], 0);
+        let (plain, _) = mesh_leaf(&hf, face, level, ix, iy, RADIUS, HEIGHT_SCALE, subdiv, TransitionSide::none(), None, &[], 0);
+        let (dug, _) = mesh_leaf(&hf, face, level, ix, iy, RADIUS, HEIGHT_SCALE, subdiv, TransitionSide::none(), None, &[edit], 0);
         assert!(!dug.positions.is_empty(), "dug leaf produced no geometry");
         assert!(
             min_r(&dug) < min_r(&plain) - 1.0,
@@ -634,5 +659,37 @@ mod tests {
             min_r(&dug),
             min_r(&plain)
         );
+    }
+
+    /// Geomorph: a fully-morphed (morph=1) vertex must land on the PARENT LOD's radial
+    /// surface, and roots (level 0) must carry zero displacement.
+    #[test]
+    fn morph_targets_parent_surface() {
+        let hf = SimpleHeightField { noise: Noise3D::new(9) };
+        let (face, level, ix, iy, subdiv) = (2u8, 5u8, 9u32, 14u32, 24usize);
+        let (m, morph) =
+            mesh_leaf(&hf, face, level, ix, iy, RADIUS, HEIGHT_SCALE, subdiv, TransitionSide::none(), None, &[], 0);
+        assert_eq!(m.positions.len(), morph.len(), "morph parallels positions");
+        let mut checked = 0;
+        for (p, d) in m.positions.iter().zip(&morph) {
+            if d == &[0.0_f32, 0.0, 0.0] {
+                continue; // cave-guarded vertex (none expected on a no-cave leaf)
+            }
+            let local = DVec3::new(p[0] as f64, p[1] as f64, p[2] as f64);
+            let disp = DVec3::new(d[0] as f64, d[1] as f64, d[2] as f64);
+            let morphed = m.origin + local + disp; // fully-morphed world position
+            let want = surface_radius(&hf, morphed.normalize(), RADIUS, HEIGHT_SCALE, level - 1);
+            assert!(
+                (morphed.length() - want).abs() < 2.0,
+                "morphed radius {:.2} not on parent surface {:.2}",
+                morphed.length(), want
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no surface verts to check");
+
+        let (_, root_morph) =
+            mesh_leaf(&hf, face, 0, 0, 0, RADIUS, HEIGHT_SCALE, subdiv, TransitionSide::none(), None, &[], 0);
+        assert!(root_morph.iter().all(|d| d == &[0.0_f32, 0.0, 0.0]), "root leaf must not morph");
     }
 }

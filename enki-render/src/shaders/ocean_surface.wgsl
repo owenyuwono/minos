@@ -94,6 +94,9 @@ fn sample_cascade(c: i32, uv: vec2<f32>) -> OceanTexel {
 
 const BLEND_M: f32 = 240.0;     // blend-cell size (m)
 const WIND_SPREAD: f32 = 0.7;   // ±rad of directional spread around the wind
+const SPEC_AA: f32 = 16.0;      // sun-disc normal-variance damping (specular AA; no TAA)
+const REFL_NEAR_M: f32 = 8000.0;  // reflection+specular full near this camera distance
+const REFL_FAR_M: f32 = 30000.0;  // ...gone by here (zoomed out / orbit → flat water)
 
 fn hash2(p: vec2<f32>) -> vec2<f32> {
     let q = vec2<f32>(dot(p, vec2<f32>(127.1, 311.7)), dot(p, vec2<f32>(269.5, 183.3)));
@@ -242,7 +245,13 @@ fn shade_water(world_pos: vec3<f32>, N: vec3<f32>, fade: f32, frag_xy: vec2<f32>
 
     // Specular gloss: sharp only where the surface is resolved (small footprint),
     // so distant / zoomed-out water reflects the smooth sky, not a sparkly sun.
-    let gloss = 1.0 - smoothstep(4.0, 30.0, fp);
+    // Also damp it where the wave normal varies fast across the pixel: without TAA
+    // the razor-thin sun disc flips on/off on sub-pixel wave normals → a "noisy
+    // dithering" sparkle. Toksvig-style normal-variance specular AA broadens it away
+    // where the surface isn't pixel-resolved, keeping the sharp glint on calm swells.
+    // ponytail: SPEC_AA is the tunable strength; surface it as a GUI slider if tuning.
+    let nvar = max(length(dpdx(N)), length(dpdy(N)));
+    let gloss = (1.0 - smoothstep(4.0, 30.0, fp)) / (1.0 + nvar * SPEC_AA);
     var R = reflect(-V, N);
     R = R - up * min(dot(R, up), 0.0) + up * 0.02;
     let reflection = sky_color(normalize(R), gloss);
@@ -292,14 +301,10 @@ fn shade_water(world_pos: vec3<f32>, N: vec3<f32>, fade: f32, frag_xy: vec2<f32>
     let sss = pow(clamp(dot(V, -H), 0.0, 1.0), 4.0) * ocean.shading.x;
     body = mix(body, ocean.scatter_color.xyz, clamp(sss * fade * day, 0.0, 0.3));
 
-    // Damp the sky reflection with altitude: the reflected `sky_color` is always
-    // the bright near-surface gradient, so from high up a grazing ocean reads as a
-    // too-bright mirror. Fade the reflection toward the water body so a zoomed-out
-    // ocean shows its deep-water colour (planet radius ~50 km, so the band is tens
-    // of km, not hundreds). From orbit the reflected env is really dark space, not a
-    // bright sky, so it's nearly killed. (Tune the 2..40 km band / 0.97 max damp.)
-    let altitude = length(ocean.center_rel.xyz) - ocean.sub_point_rel.w;
-    let refl_damp = 1.0 - 0.97 * smoothstep(2000.0, 40000.0, altitude);
+    // `fade` (1 near → 0 far, by camera distance — see fs_main) drives the whole
+    // reflection term (sky gradient + sun disc/glow below) to zero when zoomed out,
+    // so a distant ocean reads as flat deep colour, not a bright mirror sheen.
+    let refl_damp = fade;
     // Reflection follows day/night too — at night the reflected sky is dark, not the
     // bright daytime gradient (small floor for ambient/star light).
     let daylight = max(smoothstep(-0.1, 0.25, dot(radial, frame.sun0_dir.xyz)), 0.05);
@@ -320,6 +325,18 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // Sum cascade derivatives (→ normal) + foam. Tile-blended (breaks the repeat),
     // wind-driven amplitude + direction, and faded by the per-pixel screen FOOTPRINT
     // (world metres per pixel) so far / zoomed-out water doesn't alias into speckle.
+    // Flatten the whole wave surface to a smooth lit sphere as the camera gets far
+    // (zoomed out / orbit). This is the master "far kill": it flattens the wave normal
+    // (→ no specular sparkle, no refraction-offset noise), drops foam + SSS, AND kills
+    // the sky reflection (via shade_water's refl_damp), so a distant ocean is flat deep
+    // colour rather than a sparkly mirror. The per-cascade `fp` fade below can't do this
+    // alone — the biggest cascade (250 m tile) survives `fp` until ~225 m/px, far past
+    // orbit footprint, so its normals kept sparkling. `world_pos` is camera-relative, so
+    // its length IS the camera→water distance; near the surface the visible ocean is well
+    // within REFL_NEAR_M (small planet → close horizon), so the near look is unchanged.
+    // ponytail: REFL_NEAR_M/REFL_FAR_M are the tunable band (metres).
+    let fade = 1.0 - smoothstep(REFL_NEAR_M, REFL_FAR_M, length(in.world_pos));
+
     let cc = i32(ocean.cfg.w);
     let amp = mix(ocean.amp.y, ocean.amp.z, in.wind.x);
     let b = blend_cells(in.grid);
@@ -337,16 +354,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let slope_x = amp * deriv.x / (1.0 + deriv.z);
     let slope_z = amp * deriv.y / (1.0 + deriv.w);
     var n_t = normalize(vec3<f32>(-slope_x, 1.0, -slope_z));
-    n_t = mix(vec3<f32>(0.0, 1.0, 0.0), n_t, in.fade);
+    n_t = mix(vec3<f32>(0.0, 1.0, 0.0), n_t, fade);
     let N = normalize(east * n_t.x + up * n_t.y + north * n_t.z);
 
-    var water = shade_water(in.world_pos, N, in.fade, in.clip.xy, in.clip.z, fp);
+    var water = shade_water(in.world_pos, N, fade, in.clip.xy, in.clip.z, fp);
 
     // Foam is a near-field detail only — fade it out entirely as pixels cover
     // more ocean, so zoomed-out water shows no whitecaps. (Tune the 8..35 m
     // footprint band for how close you must be to see foam.)
     let foam_fade = 1.0 - smoothstep(8.0, 35.0, fp);
-    let coverage = smoothstep(0.2, 0.9, foam * clamp(amp, 0.0, 1.3) * in.fade) * foam_fade;
+    let coverage = smoothstep(0.2, 0.9, foam * clamp(amp, 0.0, 1.3) * fade) * foam_fade;
     let foam_light = 0.55 + 0.6 * clamp(dot(N, frame.sun0_dir.xyz), 0.0, 1.0);
     water = mix(water, ocean.foam_color.xyz * foam_light, coverage);
 

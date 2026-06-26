@@ -238,6 +238,17 @@ struct App {
     /// compiles without the `voxel` feature — the effect is what's gated).
     voxel_caves:       bool,
     voxel_cave_strength: f32,
+    /// CDLOD geomorph region (fraction of each leaf's LOD range the morph spans).
+    voxel_morph_region: f32,
+    /// Mountain peak sharpness (0 rounded → 1 cusped/pointy).
+    voxel_peak_sharpen: f32,
+    /// Ground detail-normal knobs (terrain_csm.wgsl): strength (0 = off) + feature scale (m).
+    voxel_detail_strength: f32,
+    voxel_detail_scale: f32,
+    /// POM parallax depth (m): 0 = flat normal-map only, higher = more apparent height.
+    voxel_detail_depth: f32,
+    /// Heightfield ground-roughness knob 0..1 (0 = smooth, 1 = strong human-scale relief).
+    voxel_ground_rough: f64,
     /// Draw the translucent ocean shell over the planet.
     ocean_enabled:     bool,
     /// Draw the wind streakline overlay.
@@ -361,6 +372,12 @@ impl App {
             aa_mode:       crate::gui::AaMode::Fxaa,
             voxel_caves:       true,
             voxel_cave_strength: 90.0,
+            voxel_morph_region: 1.0,
+            voxel_peak_sharpen: 0.5,
+            voxel_detail_strength: 0.6,
+            voxel_detail_scale: 1.5,
+            voxel_detail_depth: 0.25,
+            voxel_ground_rough: 0.6,
             ocean_enabled:     true,
             wind_enabled:      false,
             atmo_enabled:      true,
@@ -1169,8 +1186,11 @@ impl App {
                         self.terrain_height_scale = cfg.lod.height_scale;
                         // Phase 2: stand up the on-demand voxel terrain (transvoxel
                         // quadtree). It drives the same LOD selection as PlanetView but
-                        // meshes each leaf as a transvoxel block. ponytail: subdiv 24 +
-                        // synchronous meshing for now (Phase 3 moves it to the jobs pool).
+                        // meshes each leaf as a transvoxel block. subdiv=32 MATCHES the LOD
+                        // metric (resolution=32 → ~2 px/cell at target_tri_px); at subdiv=16
+                        // leaves rendered at half the targeted triangle density (visible LOD
+                        // coarseness). The transvoxel CacheCentralBlockOnly switch (mesh_leaf)
+                        // keeps per-leaf mesh cost ~flat despite the higher subdiv.
                         #[cfg(feature = "voxel")]
                         {
                             let vlod = LodConfig {
@@ -1193,7 +1213,7 @@ impl App {
                                     rhi,
                                     Arc::clone(&out.hf),
                                     vlod,
-                                    16,
+                                    32, // subdiv — matches resolution=32 (see comment above)
                                     cfg.terrain_pipeline,
                                 );
                                 self.voxel_view = Some(vv);
@@ -1239,6 +1259,12 @@ impl App {
         let ui_out = if self.egui.is_some() && self.window.is_some() && self.rhi.is_some() {
             let voxel_caves          = self.voxel_caves;
             let voxel_cave_strength  = self.voxel_cave_strength;
+            let voxel_morph_region   = self.voxel_morph_region;
+            let voxel_peak_sharpen   = self.voxel_peak_sharpen;
+            let voxel_detail_strength = self.voxel_detail_strength;
+            let voxel_detail_scale    = self.voxel_detail_scale;
+            let voxel_detail_depth    = self.voxel_detail_depth;
+            let voxel_ground_rough    = self.voxel_ground_rough;
             let shadow_map_enabled = self.shadow_map_enabled;
             let shadow_half_extent = self.shadow_half_extent;
             let shadow_depth       = self.shadow_depth;
@@ -1291,7 +1317,9 @@ impl App {
             Some(egui.build_frame(
                 window, rhi, nav_mode, altitude, frame_time, view_mode, wireframe, aa_mode,
                 shadow_map_enabled, shadow_half_extent, shadow_depth, shadow_depth_bias, shadow_normal_bias,
-                cfg!(feature = "voxel"), voxel_caves, voxel_cave_strength,
+                cfg!(feature = "voxel"), voxel_caves, voxel_cave_strength, voxel_morph_region,
+                voxel_peak_sharpen, voxel_detail_strength, voxel_detail_scale, voxel_detail_depth,
+                voxel_ground_rough,
                 ocean_enabled, sea_level_m, wave_enabled, wave_choppiness, wave_foam,
                 cfg!(feature = "flora"), flora_enabled, flora_density,
                 flora_radius_m, flora_alt_threshold_m,
@@ -1322,10 +1350,20 @@ impl App {
             self.shadow_normal_bias  = out.shadow_normal_bias;
             self.voxel_caves          = out.voxel_caves;
             self.voxel_cave_strength  = out.voxel_cave_strength;
+            self.voxel_morph_region   = out.voxel_morph_region;
+            self.voxel_peak_sharpen   = out.voxel_peak_sharpen;
+            self.voxel_detail_strength = out.voxel_detail_strength;
+            self.voxel_detail_scale    = out.voxel_detail_scale;
+            self.voxel_detail_depth    = out.voxel_detail_depth;
+            self.voxel_ground_rough    = out.voxel_ground_rough;
             #[cfg(feature = "voxel")]
             if let Some(vv) = self.voxel_view.as_mut() {
                 vv.set_caves_enabled(out.voxel_caves);
                 vv.set_cave_strength(out.voxel_cave_strength as f64);
+                vv.set_morph_region(out.voxel_morph_region);
+                vv.set_peak_sharpen(out.voxel_peak_sharpen as f64);
+                vv.set_detail(out.voxel_detail_strength, out.voxel_detail_scale, out.voxel_detail_depth);
+                vv.set_ground_roughness(out.voxel_ground_rough);
             }
             // Geometry views (3–5) work on the voxel terrain; only the bare classic
             // quadtree lacks them → collapse to Lit there.
@@ -1613,31 +1651,30 @@ impl App {
                             self.flora_last_radius_m = self.flora_radius_m;
                         }
                     }
-                    // Re-ground only NEAR trees (within the geometry-LOD ring) each frame on
-                    // the rendered voxel mesh — per-frame so they track the surface as the LOD
-                    // streams/refines, with no submersion and no dip where it's VISIBLE. Beyond
-                    // the ring a tree draws as a flat impostor billboard, where a sub-metre
-                    // LOD offset is sub-pixel, so it keeps its scatter-time origin (skip the
-                    // raycast). This cuts the loop from O(all trees) to ~the near ~7% — the fps
-                    // fix (the full O(trees×resident×tris) raycast/frame was ~200ms in debug).
-                    // ponytail: if a maxed density slider re-spikes the near ring, bucket
-                    //   resident leaves by face-cell in VoxelCollider (O(1) leaf-find) + a
-                    //   per-leaf (cu,cv) tri-grid (O(few) raycast), cached on ResidentVoxel.
+                    // Trees ride the analytic CDLOD-MORPHED surface — the radius
+                    // terrain_csm.wgsl actually draws at each direction/distance, from
+                    // `surface_radius` alone (no mesh raycast, no residency). This is what keeps
+                    // FAR trees on the coarse far mesh instead of floating at the fine level-12
+                    // height, AND near trees on the morphed surface — one path, every distance.
+                    // Cheap (~2 height samples/tree), so all trees every frame, no spike.
+                    // ponytail: dug/edited terrain isn't in `surface_radius` (density-only) — a
+                    //   tree over a hole won't drop into it; re-add a targeted mesh raycast
+                    //   (`vv.collider_dyn().ground_radius(dir)`) for edited regions when digging
+                    //   leaves WIP.
                     #[cfg(feature = "voxel")]
-                    if let Some(vv) = self.voxel_view.as_ref() {
-                        // = TREE_GEOM_M (40) + TREE_FADE_M (25): the draw's geometry→impostor
-                        //   crossover, so every tree whose trunk geometry is drawn re-grounds.
-                        const TREE_REGROUND_RADIUS_M: f64 = 65.0;
-                        let reg_r2 = TREE_REGROUND_RADIUS_M * TREE_REGROUND_RADIUS_M;
+                    if let (Some(vv), Some(hf)) =
+                        (self.voxel_view.as_ref(), self.height_field.as_ref())
+                    {
                         for inst in self.flora_instances.iter_mut() {
-                            if (inst.origin - camera_world_pos).length_squared() > reg_r2 {
-                                continue;
-                            }
                             let dir = inst.origin.normalize_or_zero();
                             if dir.length_squared() > 0.5 {
-                                if let Some(r) = vv.ground_radius(dir) {
-                                    inst.origin = dir * r;
-                                }
+                                let r = vv.morphed_ground_radius(
+                                    hf.as_ref(),
+                                    self.terrain_height_scale,
+                                    camera_world_pos,
+                                    dir,
+                                );
+                                inst.origin = dir * r;
                             }
                         }
                     }

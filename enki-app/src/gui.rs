@@ -110,6 +110,18 @@ pub struct UiOutput {
     pub voxel_caves: bool,
     /// Cave carve strength (m).
     pub voxel_cave_strength: f32,
+    /// CDLOD geomorph region: fraction of each leaf's LOD distance range over which the
+    /// morph happens (1.0 = smoothest; lower = later/snappier).
+    pub voxel_morph_region: f32,
+    /// Mountain peak sharpness: 0 = rounded (generator default), 1 = cusped/pointy crests.
+    pub voxel_peak_sharpen: f32,
+    /// Ground detail-normal: strength (0 = off) + feature wavelength (m). terrain_csm.wgsl.
+    pub voxel_detail_strength: f32,
+    pub voxel_detail_scale: f32,
+    /// POM parallax depth (m): 0 = flat normal-map only, higher = more apparent height.
+    pub voxel_detail_depth: f32,
+    /// Heightfield ground roughness 0..1 (0 = smooth, 1 = strong human-scale relief).
+    pub voxel_ground_rough: f64,
     /// Draw the translucent ocean shell over the planet.
     pub ocean_enabled: bool,
     /// Sea level as a metre offset from the terrain's `e = 0` datum.
@@ -293,6 +305,12 @@ impl EguiState {
         voxel_available:   bool,
         voxel_caves:       bool,
         voxel_cave_strength: f32,
+        voxel_morph_region: f32,
+        voxel_peak_sharpen: f32,
+        voxel_detail_strength: f32,
+        voxel_detail_scale: f32,
+        voxel_detail_depth: f32,
+        voxel_ground_rough: f64,
         ocean_enabled:     bool,
         sea_level_m:       f64,
         wave_enabled:      bool,
@@ -332,6 +350,12 @@ impl EguiState {
             shadow_normal_bias,
             voxel_caves,
             voxel_cave_strength,
+            voxel_morph_region,
+            voxel_peak_sharpen,
+            voxel_detail_strength,
+            voxel_detail_scale,
+            voxel_detail_depth,
+            voxel_ground_rough,
             ocean_enabled,
             sea_level_m,
             wave_enabled,
@@ -624,6 +648,30 @@ impl EguiState {
                                         .text("Cave strength (m)"),
                                 );
                             });
+                            ui.add(
+                                egui::Slider::new(&mut out.voxel_morph_region, 0.05..=1.0)
+                                    .text("LOD morph region"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut out.voxel_peak_sharpen, 0.0..=1.0)
+                                    .text("Peak sharpness"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut out.voxel_ground_rough, 0.0..=1.0)
+                                    .text("Ground roughness (relief)"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut out.voxel_detail_strength, 0.0..=2.0)
+                                    .text("Ground detail"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut out.voxel_detail_scale, 0.3..=6.0)
+                                    .text("Detail scale (m)"),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut out.voxel_detail_depth, 0.0..=1.0)
+                                    .text("Detail depth (m, POM)"),
+                            );
                         });
                     }
 

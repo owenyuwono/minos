@@ -109,6 +109,7 @@ impl<'r> ChunkUploader for RhiUploader<'r> {
             &arrays.normals,
             &arrays.colors,
             plate_src,
+            None, // classic path: no geomorph stream
             &arrays.indices,
         )
     }

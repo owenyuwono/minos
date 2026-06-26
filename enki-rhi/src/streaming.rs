@@ -260,6 +260,8 @@ impl Default for Graveyard {
 ///   binding 1 = normals   ([f32; 3] per vertex)
 ///   binding 2 = colors    ([f32; 3] per vertex)
 ///   binding 3 = plate_colors ([f32; 3] per vertex, synthesized from colors if absent)
+///   binding 4 = morph ([f32; 3] per vertex; CDLOD geomorph displacement, synthesized
+///               from positions if absent — never read by 4-attr pipelines)
 ///   index buffer = u32 indices
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamedMesh {
@@ -267,6 +269,7 @@ pub struct StreamedMesh {
     pub nrm:         BufferHandle,
     pub col:         BufferHandle,
     pub plate:       BufferHandle,
+    pub morph:       BufferHandle,
     pub idx:         BufferHandle,
     pub index_count: u32,
 }
@@ -317,16 +320,16 @@ pub struct StreamingUploader {
     next_id: u64,
 
     /// Live DEVICE_LOCAL buffers, keyed by their graveyard id.
-    /// Each entry is (vk::Buffer, Allocation) for the 5 sub-buffers of one
-    /// StreamedMesh.  We store them as a flat Vec of (id, [Option<...>; 5])
-    /// where index 0..5 maps to pos/nrm/col/plate/idx.
+    /// Each entry is (vk::Buffer, Allocation) for the 6 sub-buffers of one
+    /// StreamedMesh.  We store them as a flat Vec of (id, [Option<...>; 6])
+    /// where index 0..6 maps to pos/nrm/col/plate/morph/idx.
     live: Vec<LiveEntry>,
 }
 
 struct LiveEntry {
     id: u64,
-    buffers: [vk::Buffer; 5],
-    allocs: Option<[Allocation; 5]>,
+    buffers: [vk::Buffer; 6],
+    allocs: Option<[Allocation; 6]>,
 }
 
 impl StreamingUploader {
@@ -417,6 +420,8 @@ impl StreamingUploader {
     /// - `normals`     — Per-vertex normals `[f32; 3]`.
     /// - `colors`      — Per-vertex colours `[f32; 3]`.
     /// - `plate_colors`— Optional per-vertex plate colours.  If `None`, `colors` is used.
+    /// - `morph`       — Optional per-vertex geomorph displacement.  If `None`, `positions`
+    ///                   is reused as a never-read placeholder (4-attr pipelines ignore it).
     /// - `indices`     — Triangle indices (`u32`).
     ///
     /// # Returns
@@ -439,23 +444,29 @@ impl StreamingUploader {
         normals: &[[f32; 3]],
         colors: &[[f32; 3]],
         plate_colors: Option<&[[f32; 3]]>,
+        morph: Option<&[[f32; 3]]>,
         indices: &[u32],
     ) -> Result<Option<StreamedMesh>, RhiError> {
         let _ = frame_counter; // used in graveyard; not needed here but keep param for clarity
 
         let plate_src = plate_colors.unwrap_or(colors);
+        // ponytail: when absent, reuse `positions` as a same-length placeholder — its
+        // bytes are never read (only the 5-attr voxel-CSM pipeline binds morph).
+        let morph_src = morph.unwrap_or(positions);
 
         // Build byte slices for each stream.
         let pos_bytes: &[u8] = bytemuck::cast_slice(positions);
         let nrm_bytes: &[u8] = bytemuck::cast_slice(normals);
         let col_bytes: &[u8] = bytemuck::cast_slice(colors);
         let plate_bytes: &[u8] = bytemuck::cast_slice(plate_src);
+        let morph_bytes: &[u8] = bytemuck::cast_slice(morph_src);
         let idx_bytes: &[u8] = bytemuck::cast_slice(indices);
 
         let total_bytes = (pos_bytes.len()
             + nrm_bytes.len()
             + col_bytes.len()
             + plate_bytes.len()
+            + morph_bytes.len()
             + idx_bytes.len()) as u64;
 
         // ── Budget check ─────────────────────────────────────────────────────
@@ -478,10 +489,10 @@ impl StreamingUploader {
         // ── Copy into staging ─────────────────────────────────────────────────
         let mut write_offset = staging_offset as usize;
 
-        let offsets: [(u64, u64); 5] = {
+        let offsets: [(u64, u64); 6] = {
             let mut o = staging_offset;
-            let mut arr = [(0u64, 0u64); 5];
-            for (i, bytes) in [pos_bytes, nrm_bytes, col_bytes, plate_bytes, idx_bytes]
+            let mut arr = [(0u64, 0u64); 6];
+            for (i, bytes) in [pos_bytes, nrm_bytes, col_bytes, plate_bytes, morph_bytes, idx_bytes]
                 .iter()
                 .enumerate()
             {
@@ -491,7 +502,7 @@ impl StreamingUploader {
             arr
         };
 
-        for bytes in [pos_bytes, nrm_bytes, col_bytes, plate_bytes, idx_bytes] {
+        for bytes in [pos_bytes, nrm_bytes, col_bytes, plate_bytes, morph_bytes, idx_bytes] {
             let dst = unsafe {
                 std::slice::from_raw_parts_mut(
                     self.staging_ptr.add(write_offset),
@@ -503,27 +514,29 @@ impl StreamingUploader {
         }
 
         // ── Allocate DEVICE_LOCAL vertex+index buffers ────────────────────────
-        let usages: [vk::BufferUsageFlags; 5] = [
+        let usages: [vk::BufferUsageFlags; 6] = [
+            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
         ];
-        let names = ["stream_pos", "stream_nrm", "stream_col", "stream_plate", "stream_idx"];
+        let names = ["stream_pos", "stream_nrm", "stream_col", "stream_plate", "stream_morph", "stream_idx"];
         let sizes = [
             pos_bytes.len() as u64,
             nrm_bytes.len() as u64,
             col_bytes.len() as u64,
             plate_bytes.len() as u64,
+            morph_bytes.len() as u64,
             idx_bytes.len() as u64,
         ];
 
-        let mut dev_buffers = [vk::Buffer::null(); 5];
-        let mut dev_allocs: [Option<Allocation>; 5] =
-            [None, None, None, None, None];
+        let mut dev_buffers = [vk::Buffer::null(); 6];
+        let mut dev_allocs: [Option<Allocation>; 6] =
+            [None, None, None, None, None, None];
 
-        for i in 0..5 {
+        for i in 0..6 {
             let create_info = vk::BufferCreateInfo::default()
                 .size(sizes[i])
                 .usage(usages[i])
@@ -584,7 +597,7 @@ impl StreamingUploader {
         }
 
         // ── Record vkCmdCopyBuffer (staging → device-local) ──────────────────
-        for i in 0..5 {
+        for i in 0..6 {
             let (src_offset, size) = offsets[i];
             let region = vk::BufferCopy {
                 src_offset,
@@ -648,6 +661,7 @@ impl StreamingUploader {
             dev_allocs[2].take().unwrap(),
             dev_allocs[3].take().unwrap(),
             dev_allocs[4].take().unwrap(),
+            dev_allocs[5].take().unwrap(),
         ];
 
         self.live.push(LiveEntry {
@@ -668,13 +682,15 @@ impl StreamingUploader {
         let nrm_handle   = BufferHandle(tag | (id * 10 + 1));
         let col_handle   = BufferHandle(tag | (id * 10 + 2));
         let plate_handle = BufferHandle(tag | (id * 10 + 3));
-        let idx_handle   = BufferHandle(tag | (id * 10 + 4));
+        let morph_handle = BufferHandle(tag | (id * 10 + 4));
+        let idx_handle   = BufferHandle(tag | (id * 10 + 5));
 
         Ok(Some(StreamedMesh {
             pos:         pos_handle,
             nrm:         nrm_handle,
             col:         col_handle,
             plate:       plate_handle,
+            morph:       morph_handle,
             idx:         idx_handle,
             index_count: indices.len() as u32,
         }))

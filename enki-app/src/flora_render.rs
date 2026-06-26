@@ -886,10 +886,7 @@ impl FloraRenderer {
 
         // Ortho fit to the tree bounds (mirrors flora_viewer::light_view_proj). A
         // uniform cube fit (max extent) so all view dirs frame the whole tree.
-        let (bmin, bmax) = view.bake_bounds();
-        let center = (bmin + bmax) * 0.5;
-        let ext = bmax - bmin;
-        let half = 0.5 * ext.x.max(ext.y).max(ext.z).max(1.0) + 0.5;
+        let (center, half) = view.impostor_frame();
         let tile_vp = |dir: glam::Vec3| -> [[f32; 4]; 4] {
             let d = dir.normalize_or(glam::Vec3::Y);
             let eye = center + d * 50.0;
@@ -900,7 +897,7 @@ impl FloraRenderer {
             };
             let view_m = glam::Mat4::look_at_rh(eye, center, up);
             let near_d = 1.0_f32;
-            let far_d = 100.0 + ext.y + 10.0;
+            let far_d = 100.0 + 2.0 * half;
             let ortho = enki_render::projection::reversed_z_orthographic(
                 -half, half, -half, half, near_d, far_d,
             );

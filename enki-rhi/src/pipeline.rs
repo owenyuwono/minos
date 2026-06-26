@@ -110,7 +110,16 @@ impl PipelineStore {
         &mut self,
         desc: &GraphicsPipelineDesc<'_>,
     ) -> Result<PipelineHandle, RhiError> {
-        self.create_inner(desc, false, false)
+        self.create_inner(desc, false, false, 4)
+    }
+
+    /// Like [`Self::create`] but with a 5th `vec3` vertex attribute at binding/location
+    /// 4 (the CDLOD geomorph displacement stream).
+    pub fn create_morph(
+        &mut self,
+        desc: &GraphicsPipelineDesc<'_>,
+    ) -> Result<PipelineHandle, RhiError> {
+        self.create_inner(desc, false, false, 5)
     }
 
     /// Like [`Self::create`] but with NO vertex input bindings — the vertex shader
@@ -120,7 +129,7 @@ impl PipelineStore {
         &mut self,
         desc: &GraphicsPipelineDesc<'_>,
     ) -> Result<PipelineHandle, RhiError> {
-        self.create_inner(desc, true, false)
+        self.create_inner(desc, true, false, 4)
     }
 
     /// Like [`Self::create_pulling`] but **depth-only**: no fragment stage, no color
@@ -131,7 +140,7 @@ impl PipelineStore {
         &mut self,
         desc: &GraphicsPipelineDesc<'_>,
     ) -> Result<PipelineHandle, RhiError> {
-        self.create_inner(desc, true, true)
+        self.create_inner(desc, true, true, 4)
     }
 
     /// Depth-only pipeline WITH the standard 4×vec3 vertex input (no fragment, no
@@ -141,7 +150,7 @@ impl PipelineStore {
         &mut self,
         desc: &GraphicsPipelineDesc<'_>,
     ) -> Result<PipelineHandle, RhiError> {
-        self.create_inner(desc, false, true)
+        self.create_inner(desc, false, true, 4)
     }
 
     fn create_inner(
@@ -149,6 +158,7 @@ impl PipelineStore {
         desc: &GraphicsPipelineDesc<'_>,
         vertex_pulling: bool,
         depth_only: bool,
+        n_vec3_attrs: usize,
     ) -> Result<PipelineHandle, RhiError> {
         // ── Pipeline layout ─────────────────────────────────────────────────
         let set_layouts = [desc.set0_layout];
@@ -189,21 +199,26 @@ impl PipelineStore {
         }
 
         // ── Vertex input ────────────────────────────────────────────────────
-        // 4 separate bindings, each carries one vec3<f32> attribute.
-        let bindings: [_; 4] = std::array::from_fn(|i| {
-            vk::VertexInputBindingDescription::default()
-                .binding(i as u32)
-                .stride(12) // sizeof(vec3) = 3 × 4
-                .input_rate(vk::VertexInputRate::VERTEX)
-        });
+        // `n_vec3_attrs` separate bindings, each carries one vec3<f32> attribute
+        // (4 = pos/nrm/col/plate; 5 adds the geomorph displacement at location 4).
+        let bindings: Vec<_> = (0..n_vec3_attrs)
+            .map(|i| {
+                vk::VertexInputBindingDescription::default()
+                    .binding(i as u32)
+                    .stride(12) // sizeof(vec3) = 3 × 4
+                    .input_rate(vk::VertexInputRate::VERTEX)
+            })
+            .collect();
 
-        let attributes: [_; 4] = std::array::from_fn(|i| {
-            vk::VertexInputAttributeDescription::default()
-                .location(i as u32)
-                .binding(i as u32)
-                .format(vk::Format::R32G32B32_SFLOAT)
-                .offset(0)
-        });
+        let attributes: Vec<_> = (0..n_vec3_attrs)
+            .map(|i| {
+                vk::VertexInputAttributeDescription::default()
+                    .location(i as u32)
+                    .binding(i as u32)
+                    .format(vk::Format::R32G32B32_SFLOAT)
+                    .offset(0)
+            })
+            .collect();
 
         let vertex_input = if vertex_pulling {
             // No vertex buffers — the shader pulls from storage via vertex_index.

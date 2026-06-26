@@ -9,6 +9,10 @@
 // terrain falls back to the shared set0-only terrain pipeline.
 
 const SHADOW_CASCADES: u32 = 3u; // MUST match SHADOW_CASCADES in voxel_view.rs / main.rs
+const DETAIL_FADE_NEAR: f32 = 18.0; // m — ground detail at full strength closer than this
+const DETAIL_FADE_FAR:  f32 = 55.0; // m — faded to nothing beyond (kills far-field shimmer)
+const POM_STEPS: i32 = 10;          // parallax-occlusion march steps (near-field only)
+const POM_INV_STEPS: f32 = 0.1;     // = 1.0 / POM_STEPS
 
 struct Frame {
     view_proj    : mat4x4<f32>,
@@ -22,6 +26,8 @@ struct Frame {
     ambient      : vec4<f32>,
     cascade_vp   : array<mat4x4<f32>, 3>, // camera-relative world → light clip
     shadow_params: vec4<f32>,             // [depth_bias, normal_bias, strength, enabled]
+    morph_a      : vec4<f32>,             // CDLOD: [radius, screen_k, split_px, merge_px]
+    morph_b      : vec4<f32>,             // [morph_region, _, _, _]
 }
 
 @group(0) @binding(0) var<uniform> frame : Frame;
@@ -45,6 +51,7 @@ struct VertexIn {
     @location(1) normal     : vec3<f32>,
     @location(2) color      : vec3<f32>,
     @location(3) plate_color: vec3<f32>,
+    @location(4) morph_disp : vec3<f32>, // CDLOD displacement toward the parent LOD surface
 }
 struct VertexOut {
     @builtin(position) clip_pos    : vec4<f32>,
@@ -58,7 +65,26 @@ struct VertexOut {
 @vertex
 fn vs_main(v: VertexIn) -> VertexOut {
     var out: VertexOut;
-    let world_pos = pc.model * vec4<f32>(v.position, 1.0);
+    // CDLOD geomorph: lerp the vertex toward the parent-LOD surface (carried per-vertex
+    // in morph_disp) by camera distance, so coarse↔fine LOD swaps are continuous (no pop).
+    // The band maps a leaf's [split, merge] screen-threshold distances (from its level +
+    // the screen factors in morph_a) to morph 0→1. length(world_un) is camera distance
+    // because rendering is camera-relative (camera at the origin).
+    let world_un = pc.model * vec4<f32>(v.position, 1.0);
+    let radius   = frame.morph_a.x;
+    let k        = frame.morph_a.y;   // screen_h / (2·tan(fov/2))
+    let split_px = frame.morph_a.z;
+    let region   = frame.morph_b.x;
+    let ns   = 1.5707963267 * radius / exp2(f32(pc.dbg_level)); // node size (m)
+    // Both bounds key off split_px so the morph reaches 1 exactly at the distance this
+    // leaf APPEARED (its parent split = 2·ns_self distance): then finer children appear
+    // fully morphed-to-parent → the split is continuous. `near` is where this leaf in
+    // turn gives way to its own children (full detail, morph 0). far = 2·near.
+    let near = ns * k / split_px;
+    let far  = 2.0 * near;
+    let lo   = far - region * (far - near);
+    let morph = smoothstep(lo, far, length(world_un.xyz));
+    let world_pos = pc.model * vec4<f32>(v.position + morph * v.morph_disp, 1.0);
     out.clip_pos = frame.view_proj * world_pos;
     let m3 = mat3x3<f32>(pc.model[0].xyz, pc.model[1].xyz, pc.model[2].xyz);
     out.world_normal = m3 * v.normal;
@@ -147,6 +173,70 @@ fn sample_shadow(world_rel: vec3<f32>, n: vec3<f32>) -> f32 {
     return sum / 9.0;
 }
 
+// ── Procedural ground detail: 3D value noise + Worley (lifted from clouds.wgsl) ───
+// Pure ALU (no bindings), so the per-pixel detail normal needs no texture upload.
+fn hash13(p3in: vec3<f32>) -> f32 {
+    var p3 = fract(p3in * 0.1031);
+    p3 = p3 + dot(p3, p3.zyx + 31.32);
+    return fract((p3.x + p3.y) * p3.z);
+}
+fn hash33(p3in: vec3<f32>) -> vec3<f32> {
+    var p3 = fract(p3in * vec3<f32>(0.1031, 0.1030, 0.0973));
+    p3 = p3 + dot(p3, p3.yxz + 33.33);
+    return fract((p3.xxy + p3.yxx) * p3.zyx);
+}
+fn vnoise(x: vec3<f32>) -> f32 {
+    let i = floor(x);
+    let f = fract(x);
+    let u = f * f * (3.0 - 2.0 * f);
+    let c000 = hash13(i + vec3<f32>(0.0, 0.0, 0.0)); let c100 = hash13(i + vec3<f32>(1.0, 0.0, 0.0));
+    let c010 = hash13(i + vec3<f32>(0.0, 1.0, 0.0)); let c110 = hash13(i + vec3<f32>(1.0, 1.0, 0.0));
+    let c001 = hash13(i + vec3<f32>(0.0, 0.0, 1.0)); let c101 = hash13(i + vec3<f32>(1.0, 0.0, 1.0));
+    let c011 = hash13(i + vec3<f32>(0.0, 1.0, 1.0)); let c111 = hash13(i + vec3<f32>(1.0, 1.0, 1.0));
+    let x00 = mix(c000, c100, u.x); let x10 = mix(c010, c110, u.x);
+    let x01 = mix(c001, c101, u.x); let x11 = mix(c011, c111, u.x);
+    return mix(mix(x00, x10, u.y), mix(x01, x11, u.y), u.z);
+}
+fn worley(x: vec3<f32>) -> f32 {
+    let ip = floor(x);
+    let fp = fract(x);
+    var min_d = 1.0;
+    for (var dz = -1; dz <= 1; dz = dz + 1) {
+        for (var dy = -1; dy <= 1; dy = dy + 1) {
+            for (var dx = -1; dx <= 1; dx = dx + 1) {
+                let g = vec3<f32>(f32(dx), f32(dy), f32(dz));
+                let o = hash33(ip + g);
+                let r = g + o - fp;
+                min_d = min(min_d, dot(r, r));
+            }
+        }
+    }
+    return sqrt(min_d);
+}
+// Material-aware detail height at world point `p` (m), feature wavelength `scale` (m).
+// slope∈[0,1] (0 flat → 1 cliff) blends sediment↔rock character:
+//   flats  = gentle 2-oct FBM + Worley pebble/cracked-soil cells
+//   cliffs = ridged noise → rock fractures/strata
+// ponytail: ~5 noise taps, called 5× (4 grad + 1 albedo) ≈ 25 vnoise/fragment near-field
+// (faded out past DETAIL_FADE_FAR, early-out below). Drop an octave if fragment-bound.
+fn detail_h(p: vec3<f32>, scale: f32, slope: f32) -> f32 {
+    let q = p / max(scale, 0.05);
+    let fbm = vnoise(q) * 0.6 + vnoise(q * 2.03) * 0.3;
+    let cells = 1.0 - worley(q * 1.7);
+    let r0 = 1.0 - abs(2.0 * vnoise(q * 1.3) - 1.0);
+    let ridged = r0 * r0;
+    let flat_d = fbm * 0.7 + cells * 0.3;
+    return mix(flat_d, ridged, smoothstep(0.35, 0.7, slope));
+}
+// Cheaper height (no Worley cells) for the POM march inner loop — the gross profile is
+// enough for parallax; full detail_h (with cells) is read only at the final hit point.
+fn detail_h_fast(p: vec3<f32>, scale: f32, slope: f32) -> f32 {
+    let q = p / max(scale, 0.05);
+    let fbm = vnoise(q) * 0.6 + vnoise(q * 2.03) * 0.3;
+    let r0 = 1.0 - abs(2.0 * vnoise(q * 1.3) - 1.0);
+    return mix(fbm * 0.9, r0 * r0, smoothstep(0.35, 0.7, slope));
+}
+
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let n = normalize(in.world_normal);
@@ -168,13 +258,71 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     // ocean (sun-driven) goes dark. radial_up = absolute world dir (camera-relative
     // world_pos + camera_pos); soft terminator on radial_up·sun, low night floor so it's
     // dark-but-not-pure-black. The directional sun terms are already self-gating (n·sun).
-    let radial_up = normalize(in.world_pos + frame.camera_pos.xyz);
+    let wp = in.world_pos + frame.camera_pos.xyz; // absolute world pos (radial up + detail anchor)
+    let radial_up = normalize(wp);
     let day = smoothstep(-0.15, 0.25, dot(radial_up, frame.sun0_dir.xyz));
     let amb_gate = mix(0.05, 1.0, day);
-    let ambient_term = frame.ambient.xyz * albedo * amb_gate;
-    let hemi_term    = hemisphere_ambient(n, frame.hemi_sky.xyz, frame.hemi_ground.xyz) * albedo * amb_gate;
-    let diff0        = directional_diffuse(n, frame.sun0_dir.xyz, frame.sun0_color.xyz) * albedo * sh;
-    let diff1        = directional_diffuse(n, frame.sun1_dir.xyz, frame.sun1_color.xyz) * albedo;
+
+    // ── Procedural ground detail (normal + parallax) ─────────────────────────────
+    // Perturb the shading normal (+ a small albedo tint) from the analytic 3D-noise height
+    // field, and PARALLAX-shift the sample point by marching the view ray against that
+    // height (POM) so the bumps read as real depth. Pure shading — no texture (enki-rhi
+    // can't upload one), no displacement (mesh IS the collider, must not move). Faded out
+    // past DETAIL_FADE_FAR. Knobs: morph_b.y strength, .z scale (m), .w POM depth (m).
+    var nd = n;
+    var alb = albedo;
+    let fade = 1.0 - smoothstep(DETAIL_FADE_NEAR, DETAIL_FADE_FAR, length(in.world_pos));
+    let dstr = frame.morph_b.y * fade;
+    if (dstr > 0.001) {
+        let dscale = frame.morph_b.z;
+        let slope = clamp(1.0 - dot(n, radial_up), 0.0, 1.0); // 0 flat → 1 cliff
+
+        // Parallax occlusion: march the view ray against the height field; the hit point
+        // `pp` (parallax-shifted from `wp`) is where we then read the normal + albedo, so
+        // bumps gain motion parallax + self-occlusion. Marches the cheap (no-Worley) height;
+        // full detail_h is sampled only at the hit. ponytail: if the parallax pushes the
+        // WRONG way, negate `pmax` (the usual POM sign gotcha).
+        var pp = wp;
+        let depth = frame.morph_b.w * fade; // POM amplitude (m), distance-faded (NOT coupled to normal strength)
+        if (depth > 0.0005) {
+            let D = normalize(in.world_pos);                  // camera→fragment (camera at origin)
+            let c = dot(D, n);                                // view·normal (<0 = into surface)
+            let pmax = (D - c * n) * (depth / max(-c, 0.30)); // tangent shift over full depth
+            var rh = 1.0;                                     // normalised ray height (1=top → 0)
+            var off = 0.0;                                    // fraction along pmax
+            var hc = detail_h_fast(wp, dscale, slope);
+            for (var i = 0; i < POM_STEPS; i = i + 1) {
+                if (rh <= hc) { break; }
+                rh = rh - POM_INV_STEPS;
+                off = off + POM_INV_STEPS;
+                hc = detail_h_fast(wp + pmax * off, dscale, slope);
+            }
+            // relief refine: interpolate the crossing between the last two samples.
+            let po = off - POM_INV_STEPS;
+            let after  = hc - rh;
+            let before = detail_h_fast(wp + pmax * po, dscale, slope) - (rh + POM_INV_STEPS);
+            let t = clamp(after / max(after - before, 1e-4), 0.0, 1.0);
+            pp = wp + pmax * mix(off, po, t);
+        }
+
+        let e = max(dscale * 0.15, 0.02);                     // finite-diff step (m)
+        // 4-tap tetrahedron gradient of detail_h (same kernel as the mesher's gradient_normal).
+        let k0 = vec3<f32>( 1.0, -1.0, -1.0); let k1 = vec3<f32>(-1.0, -1.0, 1.0);
+        let k2 = vec3<f32>(-1.0, 1.0, -1.0); let k3 = vec3<f32>( 1.0, 1.0, 1.0);
+        let g = k0 * detail_h(pp + k0 * e, dscale, slope)
+              + k1 * detail_h(pp + k1 * e, dscale, slope)
+              + k2 * detail_h(pp + k2 * e, dscale, slope)
+              + k3 * detail_h(pp + k3 * e, dscale, slope);
+        let g_tan = g - dot(g, n) * n;                        // tangential gradient only
+        // ponytail: flip to (n + dstr*g_tan) if lighting looks INVERTED (bump sign).
+        nd = normalize(n - dstr * g_tan);
+        alb = albedo * (0.88 + 0.24 * detail_h(pp, dscale, slope)); // break the flat colour wash
+    }
+
+    let ambient_term = frame.ambient.xyz * alb * amb_gate;
+    let hemi_term    = hemisphere_ambient(nd, frame.hemi_sky.xyz, frame.hemi_ground.xyz) * alb * amb_gate;
+    let diff0        = directional_diffuse(nd, frame.sun0_dir.xyz, frame.sun0_color.xyz) * alb * sh;
+    let diff1        = directional_diffuse(nd, frame.sun1_dir.xyz, frame.sun1_color.xyz) * alb;
     var lit = ambient_term + hemi_term + diff0 + diff1;
     lit = aces_filmic(lit);
     return vec4<f32>(lit, 1.0);

@@ -455,6 +455,7 @@ impl Rhi {
         normals: &[[f32; 3]],
         colors: &[[f32; 3]],
         plate_colors: Option<&[[f32; 3]]>,
+        morph: Option<&[[f32; 3]]>,
         indices: &[u32],
     ) -> Result<Option<StreamedMesh>, RhiError> {
         let fi = fi as usize;
@@ -475,6 +476,7 @@ impl Rhi {
             normals,
             colors,
             plate_colors,
+            morph,
             indices,
         )
     }
@@ -545,6 +547,16 @@ impl Rhi {
         desc: &GraphicsPipelineDesc<'_>,
     ) -> Result<PipelineHandle, RhiError> {
         self.pipelines.create(desc)
+    }
+
+    /// Like [`Self::create_graphics_pipeline`] but with a 5th `vec3` vertex attribute
+    /// at binding/location 4 (the CDLOD geomorph displacement stream). The shader must
+    /// declare `@location(4)`; the draw must bind 5 vertex buffers.
+    pub fn create_graphics_pipeline_morph(
+        &mut self,
+        desc: &GraphicsPipelineDesc<'_>,
+    ) -> Result<PipelineHandle, RhiError> {
+        self.pipelines.create_morph(desc)
     }
 
     /// Create a compute pipeline. See [`ComputePipelineDesc`].
