@@ -1,0 +1,17 @@
+[package]
+name = "minos-nanite"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+glam = "0.33.1"
+minos-planet = { path = "../minos-planet" }
+minos-render = { path = "../minos-render" }
+minos-rhi = { path = "../minos-rhi" }
+meshopt = "0.6.2"
+metis = "0.2"
+bytemuck = { version = "1.25.0", features = ["derive"] }
+log = "0.4.32"
+
+[dev-dependencies]
+naga = { version = "29.0.3", features = ["wgsl-in"] }

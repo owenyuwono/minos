@@ -1,0 +1,12 @@
+[package]
+name = "minos-voxel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Crack-free LOD voxel meshing (Lengyel transition cells). Pinned to the exact
+# API we built against; bump deliberately. Patent-free, MIT/Apache.
+transvoxel = "=2.0.0"
+glam = "0.33.1"
+# HeightField trait + ChunkMeshArrays (re-exported from minos-render).
+minos-planet = { version = "0.1.0", path = "../minos-planet" }

@@ -1,4 +1,4 @@
-# enki — Nanite-Style Virtualized Terrain Plan
+# minos — Nanite-Style Virtualized Terrain Plan
 
 > Status: **proposed, decisions locked** (planning only — no code yet). Sibling to
 > `docs/foundation-plan.md`.
@@ -15,7 +15,7 @@
 | **Bake timing** | **At startup, in-memory** | No on-disk asset format in v1. N5 streaming will define the page-structured on-disk format. |
 | **Rasterization** | **Hardware only** | Software raster + 64-bit vis-buffer deferred to N4 (blocked on naga u64 atomics). |
 | **Mesh shaders** | **No** | naga/WGSL can't target task/mesh stages; compute-cull + indirect-draw is the portable path. |
-| **Modularity** | Self-contained, **feature-gated `enki-nanite` crate** | Plug-and-play: a deletable folder; per-mesh opt-in; lower crates (`enki-rhi`/`-render`/`-planet`) never reference it. See **Modularity** below. |
+| **Modularity** | Self-contained, **feature-gated `minos-nanite` crate** | Plug-and-play: a deletable folder; per-mesh opt-in; lower crates (`minos-rhi`/`-render`/`-planet`) never reference it. See **Modularity** below. |
 
 ## Goal & honest scope of v1
 
@@ -37,7 +37,7 @@ virtualizes *that*. No runtime procedural cluster generation in scope.
 
 ## Verified facts (capability audit + dependency check)
 
-- **RHI gap:** `enki-rhi` is graphics-only — Vulkan 1.3 with `dynamicRendering`,
+- **RHI gap:** `minos-rhi` is graphics-only — Vulkan 1.3 with `dynamicRendering`,
   `synchronization2`, `timelineSemaphore`, `fillModeNonSolid`; one graphics+present queue; one
   `UNIFORM_BUFFER` descriptor; 128-byte push constants; fixed 4×`vec3` vertex bindings.
   No compute, storage buffers, indirect, atomics, descriptor indexing, or BDA.
@@ -53,36 +53,36 @@ virtualizes *that*. No runtime procedural cluster generation in scope.
 - **naga 29.0.3** (the version in `Cargo.lock`) supports the full v1 WGSL surface: `@compute`,
   `var<storage, read_write>`, `atomic<u32>` add/max, storage reads from `@vertex`,
   `@builtin(vertex_index)`. (Only u64 atomics are missing — deferred to N4.)
-- **Crate dependency graph:** `enki-rhi → enki-render → enki-planet → enki-jobs → enki-app`
-  (low→high). The runtime pass needs `enki-rhi` (lowest) and the baker needs `HeightField`
-  (`enki-planet`, high). A cycle only arises *if a lower crate consumes cluster types* — nothing
-  forces that, so **all Nanite code lives in one self-contained crate above enki-planet**, with
-  `enki-app` its only consumer (see **Crates** and **Modularity**).
+- **Crate dependency graph:** `minos-rhi → minos-render → minos-planet → minos-jobs → minos-app`
+  (low→high). The runtime pass needs `minos-rhi` (lowest) and the baker needs `HeightField`
+  (`minos-planet`, high). A cycle only arises *if a lower crate consumes cluster types* — nothing
+  forces that, so **all Nanite code lives in one self-contained crate above minos-planet**, with
+  `minos-app` its only consumer (see **Crates** and **Modularity**).
 
 ## Crates & placement (single self-contained, deletable crate)
 
-**All Nanite code lives in one new `enki-nanite` crate** — baker, data types, runtime GPU pass,
-and WGSL shaders — sitting above `enki-planet`, depending only **downward**, consumed only by
-`enki-app`. This is what makes it a deletable, plug-and-play folder (see **Modularity**).
+**All Nanite code lives in one new `minos-nanite` crate** — baker, data types, runtime GPU pass,
+and WGSL shaders — sitting above `minos-planet`, depending only **downward**, consumed only by
+`minos-app`. This is what makes it a deletable, plug-and-play folder (see **Modularity**).
 
-- **`enki-nanite`** *(new)* — three internal modules, one crate:
+- **`minos-nanite`** *(new)* — three internal modules, one crate:
   - `cluster` — data-only types (frozen contract): `Cluster`, `ClusterBounds` (sphere + normal
     cone), `ClusterDag` (parent links, group ids, self/parent error, lod), `ClusterAsset` (the
     resident bundle + patch origin). No GPU, no `ash`.
   - `bake` — tessellate the patch from `HeightField` + build the DAG (meshopt + METIS), emitting
     `cluster` types. CPU-only, no GPU — fully unit-testable headless (à la
-    `enki-planet/tests/determinism.rs`).
+    `minos-planet/tests/determinism.rs`).
   - `render` — the runtime GPU pass (`NaniteRenderer` facade + cull/draw + WGSL), using the RHI.
-  - Deps: `enki-rhi` (GPU), `enki-render` (reuse `FrameUniforms`, lighting/ACES), `enki-planet`
+  - Deps: `minos-rhi` (GPU), `minos-render` (reuse `FrameUniforms`, lighting/ACES), `minos-planet`
     (`HeightField`, `face_bases`/`cube_to_sphere`), `meshopt`, `metis`, `glam`. **Nothing in
-    `enki-rhi`/`enki-render`/`enki-planet` ever names `enki-nanite`.**
-- **`enki-rhi`** — gains *generic, un-branded* primitives usable with or without Nanite: compute
+    `minos-rhi`/`minos-render`/`minos-planet` ever names `minos-nanite`.**
+- **`minos-rhi`** — gains *generic, un-branded* primitives usable with or without Nanite: compute
   pipelines, storage buffers, one-shot device-local upload, a storage descriptor set, indirect
   draw + barriers, a zero-vertex-binding pipeline variant. These stay if Nanite is deleted.
-- **`enki-app`** — under `#[cfg(feature = "nanite")]`: picks the bake region, calls the baker at
+- **`minos-app`** — under `#[cfg(feature = "nanite")]`: picks the bake region, calls the baker at
   startup, registers the patch with `NaniteRenderer`, calls `record()` in the frame loop, adds
   `RenderMode::NaniteTerrain` + HUD counters. This is the *only* crate that references
-  `enki-nanite`, and only behind the feature.
+  `minos-nanite`, and only behind the feature.
 
 ## Modularity & plug-and-play
 
@@ -90,35 +90,35 @@ Two requirements drive this: (a) deleting the whole Nanite folder must leave a w
 (b) Nanite must apply to *some* meshes while the rest use the classic path, in the same frame.
 
 **Containment rules (enforced, not aspirational):**
-- One crate (`enki-nanite`) holds 100% of Nanite logic, types, and shaders. Lower crates are
-  forbidden from referencing it (a grep for `nanite` in `enki-rhi`/`enki-render`/`enki-planet`
+- One crate (`minos-nanite`) holds 100% of Nanite logic, types, and shaders. Lower crates are
+  forbidden from referencing it (a grep for `nanite` in `minos-rhi`/`minos-render`/`minos-planet`
   must return nothing — an N2 acceptance check).
 - RHI additions are **generic and un-prefixed** (`create_compute_pipeline`, not
   `create_nanite_pipeline`), so they have independent value and never become orphaned on deletion.
 - The baker depends on the existing `HeightField` **trait**, so it plugs onto any height source
   without coupling to terrain internals.
 
-**The app seam (single public surface):** `enki-nanite` exposes one facade —
+**The app seam (single public surface):** `minos-nanite` exposes one facade —
 `NaniteRenderer::new(rhi)`, `register(asset, transform) -> NaniteInstanceId`,
 `update(camera, &FrameUniforms)`, `record(rhi, frame_index)`. Everything else is crate-internal.
-`enki-app` holds `#[cfg(feature = "nanite")] Option<NaniteRenderer>` and calls `record()` inside
+`minos-app` holds `#[cfg(feature = "nanite")] Option<NaniteRenderer>` and calls `record()` inside
 the existing MSAA instance alongside the classic terrain/water passes. Because both paths write
 the shared **reversed-Z depth + MSAA color**, they composite by depth automatically — record
 order doesn't affect correctness. *(Optional later polish: a generic `ScenePass` trait in
-`enki-render` so the frame loop iterates passes uniformly; not required for v1.)*
+`minos-render` so the frame loop iterates passes uniformly; not required for v1.)*
 
 **Per-mesh opt-in:** `NaniteRenderer` renders only the `(ClusterAsset, transform)` instances the
 app registers; everything unregistered flows through the classic path. The two are independent
 lists — mixing is the default, not a special case.
 
-**Feature flag:** a `nanite` Cargo feature gates the optional `enki-app → enki-nanite` dependency
+**Feature flag:** a `nanite` Cargo feature gates the optional `minos-app → minos-nanite` dependency
 and all wiring. Off ⇒ the crate isn't linked and the classic engine builds/runs unchanged.
 
 **Deletion checklist (what removing Nanite actually touches — nothing else):**
-1. delete the `enki-nanite/` folder;
-2. remove `"enki-nanite"` from `[workspace].members` in the root `Cargo.toml`;
-3. remove the optional dep + `nanite` feature from `enki-app/Cargo.toml`;
-4. delete the `#[cfg(feature = "nanite")]` blocks in `enki-app` (renderer wiring + the
+1. delete the `minos-nanite/` folder;
+2. remove `"minos-nanite"` from `[workspace].members` in the root `Cargo.toml`;
+3. remove the optional dep + `nanite` feature from `minos-app/Cargo.toml`;
+4. delete the `#[cfg(feature = "nanite")]` blocks in `minos-app` (renderer wiring + the
    `RenderMode::NaniteTerrain` arm).
 The generic RHI primitives from N1 stay (they're not Nanite-specific). Workspace compiles clean.
 
@@ -171,7 +171,7 @@ The hardest correctness problem, needs no device — goes first.
 - **N0.0 (gating spike):** get the **`metis` crate building/linking on Windows** (vendored
   cmake build or prebuilt METIS) — this is the one friction point of choosing METIS-from-start;
   prove it compiles and round-trips a trivial `PartGraphKway` before the algorithm work.
-- Add `meshopt`, `metis` deps. New `enki-nanite` crate; new `enki-render::cluster` types.
+- Add `meshopt`, `metis` deps. New `minos-nanite` crate; new `minos-render::cluster` types.
 - High-res patch tessellator: `(face, level, ix, iy) + finest_res` → watertight indexed mesh from
   `HeightField`, with the 4 outer-edge vertices flagged for locking.
 - Build pipeline: `build_meshlets` (128/64) → cluster adjacency graph → **METIS** group partition
@@ -207,7 +207,7 @@ The hardest correctness problem, needs no device — goes first.
   the cluster SSBO and transforms by `view_proj · camera_relative_patch`; fragment reuses the
   existing ACES/lighting; renders into the existing 4× MSAA forward instance.
 - **App integration (live, in-engine — the primary debug view):** bake the patch at startup;
-  add a feature-gated Nanite render path in `enki-app` (`#[cfg(feature = "nanite")]`) selectable
+  add a feature-gated Nanite render path in `minos-app` (`#[cfg(feature = "nanite")]`) selectable
   at runtime, and a **"Nanite" section in the existing egui panel** (`gui.rs`) alongside the
   material/wireframe controls: an **enable** checkbox + a **debug-mode selector**
   (Off / Triangle / Cluster / LOD) + live counters (visible clusters / triangles / draw count).
@@ -216,14 +216,14 @@ The hardest correctness problem, needs no device — goes first.
   distinct color → micro-poly density), **Cluster** (every cluster distinct → meshlet structure),
   **LOD** (color by DAG level → see the cut). The fragment color is `id_color(hash)` keyed by the
   `(cluster_id, triangle_id)` the vertex-pulling shader already computes, so it's nearly free. The
-  WGSL `id_color` mirrors `enki_nanite::debug::id_color`, so the live view matches the offline PLY
+  WGSL `id_color` mirrors `minos_nanite::debug::id_color`, so the live view matches the offline PLY
   exporter (`debug::export_ply`, shipped in N0 as a dev tool:
-  `cargo run -p enki-nanite --example export_debug`).
+  `cargo run -p minos-nanite --example export_debug`).
 - **Acceptance:** crack-free LOD as the camera approaches/recedes; visible-cluster and triangle
   counts adapt with distance; draws collapse to one indirect; visual parity with the quadtree at
   matched detail; validation-clean; stable frame time.
 - **Modularity acceptance:** building with `--no-default-features` (feature `nanite` off) compiles
-  and runs the classic engine unchanged; `enki-rhi`/`enki-render`/`enki-planet` contain zero
+  and runs the classic engine unchanged; `minos-rhi`/`minos-render`/`minos-planet` contain zero
   references to `nanite` (grep check); the deletion checklist leaves a clean-compiling workspace.
 
 ## OUT of v1 (deferred roadmap)

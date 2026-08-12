@@ -1,4 +1,4 @@
-# enki — Foundation Build Plan
+# minos — Foundation Build Plan
 
 > Authoritative, approved plan: `~/.claude/plans/floofy-crunching-swing.md`. This doc mirrors it for in-repo reference.
 
@@ -7,10 +7,10 @@
 Target: native **Rust + Vulkan (`ash`)**, Windows-only, own RHI (not wgpu). Ultimately hosts the **demiurge** procedural-planet renderer (`../demiurge`).
 
 ## Crates
-- **enki-rhi** — the only `ash` consumer (device, swapchain, sync, memory, buffers, pipelines, streaming)
-- **enki-render** — forward pipeline, camera/projection (reversed-Z), materials/view-variants, lights, ACES, placeholder-geometry provider
-- **enki-app** — window/input, navigation (controllers + nav state machine), egui/HUD, wiring
-- *(deferred)* **enki-planet**, **enki-jobs** — the terrain phase
+- **minos-rhi** — the only `ash` consumer (device, swapchain, sync, memory, buffers, pipelines, streaming)
+- **minos-render** — forward pipeline, camera/projection (reversed-Z), materials/view-variants, lights, ACES, placeholder-geometry provider
+- **minos-app** — window/input, navigation (controllers + nav state machine), egui/HUD, wiring
+- *(deferred)* **minos-planet**, **minos-jobs** — the terrain phase
 
 ## Key decisions
 - **Reversed-Z float depth** (`D32_SFLOAT`, clear 0.0, `GREATER`); near 0.5 → far ~750 000

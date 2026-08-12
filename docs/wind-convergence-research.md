@@ -1,12 +1,12 @@
-# Convergence-Driven Cloud Aggregation for enki's Baked Wind
+# Convergence-Driven Cloud Aggregation for minos's Baked Wind
 
 *Deep-research synthesis. Goal: make clouds form and MERGE at convergence zones instead of merely
-drifting. Multi-agent sweep (enki/ki read + 4 external + 3 adversarial verifications). Date: 2026-06-23.
+drifting. Multi-agent sweep (minos/ki read + 4 external + 3 adversarial verifications). Date: 2026-06-23.
 Companion to `clouds-advection-research.md`.*
 
 ## 0. TL;DR — recommended approach
 
-enki's baked wind is the **curl of a Gaussian streamfunction** (`vel = dir × ∇ψ`, `climate.rs:626-628`),
+minos's baked wind is the **curl of a Gaussian streamfunction** (`vel = dir × ∇ψ`, `climate.rs:626-628`),
 **divergence-free by the identity `div(curl) ≡ 0`**. A div-free wind can *transport* a coverage field
 but never *concentrate* it — the precise, verified reason clouds drift but never merge. The fix is two
 parts, and **the load-bearing one is in the cloud worker, not the wind bake**:
@@ -32,7 +32,7 @@ fluid sim, no Poisson solve, no per-frame cost beyond a finite-difference pass o
 
 ## 1. Why they don't merge
 
-Merging = mass piling up where horizontal flow converges (`∇·u < 0`). enki's swirl vortices are
+Merging = mass piling up where horizontal flow converges (`∇·u < 0`). minos's swirl vortices are
 `dir × ∇ψ` (curl of a Gaussian streamfunction) → vorticity but **identically zero divergence**. Only
 the broad, box-blurred zonal+Coriolis tilt has any convergence. Strong flow-following, ~zero piling —
 the documented conclusion in `clouds-advection-research.md`. Convergence buys: **ITCZ/cyclone
@@ -41,14 +41,14 @@ highs → subside → clear). Both are sign-of-divergence effects a div-free win
 
 ## 2. The physics, minimally
 
-**Helmholtz decomposition.** `u = k̂×∇ψ (rotational, div=0) + ∇χ (divergent, curl=0, div(u)=∇²χ)`. enki
+**Helmholtz decomposition.** `u = k̂×∇ψ (rotational, div=0) + ∇χ (divergent, curl=0, div(u)=∇²χ)`. minos
 has the first term; convergence lives entirely in the second. They **add** — append `+∇χ` without
 touching the swirl.
 
 **Cheap-correct mechanism — ageostrophic/frictional inflow.** Aloft wind is ~geostrophic (parallel to
 isobars → div-free). At the surface, friction turns it *across* isobars toward low pressure (~30° land,
 ~10° ocean). That cross-isobar inflow IS the divergent surface wind — converges into lows (→ ascent →
-cloud), diverges out of highs (→ subsidence → clear). enki's `cross_isobar` tilt (`climate.rs:639-651`)
+cloud), diverges out of highs (→ subsidence → clear). minos's `cross_isobar` tilt (`climate.rs:639-651`)
 is a **pure rotation about the normal** — adds ~no usable divergence and gets normalized away.
 
 **ITCZ/Hadley.** Mean convergence at 0° (ITCZ, cloudiest band) and ~60° (polar front); divergence at
@@ -114,7 +114,7 @@ let div   = du_dx + dv_dy;          // <0 = convergence
 divergence[idx] = div;              // worker-internal, no GPU upload
 ```
 Exactly what ki's `_bakeFavTexture` does (`VolumetricClouds.ts:557-590`); sidesteps the unit-dir trap.
-~30 lines, no `enki-planet` change. Guard the pole basis singularity (`|east| ≥ 1e-5` → div = 0).
+~30 lines, no `minos-planet` change. Guard the pole basis singularity (`|east| ≥ 1e-5` → div = 0).
 
 **The source term** (replace `clouds_advect.rs:271`):
 ```rust
@@ -142,7 +142,7 @@ the ITCZ.**
 |---|---|---|
 | Wind divergent term | `climate.rs:600-629` (vortex loop), `:635-637` (combine) | `div_x/y/z += gx/gy/gz`; mix `+ cs*eq_mask*div_*`. **No new RNG.** Don't touch `raw_s`. |
 | Param | `climate.rs:87-104`, `:234-243`, `:466-475` | Add `convergence_strength: Option<f64>` plumbed like `swirl_strength`. Default `None`. |
-| GUI | `enki-app/src/gui.rs` Wind section | One `convergence_strength` slider. |
+| GUI | `minos-app/src/gui.rs` Wind section | One `convergence_strength` slider. |
 | Cloud divergence | `clouds_advect.rs:227-234` | Central-difference speed-weighted `wind_vel` → worker `divergence[]`. Pole guard. |
 | Cloud source | `clouds_advect.rs:271`; params `:35-54` | Add `conv_gain` + moisture-gated convergence source. |
 | Determinism | `determinism.rs:355-372` | **Nothing** — all wind params `None` → bake byte-identical. Wind not golden-gated; golden `convergence` is **tectonic** (`tectonics.rs:131-132`). |
@@ -219,7 +219,7 @@ divergence damping / polar filters (dodged by the analytic Cartesian gradient + 
 - https://niels747.github.io/2D-Weather-Sandbox/ · https://nickmcd.me/2018/07/10/procedural-weather-patterns/
 - https://freezedriedmangos.github.io/realistic-planet-generation-and-simulation/
 
-**enki/ki refs:** `climate.rs:500-676` (`bake_wind`; swirl `:626-628`; combine `:635-637`; normalize
+**minos/ki refs:** `climate.rs:500-676` (`bake_wind`; swirl `:626-628`; combine `:635-637`; normalize
 `:653-658`; speed `:660-663`); `:87-104`/`:234-243`/`:466-475` (params); `:855` (`wind_deterministic`);
 `:307-313` (`wind_at`). `clouds_advect.rs:227-234`,`:262-272`,`:271`,`:332`,`:35-54`.
 `ocean/mod.rs:472-505`, `ocean/fetch.rs:186-205`. `determinism.rs:355-372`, `tectonics.rs:131-132`.

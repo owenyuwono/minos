@@ -1,0 +1,16 @@
+[package]
+name = "minos-flora"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+glam = "0.33.1"
+
+[dev-dependencies]
+# GOLDEN-VECTOR determinism gate (tests/golden.rs) loads tests/golden.json,
+# produced by tools/dump_golden.mjs from the REAL dryad generator.
+serde_json = "1.0.150"
+# Headless WGSL validation + spv-out gate (tests/shader.rs) — same naga frontend
+# AND SPIR-V backend the RHI uses at runtime, so flora.wgsl / staging.wgsl errors
+# surface in `cargo test`, not at launch.
+naga = { version = "29.0.3", features = ["wgsl-in", "spv-out"] }

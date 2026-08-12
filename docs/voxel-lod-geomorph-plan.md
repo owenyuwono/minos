@@ -32,8 +32,8 @@ cells (`mesh_leaf(..., transitions)`) heal *cracks* (topology), never *position*
 ## Approach: CDLOD radial geomorph (exploit that the terrain is analytic)
 
 Geomorph is "hard for transvoxel" in the literature only because general marching-cubes has
-no vertex correspondence across LODs, so you must **bake** a coarse mesh to morph toward. enki
-doesn't: the surface is `surface_radius(hf, p̂, level)` (`enki-voxel/src/lib.rs:117`), an
+no vertex correspondence across LODs, so you must **bake** a coarse mesh to morph toward. minos
+doesn't: the surface is `surface_radius(hf, p̂, level)` (`minos-voxel/src/lib.rs:117`), an
 analytic function. The morph target is a **function call at the parent level**, not a bake —
 which is exactly why the DAG dealbreaker doesn't apply here.
 
@@ -49,10 +49,10 @@ This is CDLOD (Strugar 2010) applied radially.
 ## The one piece of real plumbing
 
 The morph needs one per-vertex scalar/vector (`Δr` toward the parent surface) that **cannot be
-computed on the GPU** (the `HeightField` is CPU-baked; enki-rhi can't upload it — see
-`enki-rhi-no-texture-upload`). So it must ride as a **5th vertex stream**. `GraphicsPipelineDesc`
-currently has no vertex-layout field (`voxel_view.rs:262,315`) — enki-rhi hardcodes 4×vec3 in
-`enki-rhi/src/pipeline.rs` (shared by 6 pipelines). Extending it is the CLAUDE-flagged "5th
+computed on the GPU** (the `HeightField` is CPU-baked; minos-rhi can't upload it — see
+`minos-rhi-no-texture-upload`). So it must ride as a **5th vertex stream**. `GraphicsPipelineDesc`
+currently has no vertex-layout field (`voxel_view.rs:262,315`) — minos-rhi hardcodes 4×vec3 in
+`minos-rhi/src/pipeline.rs` (shared by 6 pipelines). Extending it is the CLAUDE-flagged "5th
 channel" chore; doing it **also unblocks data modes 7–10** on the voxel/classic paths.
 
 Per-vertex data ⇒ a vertex stream is the right mechanism (clean per-leaf `bind_vertex_buffers`).
@@ -63,16 +63,16 @@ a per-leaf descriptor rewrite mid-frame — worse. Take the vertex stream.
 
 ## Piece 1 — Geomorph (the main fix)
 
-### Step 0 — enki-rhi: optional 5th vertex attribute (enabler)
-- `enki-rhi/src/pipeline.rs`: add an optional field to `GraphicsPipelineDesc`
+### Step 0 — minos-rhi: optional 5th vertex attribute (enabler)
+- `minos-rhi/src/pipeline.rs`: add an optional field to `GraphicsPipelineDesc`
   (e.g. `extra_vec3_attr: bool` or `vertex_attrs: u8`, default = current 4×vec3). When set,
   append a `vec3<f32> @location(4)` binding (slot 4). Leaves the other 5 pipelines untouched.
 - Confirm `bind_vertex_buffers` accepts a 5-handle slice (flora already uses
   `bind_vertex_buffers_slice` with 6 streams — the path exists).
-- **Test:** existing `enki-rhi` pipeline tests compile; add a tiny assert that a 5-attr desc builds.
+- **Test:** existing `minos-rhi` pipeline tests compile; add a tiny assert that a 5-attr desc builds.
 
-### Step 1 — enki-voxel: bake the morph displacement
-- `enki-voxel/src/lib.rs` `mesh_leaf` (`:262`, already has `hf: &dyn HeightField`): for each
+### Step 1 — minos-voxel: bake the morph displacement
+- `minos-voxel/src/lib.rs` `mesh_leaf` (`:262`, already has `hf: &dyn HeightField`): for each
   output vertex at world `v` (local frame, origin = leaf origin), with `dir = (v+origin).normalize()`:
   - `r_parent = surface_radius(hf, dir, radius, height_scale, level.saturating_sub(1))` (`:117`).
   - `morph_disp = dir * r_parent − (v_world)` expressed in the **same local frame as `positions`**
@@ -111,7 +111,7 @@ a per-leaf descriptor rewrite mid-frame — worse. Take the vertex stream.
   Band endpoints (CPU): `morph = 1` at the distance where the **parent** `proj_px = merge_thresh`
   (leaf about to merge); `morph = 0` where the leaf's own `proj_px = split_thresh`. Convert with
   `dist = node_size·screen_h / (2·proj_px·tan(fov/2))` (`lod.rs::compute_proj_px`, `:408`).
-- `enki-render/src/shaders/terrain.wgsl` (no-shadow fallback): same edit, OR skip — it's only
+- `minos-render/src/shaders/terrain.wgsl` (no-shadow fallback): same edit, OR skip — it's only
   used when `!has_shadow_map()` (non-default). Lazy: skip first, port if anyone runs shadows-off.
 - **Crack-freeness:** morph is a pure function of per-vertex distance + per-vertex disp, so shared
   edge vertices (identical world pos) morph identically → no new cracks. Verify L↔L-1 transition
@@ -157,15 +157,15 @@ rest is making the *reference* stable:
   un-morphed geometry at the swap; the GUI slider (Step 5) is for dialing it.
 
 ## Sequencing (smallest shippable first)
-1. Step 0 (enki-rhi 5th attr) — enabler, isolated, also unblocks modes 7–10.
+1. Step 0 (minos-rhi 5th attr) — enabler, isolated, also unblocks modes 7–10.
 2. Steps 1–3 (bake → upload/bind → shader morph) on the **CSM path only** — this is the visible win.
 3. Step 5 GUI knob; eyeball with mode 4/5 during a fly-in.
 4. Piece 2 grounding narrowing.
 5. Step 4 caster parity + optional normal morph — only if artifacts remain.
 
 ## Tests
-- `cargo test -p enki-voxel` — morph-target accuracy (new) + existing crack-free/determinism.
-- `cargo test -p enki-app` / `-p enki-rhi` — naga validates the edited WGSL; pipeline builds.
+- `cargo test -p minos-voxel` — morph-target accuracy (new) + existing crack-free/determinism.
+- `cargo test -p minos-app` / `-p minos-rhi` — naga validates the edited WGSL; pipeline builds.
 - A CPU unit test for the morph-band math: `morph→1` at merge distance, `→0` at split distance.
 - **Visual is USER-verified** (headless can't see pixels): fly-in screenshot, watch a tree at the
   geometry/impostor edge and a ridgeline during LOD changes.

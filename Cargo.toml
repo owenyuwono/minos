@@ -1,26 +1,26 @@
 [workspace]
 resolver = "2"
 members = [
-    "enki-rhi",
-    "enki-render",
-    "enki-app",
-    "enki-planet",
-    "enki-jobs",
-    "enki-nanite",
-    "enki-flora",
-    "enki-voxel",
+    "minos-rhi",
+    "minos-render",
+    "minos-app",
+    "minos-planet",
+    "minos-jobs",
+    "minos-nanite",
+    "minos-flora",
+    "minos-voxel",
 ]
 
 # The startup heightfield + Nanite bake is scalar-f64 transcendental-heavy
 # (asin/acos/exp/normalize in tect_height, the rain-shadow march, erosion
 # flood/MFD). At opt-level 0 the debug bake is ~18s; optimizing ONLY the bake
-# crates (not enki-app) keeps app/UI incremental rebuilds fast while killing the
+# crates (not minos-app) keeps app/UI incremental rebuilds fast while killing the
 # bake cost. ponytail: pure codegen — no fast-math, no FMA on default x86-64, so
 # the determinism golden bytes are unchanged. "*" covers external math deps
 # (glam, meshopt, metis, rustfft) only — workspace crates need explicit entries.
-[profile.dev.package.enki-planet]
+[profile.dev.package.minos-planet]
 opt-level = 3
-[profile.dev.package.enki-nanite]
+[profile.dev.package.minos-nanite]
 opt-level = 3
 [profile.dev.package."*"]
 opt-level = 2

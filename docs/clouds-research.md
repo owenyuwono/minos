@@ -1,28 +1,28 @@
-# Wind-Driven Volumetric Clouds for enki — Implementation Research Report
+# Wind-Driven Volumetric Clouds for minos — Implementation Research Report
 
 *Deep research synthesis (SOTA-led; ki treated as a cautionary reference, not a template).
-Produced from a multi-agent sweep: ki source read + critique, enki infra map, 6 external SOTA
+Produced from a multi-agent sweep: ki source read + critique, minos infra map, 6 external SOTA
 facets, 3 adversarial verifications. Date: 2026-06-22.*
 
 ## 1. Goal & scope
 
-Add a **wind-driven volumetric cloud layer** to enki's cube-sphere planet that:
+Add a **wind-driven volumetric cloud layer** to minos's cube-sphere planet that:
 
 - Reads as **genuinely good** (not a sliding decal, not grainy mush, not a flat cotton-ball blob).
 - **Moves with the planet's baked wind field** — the headline feature.
 - Works as **one code path from orbit to ground** (camera flies between, may eventually fly *through*
-  the layer), on enki's ~50 km radius cube-sphere with floating-origin f64→f32 camera-relative
+  the layer), on minos's ~50 km radius cube-sphere with floating-origin f64→f32 camera-relative
   precision and reversed-Z.
 - Fits a solo dev following "laziest solution that works": shader-only where possible, no new asset
   pipeline, no new RHI subsystem, reusing the atmosphere-shell / ocean-water-split / wind-overlay
-  patterns already in `enki-app`.
+  patterns already in `minos-app`.
 
-**Non-negotiable engineering reality (feasibility verification):** enki-rhi has **no
+**Non-negotiable engineering reality (feasibility verification):** minos-rhi has **no
 CPU-data→sampled-image path** — `image.rs` only builds `TYPE_2D`, `array_layers(1)`, and
 `cmd_copy_buffer_to_image` does not exist outside flora's self-contained raw-ash renderer. So
 **anything needing a 3D noise texture or an uploaded climate cubemap is greenfield RHI work**, not
 "plumbing onto an existing path." This single fact pushes the design toward **analytic in-shader
-noise + CPU-baked coarse coverage in a storage buffer** — the route enki's wind/ocean code already
+noise + CPU-baked coarse coverage in a storage buffer** — the route minos's wind/ocean code already
 proves.
 
 ## 2. What ki does & why it falls short
@@ -44,7 +44,7 @@ heightScale·1.8`. Its **lighting backbone is production-shaped and good**:
 2. **Wind = rigid great-circle rotation → "sliding decal."** Whole field rotated as one rigid body
    (`dAdv = normalize(dLocal·cos(arc) + windDir·sin(arc))`); no curl, no detail-octave scroll, no
    in-place boil. Clouds translate, never churn. **The weakest part of the headline feature — what
-   enki must beat.**
+   minos must beat.**
 3. **Worley capped at 2 octaves → soft blobby silhouettes** ("EXPENSIVE 27-cell loop/sample"; the 3D
    density cache that would have unlocked more never landed).
 4. **Empty-space scout calls the *full* density** (2-oct Worley + 4-oct FBM + weather warp + Voronoi),
@@ -53,13 +53,13 @@ heightScale·1.8`. Its **lighting backbone is production-shaped and good**:
 6. **Missing post-gate `*= coverage` multiply** → margins look cut-out/hard.
 7. **Single height profile** (cloud-type channel unused) → no stratus/cumulus variety.
 8. **No terrain depth occlusion** (three.js log-depth vs linear-depth don't compose) → peaks never
-   poke through. **enki does NOT have this limitation** (see §6).
+   poke through. **minos does NOT have this limitation** (see §6).
 
 **Worth learning from (ki's good half):** wind+moisture baked once into equirect textures;
 convergence derived as `−(∂u/∂x + ∂v/∂y)`; wind drives clouds three ways — bulk advection,
 wind-aligned domain warp, weather-placement fold. **Copy the coupling structure, not the visuals.**
 
-## 3. enki infrastructure: what exists vs gaps
+## 3. minos infrastructure: what exists vs gaps
 
 CLAUDE.md's "baked `wind_at` + moisture cubemap already exist" is **half true and misleadingly framed**.
 
@@ -84,11 +84,11 @@ CLAUDE.md's "baked `wind_at` + moisture cubemap already exist" is **half true an
 
 **Cloud coverage — DOES NOT EXIST.** No coverage/cloud-density field is baked/stored/queryable.
 **Clouds must synthesize coverage** from moisture + noise weather-map + (optional) wind convergence.
-Convergence is **not computed in enki** — deriving it CPU-side is more work than ki's port implies.
+Convergence is **not computed in minos** — deriving it CPU-side is more work than ki's port implies.
 
 **GPU upload — the real blocker:** no climate cubemap is uploaded as a texture today; everything is
 CPU-side `Vec<f32>` sampled via `cubemap::sample_smooth`. `ClimateBaked` (`climate.rs:128`,
-`to_baked()` `:345`) is upload-*shaped* but built for worker sharing. **enki-rhi cannot upload a
+`to_baked()` `:345`) is upload-*shaped* but built for worker sharing. **minos-rhi cannot upload a
 sampled image from CPU data** (no `cmd_copy_buffer_to_image`, no cube/array view, no
 R32_SFLOAT-from-data ctor; the only buffer→image copy is in flora's deletable renderer).
 
@@ -103,7 +103,7 @@ Canonical reference: **Schneider & Vos, "The Real-Time Volumetric Cloudscapes of
 fields (Perlin-Worley base + Worley detail erosion) + height/coverage gradient + Beer + HG + ~6-tap
 light march + blue-noise dither at half-res. **Stop there for a solo dev.** Nubis2 (fly-through,
 superstorms) and Nubis3 (voxel modeling) are AAA/research-tier and *break the procedural contract*
-(Nubis3 needs Houdini-authored voxels + TYPE_3D textures enki cannot even upload).
+(Nubis3 needs Houdini-authored voxels + TYPE_3D textures minos cannot even upload).
 
 ### 4a. Modeling (density field f(p) → [0,1])
 
@@ -138,7 +138,7 @@ final    = remap(cov, modifier * 0.2, 1.0, 0.0, 1.0) // 0.2-0.35 erode strength
 Non-negotiable for "looks good."**
 
 **Weather map** (R=coverage, G=wetness, B=type), classically a 512² 5-octave Perlin texture sampled
-in world XZ → on a cube-sphere maps naturally to enki's moisture/coverage field.
+in world XZ → on a cube-sphere maps naturally to minos's moisture/coverage field.
 
 **Nubis3 verdict:** skip (fluid-sim-baked voxels — antithetical to a procedural planet + blocked by
 RHI). Borrow only renderer-side ideas (compressed-SDF empty-space skip, near/far temporal split) if
@@ -165,7 +165,7 @@ profiling demands.
 - **Sun/ambient from the sky** (ki's failure #5): drive tint + ambient from `frame.sun0_dir`/
   `sun0_color` — a couple shader lines, strictly better than hardcoded constants.
 
-### 4c. Performance / temporal — and the critical enki TAA caveat
+### 4c. Performance / temporal — and the critical minos TAA caveat
 
 - **Half-res raymarch + bicubic upscale** ("not noticeably different," ~4× cheaper); ki's
   `CloudCompositor` proves the pattern. *But* a dedicated half-res target hits the missing-image path;
@@ -177,7 +177,7 @@ profiling demands.
 - **Distance-adaptive step size** + **transmittance early-out** + **ray/shell bounds clamp** for the
   horizon-grazing case.
 
-**⚠ The TAA interaction — biggest oversold claim (verification flag).** enki's `taa_resolve`
+**⚠ The TAA interaction — biggest oversold claim (verification flag).** minos's `taa_resolve`
 reprojects **by reconstructing world-pos from the depth buffer** (`if (depth > 0.0)`). Clouds draw
 **depth-write OFF**, so:
 - **Cloud-over-sky pixels have depth==0 → the resolve SKIPS reprojection/history entirely**, applying
@@ -211,7 +211,7 @@ in self-contained cloud reprojection. **Do not assume engine TAA cleans it up.**
 - **Start the march at shell entry, never the camera** (skip empty vacuum from orbit).
 - **Clamp the edge-on chord** + distance-adaptive steps for horizon-grazing rays.
 - **Fade density to zero at both shell boundaries** so crossing a sphere doesn't pop.
-- **Rescale all Earth-tuned constants** (HZD's 1.5–4 km band → enki's 50 km radius).
+- **Rescale all Earth-tuned constants** (HZD's 1.5–4 km band → minos's 50 km radius).
 
 ### 4e. Wind animation
 
@@ -227,7 +227,7 @@ Refinements (shader-only, priority order):
    Defer for v1 (exposing curl to the GPU hits the texture wall).
 4. **Animate the weather map** for arriving fronts.
 
-**Mapping enki's wind cubemap to advection — the lazy approximation:** domain scroll `+wind·time` is
+**Mapping minos's wind cubemap to advection — the lazy approximation:** domain scroll `+wind·time` is
 valid **only if wind is uniform** across the sampled domain; a spatially-varying `+wind(p)·time` is a
 non-rigid warp whose distortion **grows linearly with time**, tearing the field apart over minutes. So:
 - **Lazy-correct default (recommended):** sample `wind_at(sub_camera_point)` **once per frame** → one
@@ -284,11 +284,11 @@ All shader-only / no new assets / no new RHI subsystem:
 ## 6. Concrete implementation plan
 
 **New files** (mirror `atmosphere.rs`/`.wgsl` + `wind/`):
-- `enki-app/src/clouds.rs` — `Clouds` struct (pipeline(s), shell mesh, params, CPU coverage/wind
+- `minos-app/src/clouds.rs` — `Clouds` struct (pipeline(s), shell mesh, params, CPU coverage/wind
   storage buffer, `new`/`record`), `CloudParams` (all sliders), naga-validation unit test.
-- `enki-app/src/clouds.wgsl` — `vs_main` (camera-relative shell vertex, like atmosphere) + `fs_main`
+- `minos-app/src/clouds.wgsl` — `vs_main` (camera-relative shell vertex, like atmosphere) + `fs_main`
   (the raymarch).
-- `enki-planet/src/height.rs` — add `fn moisture(&self, dir: DVec3) -> f32` to the trait (default +
+- `minos-planet/src/height.rs` — add `fn moisture(&self, dir: DVec3) -> f32` to the trait (default +
   `sampler.rs` impl delegating to `Climate::sample`). Optionally a CPU coverage bake.
 
 **Data flow (wind/moisture → shader), reusing the proven pattern:**
@@ -419,12 +419,12 @@ reprojection.
 - Frozen Fractal floating origin — https://frozenfractal.com/blog/2024/4/11/around-the-world-14-floating-the-origin/
 - PBRT Managing Rounding Error — https://www.pbr-book.org/3ed-2018/Shapes/Managing_Rounding_Error
 
-**enki source (integration map):** `enki-planet/src/climate.rs` (`:116` WindSample, `:128`
+**minos source (integration map):** `minos-planet/src/climate.rs` (`:116` WindSample, `:128`
 ClimateBaked, `:209` moisture_field, `:313` sample, `:325` wind_at, `:442` bake_moisture, `:562`
 bake_wind); `height.rs` (`:20` climate, `:30` wetness, `:41`/`:48` wind); `sampler.rs:472-496`;
-`cubemap.rs`; `enki-app/src/atmosphere.rs`(+`.wgsl`); `wind/mod.rs:33-156`; `ocean/mod.rs:223-472`;
-`enki-rhi/src/lib.rs:938-1078` (begin_water_pass + refraction views); `enki-rhi/src/image.rs`
+`cubemap.rs`; `minos-app/src/atmosphere.rs`(+`.wgsl`); `wind/mod.rs:33-156`; `ocean/mod.rs:223-472`;
+`minos-rhi/src/lib.rs:938-1078` (begin_water_pass + refraction views); `minos-rhi/src/image.rs`
 (TYPE_2D-only — the upload gap); `flora_render.rs` (the only buffer→image copy);
-`main.rs:1638-1793` (draw order) + `:1886-1917` (TAA resolve); `enki-render/src/material.rs:38-122`
+`main.rs:1638-1793` (draw order) + `:1886-1917` (TAA resolve); `minos-render/src/material.rs:38-122`
 (ChunkPush + _pad + camera_relative); `taa_resolve.wgsl` (depth>0 reprojection gate);
 `gui.rs:~349` (Atmosphere section).

@@ -1,7 +1,7 @@
-# How to Make enki's Clouds Move, Merge, and Follow the Wind (True Advection)
+# How to Make minos's Clouds Move, Merge, and Follow the Wind (True Advection)
 
 *Deep-research synthesis (semi-Lagrangian vs noise-trick), for a solo dev who wants the laziest thing
-that genuinely looks like weather flowing. Multi-agent sweep: enki/ki infra read + 4 external SOTA
+that genuinely looks like weather flowing. Multi-agent sweep: minos/ki infra read + 4 external SOTA
 facets + 3 adversarial verifications. Date: 2026-06-23. Companion to `clouds-research.md`.*
 
 ## 0. Verdict (lead with the decision)
@@ -25,7 +25,7 @@ only happen if you store an actual quantity (cloud coverage) and transport it ea
 
 Only **semi-Lagrangian advection (Stam)** and its crisp-staying upgrade **IBFV feedback (van Wijk)**
 genuinely merge — and both require storing + stepping a field every frame. A **storage-buffer (SSBO)
-grid is all they need; no texture upload** — exactly enki's constraint.
+grid is all they need; no texture upload** — exactly minos's constraint.
 
 **Recommendation:** semi-Lagrangian advection of a coverage scalar on the existing 256×128 equirect
 storage buffer, on a CPU background worker (ocean-FFT / wind-streak pattern), backtrace in 3D
@@ -33,7 +33,7 @@ Cartesian on the unit sphere (dodges the pole singularity), sourced by the moist
 stay bounded and alive. **Medium** effort, not free, but the only path satisfying all three goals.
 
 **Two honest caveats (from verification):**
-1. **Merging will be WEAK with enki's current wind field.** The swirl vortices are divergence-free by
+1. **Merging will be WEAK with minos's current wind field.** The swirl vortices are divergence-free by
    construction (curl of a Gaussian streamfunction, `climate.rs:596-628`) → ~zero convergence. The
    only convergence is the smooth, box-blurred zonal/Coriolis tilt (`climate.rs:639-651`) — gentle
    broad bands, not dramatic fronts. You get **translation + flow-following strongly; merging weakly.**
@@ -73,13 +73,13 @@ moisture(dir))` — a climate-fixed mask. **The fix is to make coverage an advec
 curl distortion + weather-state cross-fade; their real fluid sims are **offline-baked to voxels**.
 Schneider: *"the coverage signal is not animated"* (matrix label: *"Pseudomotion Only"*). They skip
 merging because it was never their requirement and they cross-fade *authored* weather states — an
-asset pipeline enki lacks. So "AAA skips advection" answers a different question. If merge is
+asset pipeline minos lacks. So "AAA skips advection" answers a different question. If merge is
 negotiable, the time-blend+curl recipe is the AAA-correct cheap move; if not, you need a transported
 field.
 
 **Winner: semi-Lagrangian advection of a coverage grid on a CPU worker** (option to add IBFV
 re-injection / MacCormack later). Only path delivering translate + merge + flow-following; trivial
-compute at 32K cells; reuses enki's storage-buffer + worker + bilinear-sampler patterns; no texture
+compute at 32K cells; reuses minos's storage-buffer + worker + bilinear-sampler patterns; no texture
 upload.
 
 ## 3. Recommended algorithm
@@ -139,11 +139,11 @@ Large-dt swirl → iterated-midpoint departure (2 fixed-point iters) if vortex m
 
 ### 3.7 Convergence (optional merge bias)
 Derive `−(∂u/∂x + ∂v/∂y)` on the CPU by central-differencing the wind grid (ki does this); add
-`+ k_conv·conv·dt` to the source. **Weak with enki's divergence-free swirl** — modest bias, not
-dramatic merging. Derive *in the worker* (it holds the wind grid) — no `enki-planet` change. Stencil
+`+ k_conv·conv·dt` to the source. **Weak with minos's divergence-free swirl** — modest bias, not
+dramatic merging. Derive *in the worker* (it holds the wind grid) — no `minos-planet` change. Stencil
 template: `climate.rs:680-698`.
 
-## 4. enki integration plan
+## 4. minos integration plan
 
 The GPU/threading/upload/sampling scaffold already exists. New work is **purely CPU + additive.**
 
@@ -170,7 +170,7 @@ a tiny detail boil. *This also deletes the unbounded-shear bug.*
 
 **Files:** `clouds.rs` (binding 6, per-FiF buffers, spawn worker, upload), `clouds_advect.rs` (new SL
 worker), `clouds.wgsl` (add `sample_coverage`, repoint `coverage_at`, trim warp). **No RHI change, no
-`enki-planet` change, no texture-upload path.**
+`minos-planet` change, no texture-upload path.**
 
 ## 5. Cost & quality
 - **CPU:** 32,768 cells × ~few dozen flops = ~1–2 Mflop/step → **sub-ms even in debug** (orders below
@@ -230,7 +230,7 @@ worker), `clouds.wgsl` (add `sample_coverage`, repoint `coverage_at`, trim warp)
 - Harris, "Real-Time Cloud Simulation and Rendering" (PhD) — http://www.cs.unc.edu/xcms/wpfiles/dissertations/harris.pdf
 - niels747, "2D Weather Sandbox" (GLSL grid advection) — https://github.com/niels747/2D-Weather-Sandbox
 
-**enki/ki refs:** `clouds.wgsl:153-209,230-236` · `clouds.rs:132-139,178-197,310-331` ·
+**minos/ki refs:** `clouds.wgsl:153-209,230-236` · `clouds.rs:132-139,178-197,310-331` ·
 `ocean/mod.rs:280-313,334-338,387-390,478-485` · `wind/sim.rs:215-231,299-349` ·
-`climate.rs:307,588,596-628,639-661,680-698` · `enki-rhi/src/lib.rs:537,549,560` ·
+`climate.rs:307,588,596-628,639-661,680-698` · `minos-rhi/src/lib.rs:537,549,560` ·
 `ki/src/planet/VolumetricClouds.ts` (static-coverage rotation + baked convergence — what NOT to copy).

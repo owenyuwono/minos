@@ -1,0 +1,9 @@
+[package]
+name = "minos-jobs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+glam = "0.33.1"
+minos-planet = { path = "../minos-planet" }
+crossbeam-channel = "0.5"

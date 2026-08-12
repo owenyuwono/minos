@@ -536,112 +536,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "491bdf728bf25ddd9ad60d4cf1c48588fa82c013a2440b91aa7fc43e34a07c32"
 
 [[package]]
-name = "enki-app"
-version = "0.1.0"
-dependencies = [
- "ash",
- "bytemuck",
- "egui",
- "egui-ash-renderer",
- "egui-winit",
- "enki-flora",
- "enki-jobs",
- "enki-planet",
- "enki-render",
- "enki-rhi",
- "enki-voxel",
- "env_logger",
- "glam",
- "image",
- "log",
- "lru",
- "naga",
- "raw-window-handle",
- "rustfft",
- "winit",
-]
-
-[[package]]
-name = "enki-flora"
-version = "0.1.0"
-dependencies = [
- "glam",
- "naga",
- "serde_json",
-]
-
-[[package]]
-name = "enki-jobs"
-version = "0.1.0"
-dependencies = [
- "crossbeam-channel",
- "enki-planet",
- "glam",
-]
-
-[[package]]
-name = "enki-nanite"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "enki-planet",
- "enki-render",
- "enki-rhi",
- "glam",
- "log",
- "meshopt",
- "metis",
- "naga",
-]
-
-[[package]]
-name = "enki-planet"
-version = "0.1.0"
-dependencies = [
- "enki-render",
- "glam",
- "image",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "enki-render"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "enki-rhi",
- "glam",
- "log",
- "naga",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "enki-rhi"
-version = "0.1.0"
-dependencies = [
- "ash",
- "ash-window",
- "bytemuck",
- "glam",
- "gpu-allocator",
- "log",
- "naga",
- "raw-window-handle",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "enki-voxel"
-version = "0.1.0"
-dependencies = [
- "enki-planet",
- "glam",
- "transvoxel",
-]
-
-[[package]]
 name = "env_filter"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1167,6 +1061,112 @@ checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
 dependencies = [
  "adler2",
  "simd-adler32",
+]
+
+[[package]]
+name = "minos-app"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "bytemuck",
+ "egui",
+ "egui-ash-renderer",
+ "egui-winit",
+ "env_logger",
+ "glam",
+ "image",
+ "log",
+ "lru",
+ "minos-flora",
+ "minos-jobs",
+ "minos-planet",
+ "minos-render",
+ "minos-rhi",
+ "minos-voxel",
+ "naga",
+ "raw-window-handle",
+ "rustfft",
+ "winit",
+]
+
+[[package]]
+name = "minos-flora"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "naga",
+ "serde_json",
+]
+
+[[package]]
+name = "minos-jobs"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "glam",
+ "minos-planet",
+]
+
+[[package]]
+name = "minos-nanite"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "log",
+ "meshopt",
+ "metis",
+ "minos-planet",
+ "minos-render",
+ "minos-rhi",
+ "naga",
+]
+
+[[package]]
+name = "minos-planet"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "image",
+ "minos-render",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "minos-render"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "log",
+ "minos-rhi",
+ "naga",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "minos-rhi"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "ash-window",
+ "bytemuck",
+ "glam",
+ "gpu-allocator",
+ "log",
+ "naga",
+ "raw-window-handle",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "minos-voxel"
+version = "0.1.0"
+dependencies = [
+ "glam",
+ "minos-planet",
+ "transvoxel",
 ]
 
 [[package]]
