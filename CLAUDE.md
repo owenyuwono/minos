@@ -6,18 +6,19 @@ virtualized-geometry path and the classic quadtree mesher are the alternate, fea
 
 ## Build / run
 
-`cargo` is **not on PATH**. In PowerShell prefix with:
-```
-$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
-```
+`cargo` is on PATH (verified 2026-08-12, 1.96.0). If a shell somehow lacks it, prefix with
+`$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"`.
+
+A `Makefile` wraps the commands below — `make run` / `release` / `viewer` / `classic` /
+`check` / `test`. GNU Make is installed; with no `sh` on PATH it runs recipes through `cmd`.
 - Run: `cargo run -p minos-app`
 - Check/build: `cargo check -p minos-app` (use `check`, not `build`, while the app is running — the `.exe` is locked).
-- Default features = `flora,voxel` (voxel terrain + planet flora). **Nanite is opt-in**: `cargo run -p minos-app --features nanite` — unplugged from the default in Phase 0 of the voxel migration; still used by the flora Nanite debug view.
+- Default features = `flora,voxel` (voxel terrain + planet flora). **Nanite is opt-in** — but note `minos-app` currently declares NO `nanite` feature and no `minos-nanite` dep, so `--features nanite` errors out; the crate itself still builds and tests standalone (`cargo check -p minos-nanite`). Re-plugging it means restoring the optional dep + feature in `minos-app/Cargo.toml`.
 - Classic quadtree engine (no voxel/flora/Nanite): `cargo build -p minos-app --no-default-features`.
 - Flora (procedural tree) viewer: `cargo run -p minos-app --bin flora_viewer --features flora` — the showcase bin. The planet `minos` bin scatters flora on the surface **only when built `--features flora`** (a `--no-default-features` build never references flora); see the Flora section.
 - Vendored C deps: `metis` builds clean on MSVC (no cmake/libclang needed).
 
-All feature configs must always compile — default (`flora,voxel`), `--no-default-features` (classic quadtree), and `--features nanite`.
+All feature configs must always compile — default (`flora,voxel`) and `--no-default-features` (classic quadtree), plus `cargo check -p minos-nanite` while the Nanite app wiring is unplugged.
 
 ## Workspace crates
 
