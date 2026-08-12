@@ -2,6 +2,9 @@
 name = "minos-app"
 version = "0.1.0"
 edition = "2021"
+# Two bins are buildable in the default build (flora is on), so a bare
+# `cargo run -p minos-app` is ambiguous without this.
+default-run = "minos"
 
 [features]
 default = ["flora", "voxel"]
